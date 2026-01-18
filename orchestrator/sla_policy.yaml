@@ -1,0 +1,7 @@
+price_spike_threshold: 0.01
+max_migrations_per_hour: 2
+workload_thresholds:
+  short: null      # never migrate based on price
+  medium: 0.25     # migrate if delta >= 25%
+  long: 0.12       # migrate if delta >= 12%
+  stateful: 0.40   # migrate if delta >= 40%

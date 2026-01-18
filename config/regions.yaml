@@ -1,0 +1,11 @@
+supported_regions:
+  - us-east-1
+  - us-west-2
+  - eu-west-1
+  - ap-south-1
+
+# Phase 1: Fail-safe defaults
+default_instance_type: "c5.large"
+ami_map:
+  us-east-1: "ami-0c7217cdde317cfec" # Ubuntu 22.04 LTS (Update these!)
+  us-west-2: "ami-008fe2fc65df48dac"

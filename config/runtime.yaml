@@ -1,0 +1,21 @@
+checkpoint_bucket: "spot-arbitrage-checkpoints-62dfd2bb"   # Set to your checkpoint bucket name, or export CHECKPOINT_BUCKET
+source_region: "us-east-1"
+instance_type: "t3.micro"
+ssh_key_name: "spot_arbitrage_key"
+# Target provisioning defaults
+target_region: "us-east-1"
+target_ami_id: ""
+target_security_group_id: ""
+max_spot_price: "0.10"
+# Registry backend: "json" or "dynamo"
+registry_backend: "dynamo"
+dynamodb_table: "spot_arbitrage_registry"
+dynamodb_region: "us-east-1"
+# Auto-provision is the default (set to true)
+auto_provision: true
+# Optional list of candidate regions for price selection
+candidate_regions:
+  - us-east-1
+  - us-west-2
+  - eu-west-1
+  - ap-south-1

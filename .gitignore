@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+venv/
+env/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+orchestrator.log
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+terraform.tfvars
+*.tfvars.backup
+
+# AWS
+.aws/
+aws/
+awscliv2.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+storage/job_registry.json
+*.tar.gz
+/tmp/
+ami-stage/
+
