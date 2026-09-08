@@ -13,7 +13,7 @@ ENV/
 *.egg-info/
 dist/
 build/
-
+docs/
 # IDE
 .vscode/
 .idea/

@@ -5,7 +5,7 @@ supported_regions:
   - ap-south-1
 
 # Phase 1: Fail-safe defaults
-default_instance_type: "c5.large"
+default_instance_type: "t3.micro"
 ami_map:
   us-east-1: "ami-0c7217cdde317cfec" # Ubuntu 22.04 LTS (Update these!)
   us-west-2: "ami-008fe2fc65df48dac"

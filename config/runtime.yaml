@@ -13,6 +13,8 @@ dynamodb_table: "spot_arbitrage_registry"
 dynamodb_region: "us-east-1"
 # Auto-provision is the default (set to true)
 auto_provision: true
+# Optimization: cost_first | availability_first
+optimization_mode: cost_first
 # Optional list of candidate regions for price selection
 candidate_regions:
   - us-east-1

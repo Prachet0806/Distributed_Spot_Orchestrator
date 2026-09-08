@@ -1,0 +1,14 @@
+# Instance type matrix for different workload categories
+# Maps workload type to recommended instance types and pricing tiers
+short:
+  instance_type: t3.nano
+  max_spot_price: "0.02"
+medium:
+  instance_type: t3.micro
+  max_spot_price: "0.05"
+long:
+  instance_type: t3.small
+  max_spot_price: "0.10"
+stateful:
+  instance_type: t3.medium
+  max_spot_price: "0.15"

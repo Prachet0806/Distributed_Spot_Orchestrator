@@ -1,0 +1,66 @@
+# V2 frozen baseline (ADR-006..ADR-024). Immutable versions — pinned into plans.
+# See docs/adr/ADR-*.md for rationale.
+
+policy:
+  min_savings_margin: 0.10
+  cooldown_seconds: 900
+  min_favorable_observations: 3
+  max_completion_overhead: 0.20
+
+short_job:
+  short_runtime_seconds: 900
+  medium_runtime_seconds: 3600
+  medium_required_net_benefit_multiplier: 2.0
+  medium_required_savings_fraction: 0.20
+
+recovery:
+  allow_cold_restart: false
+  max_recovery_age_seconds: 86400
+  checkpoint_retention_count: 3
+  checkpoint_gc_grace_seconds: 21600
+
+execution:
+  plan_ttl:
+    arbitrage_seconds: 600
+    proactive_seconds: 600
+  coordinator_operation_timeout_seconds: 300
+  step_timeout_seconds: 60
+  unknown_resolution_timeout_seconds: 30
+
+retry:
+  operation_max_attempts: 3
+  operation_backoff_base_seconds: 2
+  operation_backoff_max_seconds: 30
+  backoff_jitter: 0.25
+  max_replans: 2
+  max_recovery_attempts: 3
+
+concurrency:
+  max_concurrent_migrations: 3
+  max_concurrent_migrations_per_pool: 2
+  max_migrations_per_job: 1
+
+transfer:
+  multipart_part_size_bytes: 67108864
+
+placement:
+  version: v3
+  weights:
+    compatibility: 0.30
+    readiness: 0.25
+    capacity: 0.20
+    locality: 0.10
+    reliability: 0.10
+    operational_cost: 0.05
+  tie_break: [score, freshness, capacity_confidence, migration_time, pool_id_lexicographic]
+
+runtime:
+  engine_version: pinned_at_admission
+  worker_os: ubuntu-22.04
+  worker_arch: x86_64
+  criu: pinned
+  kernel: pinned_tested
+
+testing:
+  emulation_trust_mode: explicit_only
+  overhead_acceptance_p95: 0.20

@@ -1,0 +1,12 @@
+version: "v2.1"
+
+hard_constraints:
+  reject_unknown: true
+  require_ready: true
+
+ranking:
+  interruption_risk: 0.30
+  expected_cost: 0.30
+  transfer_cost: 0.15
+  topology: 0.10
+  historical_success: 0.15

@@ -3,6 +3,7 @@ set -e
 
 CMD=$1
 PID=$2
+# CHECKPOINT_DIR from common_constants.py (must match)
 DIR=/opt/job_workspace/checkpoint
 
 if [ "$CMD" == "dump" ]; then

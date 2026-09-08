@@ -2,15 +2,47 @@
 import argparse
 import logging
 import logging.config
+import os
 import time
-import yaml
 import threading
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+import yaml
 
 from orchestrator.watcher import SpotPriceWatcher
-from orchestrator.decision_engine import DecisionEngine
-from orchestrator.migrator import Migrator
+from orchestrator.workload_estimator import WorkloadEstimator, WorkloadObservation, EstimatorConfig
+from orchestrator.workload_requirements import WorkloadRequirements, GPURequirement
+from orchestrator.candidate_pool import CandidatePool, CandidatePoolRegistry
+from orchestrator.candidate_compatibility import CompatibilityEngine
+from orchestrator.candidate_readiness import ReadinessEngine, IAMReadiness, NetworkReadiness, StorageReadiness
+from orchestrator.candidate_placement import PlacementEngine, PlacementPolicy, PlacementInput
+from orchestrator.recovery_feasibility import RecoveryFeasibilityEngine
+from orchestrator.cost_risk_evaluator import CostRiskEvaluator
+from orchestrator.policy_engine import PolicyEngine, MigrationRegime, ArbitragePolicyConfig
+from orchestrator.migration_planner import MigrationPlanner
+from orchestrator.migration_coordinator import MigrationCoordinator
+from orchestrator.validator import Validator
+from orchestrator.reconciliation_manager import ReconciliationManager, ReconciliationTrigger
+from orchestrator.cleanup_executor import CleanupExecutor
+from orchestrator.migration_history import MigrationHistory
+from orchestrator.provisioner import Provisioner
+from orchestrator.checkpoint_manager import CheckpointManager
+from orchestrator.transfer_manager import TransferManager
+
 from orchestrator.config_loader import load_runtime_config
+from orchestrator.metrics import get_metrics
+from orchestrator.constants import (
+    COOLDOWN_SECONDS,
+    STUCK_JOB_THRESHOLD,
+    MIGRATION_POLL_INTERVAL,
+    PRICE_CACHE_TTL,
+    HEALTH_CHECK_PORT,
+    MAX_CONCURRENT_MIGRATIONS,
+    MAX_MIGRATIONS_PER_HOUR,
+    MIGRATION_BACKOFF_SECONDS,
+)
+from orchestrator.rate_limiter import TokenBucketRateLimiter
 from storage.job_registry import JobRegistry
 from storage.dynamo_registry import DynamoRegistry
 
@@ -29,47 +61,110 @@ def load_logging_config(path="config/logging.yaml"):
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
+        auth_token = os.getenv("HEALTH_AUTH_TOKEN")
+        parsed = urlparse(self.path)
+        query_params = parse_qs(parsed.query)
+
+        if auth_token and query_params.get("token", [None])[0] != auth_token:
+            self.send_response(403)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"forbidden"}')
+            return
+
+        if self.path == "/metrics":
+            payload = get_metrics().render_prometheus().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; version=0.0.4")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+            return
+        self.send_response(404)
         self.end_headers()
-        self.wfile.write(b'{"status":"ok"}')
 
     def log_message(self, format, *args):
-        # suppress default stdout logging
         return
 
 
-def start_health_server(port=8080):
+def start_health_server(port=8080, timeout=10):
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.timeout = timeout
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
 
 
+def _spot_flag_detected(host, flag_path, log):
+    try:
+        from orchestrator.utils import SSHClient
+        ssh = SSHClient(host)
+        ssh.connect()
+        result = ssh.run_command(
+            f"test -f {flag_path} && echo 1 || echo 0",
+            check=False,
+        )
+        return result.stdout.strip() == "1"
+    except Exception as exc:
+        log.warning("Spot flag check failed for %s: %s", host, exc)
+        return False
+    finally:
+        try:
+            ssh.close()
+        except Exception:
+            pass
+
+
+def _select_failover_region(prices, current_region, override_region=None):
+    if override_region:
+        return override_region
+    ordered = sorted(prices.items(), key=lambda x: x[1]["price"])
+    for region, _ in ordered:
+        if region != current_region:
+            return region
+    return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Orchestrator main loop: poll -> decide -> (optional) migrate.")
+    parser = argparse.ArgumentParser(description="V2 Orchestrator: Observe -> Estimate -> Compatibility -> Feasibility -> Economics -> Policy -> Plan -> Execute")
     parser.add_argument("--job-id", help="Job ID in the registry (required in single-job mode)")
     parser.add_argument("--current-region", help="Current region of the job (single-job mode)")
     parser.add_argument("--regions", help="Comma-separated regions to poll; if omitted uses runtime config candidate_regions")
     parser.add_argument("--instance-type", help="Instance type; defaults to runtime config instance_type")
     parser.add_argument("--policy", default="orchestrator/sla_policy.yaml", help="SLA policy path")
     parser.add_argument("--registry-path", default="storage/job_registry.json", help="Path to job registry JSON")
-    parser.add_argument("--interval", type=int, default=60, help="Poll interval seconds (default 60)")
-    parser.add_argument("--migrate", action="store_true", help="If set, trigger migrator when decision is MIGRATE")
-    parser.add_argument("--cooldown-seconds", type=int, default=10800, help="Min seconds between migrations for a job (default 3h)")
-    parser.add_argument("--target-ip", help="Optional target worker IP to skip prompt")
-    parser.add_argument("--auto-provision", action="store_true", help="Auto-provision target worker (no manual IP prompt)")
-    parser.add_argument("--target-region", help="Override target region (otherwise decision target)")
-    parser.add_argument("--target-ami-id", help="Override target AMI ID")
-    parser.add_argument("--target-sg-id", help="Override target security group ID")
-    parser.add_argument("--max-spot-price", help="Override max spot price for provisioning")
-    parser.add_argument("--health-port", type=int, default=8080, help="Health check HTTP port (default 8080)")
+    parser.add_argument("--interval", type=int, default=MIGRATION_POLL_INTERVAL, help=f"Poll interval seconds (default {MIGRATION_POLL_INTERVAL})")
+    parser.add_argument("--migrate", action="store_true", help="If set, execute migrations when decided")
+    parser.add_argument("--cooldown-seconds", type=int, default=COOLDOWN_SECONDS, help=f"Min seconds between migrations for a job (default {COOLDOWN_SECONDS//3600}h)")
+    parser.add_argument("--health-port", type=int, default=HEALTH_CHECK_PORT, help=f"Health check HTTP port (default {HEALTH_CHECK_PORT})")
     parser.add_argument("--multi-job", action="store_true", help="Enable multi-job mode (iterate over all RUNNING jobs)")
     parser.add_argument("--states", default="RUNNING", help="Comma-separated states to include in multi-job mode (default RUNNING)")
+    parser.add_argument("--stuck-seconds", type=int, default=STUCK_JOB_THRESHOLD, help=f"Alert if job state is unchanged longer than this (default {STUCK_JOB_THRESHOLD//60}min)")
+    parser.add_argument("--spot-flag-path", default="/tmp/spot_interrupt", help="Worker spot interruption flag path")
+    parser.add_argument("--check-spot-flag", action="store_true", help="Check worker for spot interruption flag and trigger emergency recovery")
+    parser.add_argument("--max-migrations-per-hour", type=int, default=MAX_MIGRATIONS_PER_HOUR, help=f"Max migrations per hour (default {MAX_MIGRATIONS_PER_HOUR})")
+    parser.add_argument("--max-concurrent-migrations", type=int, default=MAX_CONCURRENT_MIGRATIONS, help=f"Max concurrent migrations (default {MAX_CONCURRENT_MIGRATIONS})")
+    parser.add_argument("--reconcile-interval", type=int, default=300, help="Reconciliation sweep interval seconds (default 300)")
+    parser.add_argument("--engine", choices=["v1", "v2"], default="v2",
+                        help="Execution engine: v2 (default, Planner->Coordinator) or v1 (frozen legacy Migrator compat, ADR-024)")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
+    logging.getLogger().setLevel(args.log_level)
     load_logging_config()
     log = logging.getLogger("orchestrator.main")
+    log.info("Engine selected: %s", args.engine)
+    if args.engine == "v1":
+        log.warning(
+            "V1 engine is frozen legacy (ADR-024). Use --engine v2 for all new "
+            "work; V1 path (Migrator/DecisionEngine) will be removed after "
+            "AWS E2E + soak gates."
+        )
 
     cfg = load_runtime_config()
 
@@ -85,18 +180,69 @@ def main():
     if not instance_type:
         raise SystemExit("instance_type not set (pass --instance-type or set in config/runtime.yaml)")
 
-    watcher = SpotPriceWatcher(regions=regions, instance_type=instance_type)
-    engine = DecisionEngine(args.policy)
-    # Select registry backend
     if cfg.get("registry_backend") == "dynamo" and cfg.get("dynamodb_table"):
         registry = DynamoRegistry(cfg["dynamodb_table"], region_name=cfg.get("dynamodb_region"))
         log.info("Using DynamoDB registry: table=%s region=%s", cfg["dynamodb_table"], cfg.get("dynamodb_region"))
     else:
         registry = JobRegistry(args.registry_path)
         log.info("Using JSON registry: %s", args.registry_path)
-    migrator = Migrator(registry)
 
-    # Validate mode
+    # Initialize V2 components
+    watcher = SpotPriceWatcher(regions=regions, instance_type=instance_type)
+    
+    estimator = WorkloadEstimator(EstimatorConfig())
+    compatibility_engine = CompatibilityEngine()
+    readiness_engine = ReadinessEngine()
+    placement_policy = PlacementPolicy.load_from_file("config/placement_policy.yaml")
+    placement_engine = PlacementEngine(placement_policy)
+    feasibility_engine = RecoveryFeasibilityEngine()
+    evaluator = CostRiskEvaluator()
+    try:
+        from orchestrator.config_loader import load_v2_baseline
+        _base = load_v2_baseline()
+        _pol = _base.get("policy", {})
+        _sj = _base.get("short_job", {})
+        policy = PolicyEngine(ArbitragePolicyConfig(
+            min_savings_margin=float(_pol.get("min_savings_margin", 0.10)),
+            cooldown_seconds=float(_pol.get("cooldown_seconds", 900)),
+            min_favorable_observations=int(_pol.get("min_favorable_observations", 3)),
+            max_completion_overhead_ratio=float(_pol.get("max_completion_overhead", 0.20)),
+            short_runtime_seconds=float(_sj.get("short_runtime_seconds", 900)),
+            medium_runtime_seconds=float(_sj.get("medium_runtime_seconds", 3600)),
+            medium_net_benefit_multiplier=float(_sj.get("medium_required_net_benefit_multiplier", 2.0)),
+            medium_required_savings_fraction=float(_sj.get("medium_required_savings_fraction", 0.20)),
+            policy_version="v3",
+        ))
+        log.info("Loaded V2 baseline policy config (ADR-006..008)")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        log.warning("V2 baseline load failed, using defaults: %s", exc)
+        policy = PolicyEngine(ArbitragePolicyConfig())
+    planner = MigrationPlanner()
+    
+    provisioner = Provisioner()
+    checkpoint_mgr = CheckpointManager()
+    transfer_mgr = TransferManager()
+    validator = Validator()
+    cleanup = CleanupExecutor(provisioner=provisioner, storage_manager=None, checkpoint_manager=checkpoint_mgr)
+    history = MigrationHistory()
+    
+    coordinator = MigrationCoordinator(
+        registry=registry,
+        provisioner=provisioner,
+        checkpoint_manager=checkpoint_mgr,
+        transfer_manager=transfer_mgr,
+        validator=validator,
+        cleanup_executor=cleanup,
+    )
+    
+    reconciliation = ReconciliationManager(
+        registry=registry,
+        infrastructure_monitor=None,
+        cleanup_executor=cleanup,
+    )
+
     if not args.multi_job:
         if not args.job_id or not args.current_region:
             raise SystemExit("Single-job mode requires --job-id and --current-region")
@@ -104,14 +250,27 @@ def main():
         if cfg.get("registry_backend") != "dynamo":
             raise SystemExit("Multi-job mode requires DynamoDB backend")
 
-    # Per-job cooldown tracker
     last_migration_ts = {}
+    favorable_streaks: dict[str, int] = {}
     price_cache = {"ts": 0, "data": None}
-    price_cache_ttl = 30  # seconds
+    last_reconcile = 0
+    reconcile_interval = args.reconcile_interval
+
+    rate_limiter = TokenBucketRateLimiter(
+        max_per_hour=args.max_migrations_per_hour,
+        max_concurrent=args.max_concurrent_migrations,
+        min_interval_seconds=MIGRATION_BACKOFF_SECONDS
+    )
+    log.info(
+        "Rate limiter configured: max_per_hour=%s max_concurrent=%s min_interval=%ss",
+        args.max_migrations_per_hour,
+        args.max_concurrent_migrations,
+        MIGRATION_BACKOFF_SECONDS,
+    )
 
     health_server = start_health_server(port=args.health_port)
     log.info(
-        "Starting orchestrator loop | multi_job=%s job=%s interval=%ss migrate=%s health_port=%s",
+        "Starting V2 orchestrator loop | multi_job=%s job=%s interval=%ss migrate=%s health_port=%s",
         args.multi_job,
         args.job_id,
         args.interval,
@@ -123,7 +282,8 @@ def main():
 
     while True:
         now = time.time()
-        if price_cache["data"] and now - price_cache["ts"] < price_cache_ttl:
+        
+        if price_cache["data"] and now - price_cache["ts"] < PRICE_CACHE_TTL:
             prices = price_cache["data"]
         else:
             prices = watcher.poll()
@@ -131,7 +291,10 @@ def main():
 
         log.info("Prices: %s", {r: round(v["price"], 5) for r, v in prices.items()})
 
-        # Determine jobs to process
+        if now - last_reconcile >= reconcile_interval:
+            reconciliation.reconcile(ReconciliationTrigger.PERIODIC_SWEEP)
+            last_reconcile = now
+
         jobs = []
         if args.multi_job:
             for st in include_states:
@@ -145,35 +308,253 @@ def main():
             if not job_id or not current_region:
                 continue
 
-            decision = engine.evaluate(prices, current_region, job=job)
-            log.info("Job %s decision: action=%s target=%s reason=%s", job_id, decision.action, decision.target_region, decision.reason)
+            if job.get("state") and job.get("state") != "RUNNING":
+                last_updated = job.get("last_updated")
+                if last_updated:
+                    try:
+                        updated_dt = datetime.fromisoformat(last_updated.replace("Z", ""))
+                        updated_ts = updated_dt.timestamp()
+                        if now - updated_ts > args.stuck_seconds:
+                            log.warning("ALERT job %s stuck in %s for >%ss", job_id, job.get("state"), args.stuck_seconds)
+                    except Exception:
+                        pass
 
-            if decision.action != "MIGRATE":
+            workload_type = job.get("workload_type", "medium")
+            execution_epoch = job.get("execution_epoch", 0)
+            current_price = prices.get(current_region, {}).get("price", 0)
+            candidate_prices = {r: p["price"] for r, p in prices.items() if r != current_region}
+            interruption_risk = prices.get(current_region, {}).get("volatility", 0.1)
+
+            observation = None
+            if job.get("progress") is not None:
+                observation = WorkloadObservation(
+                    job_id=job_id,
+                    execution_epoch=execution_epoch,
+                    progress=job.get("progress"),
+                    checkpoint_size_bytes=job.get("checkpoint_size_bytes"),
+                    checkpoint_duration_seconds=job.get("checkpoint_duration_seconds"),
+                    cpu_utilization=job.get("cpu_utilization"),
+                    memory_utilization=job.get("memory_utilization"),
+                    observed_at=datetime.utcnow(),
+                    observation_confidence=job.get("observation_confidence", 0.5),
+                )
+
+            workload_estimate = estimator.estimate(job_id, execution_epoch, workload_type, observation)
+
+            requirements = WorkloadRequirements(
+                cpu_architecture="x86_64",
+                min_cpu=1,
+                min_memory_mb=1024,
+                gpu=GPURequirement(required=False),
+                reconnectable=True,
+            )
+
+            # Create candidate pools for each region
+            candidate_pools = {}
+            for r, p in candidate_prices.items():
+                pool_id = f"pool-{r}-{instance_type}"
+                pool = CandidatePool(
+                    pool_id=pool_id,
+                    provider="aws",
+                    account_id="123456789",
+                    region=r,
+                    availability_zone=f"{r}a",
+                    instance_type=instance_type,
+                    architecture="x86_64",
+                    runtime_profile=PoolRuntimeProfile(
+                        artifact_digest="sha256:abc123",
+                        architecture="x86_64",
+                    ),
+                    capacity_profile=PoolCapacityProfile(
+                        max_instances=10,
+                    ),
+                )
+                candidate_pools[r] = pool
+
+            # Assess compatibility and readiness
+            compat_assessments = {}
+            ready_assessments = {}
+            for r, pool in candidate_pools.items():
+                compat = compatibility_engine.assess(requirements, pool)
+                compat_assessments[r] = compat
+                
+                # Create default readiness evidence
+                iam_ready = IAMReadiness(
+                    secret_resolution_verified=True,
+                    kms_access_verified=True,
+                    instance_profile_ready=True,
+                    policy_attached=True,
+                )
+                network_ready = NetworkReadiness(
+                    vpc_configured=True,
+                    subnet_available=True,
+                    security_groups_ready=True,
+                    eni_attachable=True,
+                )
+                storage_ready = StorageReadiness(
+                    checkpoint_bucket_accessible=True,
+                    ebs_attachable=True,
+                    snapshot_creation_verified=True,
+                )
+                capacity_evidence = CapacityEvidence(
+                    status=CapacityStatus.AVAILABLE,
+                    source=EvidenceSource.HISTORICAL_PROVISIONING,
+                    observed_at=datetime.utcnow(),
+                    confidence=0.8,
+                    provisioning_success_rate=0.9,
+                    sample_count=10,
+                )
+                
+                ready = readiness_engine.assess(
+                    requirements, candidate_pools[r],
+                    iam_ready=iam_ready, network_ready=network_ready, storage_ready=storage_ready,
+                    capacity_evidence=capacity_evidence,
+                    artifact_available=True,
+                )
+                ready_assessments[r] = ready
+
+            # Filter emergency-eligible pools
+            emergency_pools = [
+                r for r in candidate_pools 
+                if compat_assessments[r].status.value == "COMPATIBLE" 
+                and ready_assessments[r].status.value == "READY"
+            ]
+
+            stay_analysis = evaluator.evaluate_stay(current_price, workload_estimate, interruption_risk)
+            candidate_analyses = []
+            for r in emergency_pools:
+                ca = evaluator.evaluate_candidate(
+                    current_price,
+                    prices[r],
+                    workload_estimate,
+                    interruption_risk,
+                    checkpoint_size_bytes=workload_estimate.checkpoint_size_estimate_bytes,
+                    checkpoint_duration_seconds=workload_estimate.checkpoint_duration_estimate_seconds,
+                )
+                ca.target_pool_id = r
+                candidate_analyses.append(ca)
+
+            regime = MigrationRegime.ARBITRAGE
+            if args.check_spot_flag:
+                source_ip = job.get("public_ip")
+                if source_ip and _spot_flag_detected(source_ip, args.spot_flag_path, log):
+                    regime = MigrationRegime.EMERGENCY
+                    log.warning("Job %s spot interruption detected; triggering EMERGENCY regime", job_id)
+
+            compat_list = [compat_assessments[r] for r in emergency_pools]
+            ready_list = [ready_assessments[r] for r in emergency_pools]
+
+            # Hysteresis bookkeeping (ADR-006): streak of economically
+            # favorable observations per job; reset when no saving candidate.
+            try:
+                _best_saving = max(
+                    (c.cost_breakdown.expected_savings for c in candidate_analyses),
+                    default=0.0,
+                )
+            except Exception:
+                _best_saving = 0.0
+            if _best_saving > 0:
+                favorable_streaks[job_id] = favorable_streaks.get(job_id, 0) + 1
+            else:
+                favorable_streaks[job_id] = 0
+            _cooldown_cfg = getattr(policy.arbitrage.config, "effective_cooldown_seconds",
+                                    policy.arbitrage.config.cooldown_hours * 3600.0)
+            _last = last_migration_ts.get(job_id)
+            _cooldown_left = max(0.0, _cooldown_cfg - (now - _last)) if _last else 0.0
+
+            feasibility = None
+            if regime == MigrationRegime.EMERGENCY and emergency_pools:
+                # Phase 1b: absolute-deadline ownership still lives here until
+                # Market/Risk Monitor takes it (Phase 3). Default 120s budget.
+                _deadline = 120.0
+                feasibility = feasibility_engine.evaluate(
+                    workload_estimate,
+                    compat_assessments[emergency_pools[0]],
+                    ready_assessments[emergency_pools[0]],
+                    _deadline,
+                )
+                decision = policy.decide(
+                    regime, stay_analysis, candidate_analyses, workload_estimate,
+                    [compat_assessments[r] for r in emergency_pools],
+                    [ready_assessments[r] for r in emergency_pools],
+                    recovery_feasibility=feasibility,
+                    recovery_cost=None,
+                    checkpoint_durable=True,
+                    job_context={"workload_type": workload_type},
+                    risk_context={"interruption_probability": interruption_risk},
+                )
+            else:
+                decision = policy.decide(
+                    regime, stay_analysis, candidate_analyses, workload_estimate,
+                    [compat_assessments[r] for r in emergency_pools],
+                    [ready_assessments[r] for r in emergency_pools],
+                    job_context={"workload_type": workload_type},
+                    risk_context={"interruption_probability": interruption_risk},
+                    favorable_observations=favorable_streaks.get(job_id, 0),
+                    cooldown_remaining_seconds=_cooldown_left,
+                )
+
+            log.info("Job %s decision: action=%s target=%s reason=%s regime=%s", 
+                     job_id, decision.decision.value, decision.target_candidate_id, decision.reason, regime.value)
+
+            if decision.decision.value not in ("MIGRATE", "RECOVER"):
                 continue
 
-            # Cooldown check per job
             last_ts = last_migration_ts.get(job_id)
             if last_ts and (now - last_ts) < args.cooldown_seconds:
-                log.info("Job %s cooldown active; skipping migration (remaining %ss)", job_id, int(args.cooldown_seconds - (now - last_ts)))
+                log.info("Job %s cooldown active; skipping migration", job_id)
+                continue
+
+            if not decision.target_candidate_id:
+                log.warning("Job %s has no target candidate; skipping", job_id)
                 continue
 
             if args.migrate:
-                target_region = args.target_region or decision.target_region
-                provision_overrides = {
-                    "ami_id": args.target_ami_id,
-                    "security_group_id": args.target_sg_id,
-                    "max_spot_price": args.max_spot_price,
-                    "instance_type": instance_type,
-                    "ssh_key_name": cfg.get("ssh_key_name"),
-                }
-                migrator.migrate(
-                    job_id,
-                    target_region,
-                    target_ip=args.target_ip,
-                    autoprovision=args.auto_provision or cfg.get("auto_provision"),
-                    provision_overrides=provision_overrides,
-                )
-                last_migration_ts[job_id] = time.time()
+                if not rate_limiter.acquire(timeout=0):
+                    stats = rate_limiter.get_stats()
+                    log.info("Job %s migration rate-limited (active=%s/%s)", job_id, stats["active_count"], stats["max_concurrent"])
+                    get_metrics().inc("migration_rate_limited_total")
+                    continue
+
+                try:
+                    source_pool_id = job.get("pool_id", f"source-{current_region}")
+                    target_pool_id = decision.target_candidate_id
+                    
+                    compat = compat_assessments[target_pool_id]
+                    ready = ready_assessments[target_pool_id]
+                    
+                    plan = planner.create_plan(
+                        job_id=job_id,
+                        execution_epoch=execution_epoch,
+                        regime=regime,
+                        policy_decision=decision,
+                        source_pool_id=source_pool_id,
+                        target_pool_id=target_pool_id,
+                        workload_estimate=workload_estimate,
+                        recovery_feasibility=feasibility if regime == MigrationRegime.EMERGENCY else None,
+                        stay_analysis=stay_analysis,
+                        candidate_analysis=candidate_analyses[0] if candidate_analyses else None,
+                    )
+
+                    history.record_start(plan, decision, stay_analysis, feasibility if regime == MigrationRegime.EMERGENCY else None)
+
+                    def on_state_change(old, new):
+                        log.info("Migration %s state: %s -> %s", plan.migration_id, old.value, new.value)
+
+                    execution_state = coordinator.execute_plan(plan, on_state_change)
+
+                    if execution_state.current_state.value == "SUCCESS":
+                        history.record_completion(plan.migration_id, "SUCCESS")
+                        last_migration_ts[job_id] = time.time()
+                    elif execution_state.current_state.value == "ABORTED":
+                        history.record_completion(plan.migration_id, "ABORTED")
+                    elif execution_state.current_state.value == "SUPERSEDED":
+                        history.record_completion(plan.migration_id, "SUPERSEDED")
+                    else:
+                        history.record_completion(plan.migration_id, "FAILED", str(execution_state))
+
+                finally:
+                    rate_limiter.release()
             else:
                 log.info("Job %s migration suggested (dry-run). Use --migrate to execute.", job_id)
 
@@ -182,4 +563,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

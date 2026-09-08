@@ -29,10 +29,10 @@ class TestDecisionEngine(unittest.TestCase):
 
     def test_stay_if_saving_small(self):
         prices = {
-            "us-east-1": {"price": 0.12, "volatility": 0.0}, 
+            "us-east-1": {"price": 0.105, "volatility": 0.0}, 
             "us-west-2": {"price": 0.10, "volatility": 0.0}
         }
-        # Difference is 0.02, Threshold is 0.05 -> STAY
+        # Difference is 0.005, Threshold is 0.01 (default) -> STAY
         decision = self.engine.evaluate(prices, "us-east-1")
         self.assertEqual(decision.action, "STAY")
 

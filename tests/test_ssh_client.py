@@ -1,11 +1,25 @@
 import unittest
+import tempfile
+import os
 from unittest.mock import patch, MagicMock
 from orchestrator.utils import SSHClient
 
 class TestSSHClient(unittest.TestCase):
+    def setUp(self):
+        """Create a temporary SSH key file for testing"""
+        self.temp_key = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.pem')
+        self.temp_key.write("dummy key content")
+        self.temp_key.close()
+        self.key_path = self.temp_key.name
+    
+    def tearDown(self):
+        """Clean up temporary key file"""
+        if os.path.exists(self.key_path):
+            os.unlink(self.key_path)
+    
     def test_ssh_client_initialization(self):
         """Test SSHClient initialization"""
-        client = SSHClient(host="1.2.3.4", user="ubuntu")
+        client = SSHClient(host="1.2.3.4", user="ubuntu", key_path=self.key_path)
         self.assertEqual(client.host, "1.2.3.4")
         self.assertEqual(client.user, "ubuntu")
         self.assertEqual(client.port, 22)
@@ -13,7 +27,7 @@ class TestSSHClient(unittest.TestCase):
     
     def test_ssh_client_with_custom_port(self):
         """Test SSHClient with custom port"""
-        client = SSHClient(host="1.2.3.4", port=2222)
+        client = SSHClient(host="1.2.3.4", port=2222, key_path=self.key_path)
         self.assertEqual(client.port, 2222)
     
     @patch('subprocess.run')
@@ -25,7 +39,7 @@ class TestSSHClient(unittest.TestCase):
         mock_result.stderr = ""
         mock_run.return_value = mock_result
         
-        client = SSHClient(host="1.2.3.4")
+        client = SSHClient(host="1.2.3.4", key_path=self.key_path)
         result = client.run_command("echo 'test'")
         
         self.assertEqual(result.returncode, 0)
@@ -41,7 +55,7 @@ class TestSSHClient(unittest.TestCase):
         mock_result.stderr = "Command failed"
         mock_run.return_value = mock_result
         
-        client = SSHClient(host="1.2.3.4")
+        client = SSHClient(host="1.2.3.4", key_path=self.key_path)
         
         with self.assertRaises(RuntimeError):
             client.run_command("invalid_command", check=True)
@@ -55,14 +69,14 @@ class TestSSHClient(unittest.TestCase):
         mock_result.stderr = ""
         mock_run.return_value = mock_result
         
-        client = SSHClient(host="1.2.3.4")
+        client = SSHClient(host="1.2.3.4", key_path=self.key_path)
         client.connect()
         
         self.assertTrue(client.connected)
     
     def test_ssh_close(self):
         """Test SSH connection close"""
-        client = SSHClient(host="1.2.3.4")
+        client = SSHClient(host="1.2.3.4", key_path=self.key_path)
         client.connected = True
         client.close()
         self.assertFalse(client.connected)
