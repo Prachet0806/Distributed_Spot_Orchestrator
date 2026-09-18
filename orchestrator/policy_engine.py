@@ -524,6 +524,8 @@ class PolicyEngine:
         checkpoint_durable: bool = False,
         job_context: dict = None,
         risk_context: dict = None,
+        favorable_observations: int = 99,
+        cooldown_remaining_seconds: float = 0.0,
     ) -> PolicyDecision:
         job_context = job_context or {}
         risk_context = risk_context or {}
@@ -564,4 +566,6 @@ class PolicyEngine:
             compat_assessments,
             ready_assessments,
             job_context,
+            favorable_observations=favorable_observations,
+            cooldown_remaining_seconds=cooldown_remaining_seconds,
         )

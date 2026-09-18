@@ -176,6 +176,9 @@ class DynamoRegistry:
             current_item = self.get(job_id)
             current_state = current_item.get("state")
             v2_ok = is_v2_transition_allowed("job", current_state, to_state)
+            if to_state == current_state and ownership_change:
+                # Epoch rotation (fencing invalidation) without lifecycle move.
+                v2_ok = True
             try:
                 legacy_ok = is_transition_allowed(current_state, to_state)
             except ValueError:

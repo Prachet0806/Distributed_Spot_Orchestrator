@@ -42,6 +42,11 @@ class PlanStore:
                 doc["plan_hash"] = compute_plan_hash(plan)
             except Exception:
                 doc["plan_hash"] = ""
+        # Track B2: optimistic-concurrency counter for step-state CAS.
+        # Local and Dynamo advances both bump it; Dynamo writes condition
+        # on (plan_hash, version) so concurrent advancers cannot double-
+        # advance a step.
+        doc.setdefault("version", 0)
         if self.dynamodb is not None:
             table = self.dynamodb.Table(self.table_name)
             table.put_item(
@@ -87,16 +92,35 @@ class PlanStore:
         if operation_id is not None:
             steps[step_id]["operation_id"] = operation_id
         doc["steps"] = [steps[s["step_id"]] for s in doc.get("steps", [])]
-        # NOTE: with a Dynamo backend, step advance must be a conditional
-        # write on (plan_id, plan_hash, expected step state). The local
-        # backend enforces hash-integrity + expected_from below; the Dynamo
-        # conditional expression lands with the table wiring (Phase 3).
+        expected_version = int(doc.get("version", 0))
+        doc["version"] = expected_version + 1
+        if self.dynamodb is not None:
+            table = self.dynamodb.Table(self.table_name)
+            try:
+                table.update_item(
+                    Key={"plan_id": plan_id},
+                    UpdateExpression="SET steps = :steps, version = version + :one",
+                    ConditionExpression="plan_hash = :h AND version = :v",
+                    ExpressionAttributeValues={
+                        ":steps": deepcopy(doc["steps"]),
+                        ":h": doc.get("plan_hash"),
+                        ":v": expected_version,
+                        ":one": 1,
+                    },
+                )
+            except Exception as exc:
+                if "ConditionalCheckFailedException" in str(exc):
+                    raise PlanStepConflictError(
+                        f"step {step_id}: concurrent advance detected "
+                        f"(plan_hash/version changed)") from exc
+                raise
         stored = self._plans.get(plan_id)
         if stored is not None:
             # Re-check hash integrity on write path.
             if stored.get("plan_hash") != doc.get("plan_hash"):
                 raise PlanStepConflictError("plan_hash mismatch: plan mutated")
             stored["steps"] = deepcopy(doc["steps"])
+            stored["version"] = doc["version"]
         return deepcopy(steps[step_id])
 
     def list_active(self) -> list[dict]:

@@ -63,8 +63,10 @@ class CleanupExecutor:
             self._cleanup_partial_artifacts(plan.migration_id)
             completed.append("partial_artifacts")
 
-        if plan.target_candidate_id:
-            self._terminate_target_instance(plan.target_candidate_id)
+        target = getattr(plan, "target_pool_id", None) or getattr(
+            plan, "target_candidate_id", None)
+        if target:
+            self._terminate_target_instance(target)
             completed.append("target_instance")
 
         return completed

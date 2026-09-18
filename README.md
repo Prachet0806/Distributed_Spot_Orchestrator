@@ -165,7 +165,11 @@ Watch logs for migration decisions and progress.
 ## Roadmap
 
 * Phase 1: Foundation — complete (migration, DynamoDB, auto-provision)
-* Phase 2: Reliability — retries, metrics, circuit breakers
-* Phase 3: Scale — HA orchestrator, leader election, SQS queue
+* Phase 2: Reliability — complete (V2 contracts, CAS/epoch, idempotency, fencing, reconciliation)
+* Phase 3: V2 E2E — emulated green (`tests/test_e2e_emulated.py`); AWS runbook in `docs/e2e-v2.md`
 * Phase 4: Product — job submission API, dashboards, predictive pricing
+
+V1 (`Migrator`/`DecisionEngine`) is frozen legacy behind `--engine v1` and
+will be removed per ADR-024 after AWS E2E + soak. New work targets the V2
+path (`--engine v2`, default): Policy → Planner → Coordinator.
 

@@ -23,6 +23,11 @@ from orchestrator.policy_engine import PolicyEngine, MigrationRegime, ArbitrageP
 from orchestrator.migration_planner import MigrationPlanner
 from orchestrator.migration_coordinator import MigrationCoordinator
 from orchestrator.validator import Validator
+from storage.plan_store import PlanStore
+from storage.checkpoint_store import CheckpointStore
+from storage.audit_store import AuditStore
+from storage.history_store import HistoryStore
+from storage.pool_registry import PoolRegistryStore
 from orchestrator.reconciliation_manager import ReconciliationManager, ReconciliationTrigger
 from orchestrator.cleanup_executor import CleanupExecutor
 from orchestrator.migration_history import MigrationHistory
@@ -227,7 +232,111 @@ def main():
     validator = Validator()
     cleanup = CleanupExecutor(provisioner=provisioner, storage_manager=None, checkpoint_manager=checkpoint_mgr)
     history = MigrationHistory()
-    
+
+    # Track B1: V2 execution stores share one DynamoDB resource. Local
+    # backends until `terraform apply` lands the tables (Track A2); with
+    # registry_backend=dynamo the same objects persist to DynamoDB.
+    # Table names match infra/aws/dynamodb.tf.
+    dynamodb_resource = None
+    if cfg.get("registry_backend") == "dynamo":
+        try:
+            import boto3
+            dynamodb_resource = boto3.resource(
+                "dynamodb", region_name=cfg.get("dynamodb_region"))
+            log.info("V2 execution stores using DynamoDB in %s",
+                     cfg.get("dynamodb_region"))
+        except Exception as exc:
+            log.warning("DynamoDB resource init failed, local stores: %s", exc)
+    else:
+        log.info("V2 execution stores using local backends (registry_backend=%s)",
+                 cfg.get("registry_backend"))
+    plan_store = PlanStore(dynamodb_resource=dynamodb_resource)
+    checkpoint_store = CheckpointStore(dynamodb_resource=dynamodb_resource)
+    audit_store = AuditStore(dynamodb_resource=dynamodb_resource)
+    history_store = HistoryStore(dynamodb_resource=dynamodb_resource)
+    pool_store = PoolRegistryStore(dynamodb_resource=dynamodb_resource)
+    from orchestrator.event_ledger import EventLedger
+    event_ledger = EventLedger(dynamodb_resource=dynamodb_resource)
+
+    def _wired_coordinator():
+        """Coordinator bound to real stores, transports, and fence hooks."""
+        from storage.s3_manager import S3Manager
+        from worker.transport import SSHWorkerTransport
+        from orchestrator.criu_handlers import (
+            make_dump_handler_for, make_restore_handler_for,
+            make_fence_hooks_for,
+        )
+        bucket = cfg.get("checkpoint_bucket")
+        s3 = S3Manager(bucket=bucket) if bucket else None
+        transfer = TransferManager(storage=s3)
+
+        transports: dict[str, SSHWorkerTransport] = {}
+
+        def _transport_for(host: str) -> SSHWorkerTransport:
+            if host not in transports:
+                transports[host] = SSHWorkerTransport(host)
+            return transports[host]
+
+        def _pid_resolver(plan):
+            try:
+                job = registry.get(plan.job_id)
+            except Exception:
+                job = {}
+            return job.get("public_ip"), job.get("pid")
+
+        checkpoint = CheckpointManager(
+            storage=s3,
+            dump_handler=make_dump_handler_for(_transport_for),
+            restore_handler=make_restore_handler_for(_transport_for),
+            checkpoint_store=checkpoint_store,
+        )
+        provisioner_cfg = Provisioner(
+            region=cfg.get("target_region") or cfg.get("source_region"),
+            ami_id=cfg.get("target_ami_id") or None,
+            security_group_id=cfg.get("target_security_group_id") or None,
+            key_name=cfg.get("ssh_key_name"),
+            instance_type=instance_type,
+            max_spot_price=cfg.get("max_spot_price"),
+        )
+        hooks = make_fence_hooks_for(_transport_for, pid_resolver=_pid_resolver)
+
+        def _snapshot_provider(job_id: str, phase: str):
+            """Workload-evidence snapshots for L3 validation.
+
+            Built from registry-side execution telemetry (progress,
+            utilization). Restored execution must present the same shaped
+            evidence; identical pre/post passes tolerance, drift fails it.
+            """
+            try:
+                job = registry.get(job_id)
+            except Exception:
+                return None
+            snap = {
+                "progress": job.get("progress", 0.0) or 0.0,
+                "cpu_utilization_delta": job.get("cpu_utilization", 0.5) or 0.5,
+                "memory_utilization_delta": job.get("memory_utilization", 0.5) or 0.5,
+                "progress_delta": job.get("progress", 0.0) or 0.0,
+            }
+            return snap
+
+        return MigrationCoordinator(
+            registry=registry,
+            provisioner=provisioner_cfg,
+            checkpoint_manager=checkpoint,
+            transfer_manager=transfer,
+            validator=validator,
+            cleanup_executor=CleanupExecutor(
+                provisioner=provisioner_cfg, storage_manager=s3,
+                checkpoint_manager=checkpoint),
+            plan_store=plan_store,
+            checkpoint_store=checkpoint_store,
+            audit_store=audit_store,
+            fence_invalidate=hooks["invalidate"],
+            fence_terminate=hooks["terminate"],
+            fence_verify=hooks["verify"],
+            snapshot_provider=_snapshot_provider,
+        )
+
     coordinator = MigrationCoordinator(
         registry=registry,
         provisioner=provisioner,
@@ -235,6 +344,9 @@ def main():
         transfer_manager=transfer_mgr,
         validator=validator,
         cleanup_executor=cleanup,
+        plan_store=plan_store,
+        checkpoint_store=checkpoint_store,
+        audit_store=audit_store,
     )
     
     reconciliation = ReconciliationManager(
@@ -463,10 +575,27 @@ def main():
             _cooldown_left = max(0.0, _cooldown_cfg - (now - _last)) if _last else 0.0
 
             feasibility = None
+            absolute_deadline = None
             if regime == MigrationRegime.EMERGENCY and emergency_pools:
-                # Phase 1b: absolute-deadline ownership still lives here until
-                # Market/Risk Monitor takes it (Phase 3). Default 120s budget.
-                _deadline = 120.0
+                # Protocols §24.1: computed once at ingestion (here: spot-flag
+                # detection) until Market/Risk Monitor owns it. Window comes
+                # from the frozen baseline; provider notice windows replace it.
+                from orchestrator.deadlines import (
+                    compute_absolute_deadline, remaining_budget_seconds,
+                )
+                from datetime import timezone
+                try:
+                    _baseline = load_v2_baseline()
+                    _window = float(_baseline.get("execution", {}).get(
+                        "emergency_window_seconds", 120.0))
+                except Exception:
+                    _window, _baseline = 120.0, None
+                _detected_at = datetime.now(timezone.utc)
+                absolute_deadline = compute_absolute_deadline(
+                    _detected_at, _window, current_region,
+                    emergency_pools[0], cfg.get("dynamodb_region"),
+                    _baseline)
+                _deadline = remaining_budget_seconds(absolute_deadline) or _window
                 feasibility = feasibility_engine.evaluate(
                     workload_estimate,
                     compat_assessments[emergency_pools[0]],
@@ -519,10 +648,10 @@ def main():
                 try:
                     source_pool_id = job.get("pool_id", f"source-{current_region}")
                     target_pool_id = decision.target_candidate_id
-                    
+
                     compat = compat_assessments[target_pool_id]
                     ready = ready_assessments[target_pool_id]
-                    
+
                     plan = planner.create_plan(
                         job_id=job_id,
                         execution_epoch=execution_epoch,
@@ -534,14 +663,19 @@ def main():
                         recovery_feasibility=feasibility if regime == MigrationRegime.EMERGENCY else None,
                         stay_analysis=stay_analysis,
                         candidate_analysis=candidate_analyses[0] if candidate_analyses else None,
+                        absolute_deadline=absolute_deadline,
                     )
+                    # Fencing needs the source execution identity at run time.
+                    plan.pid = job.get("pid")
+                    plan.source_host = job.get("public_ip")
 
                     history.record_start(plan, decision, stay_analysis, feasibility if regime == MigrationRegime.EMERGENCY else None)
 
                     def on_state_change(old, new):
                         log.info("Migration %s state: %s -> %s", plan.migration_id, old.value, new.value)
 
-                    execution_state = coordinator.execute_plan(plan, on_state_change)
+                    executor = _wired_coordinator()
+                    execution_state = executor.execute_plan(plan, on_state_change)
 
                     if execution_state.current_state.value == "SUCCESS":
                         history.record_completion(plan.migration_id, "SUCCESS")

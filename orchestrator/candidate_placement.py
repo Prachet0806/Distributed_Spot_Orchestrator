@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 from enum import Enum
 import uuid
 import yaml
@@ -26,6 +26,8 @@ class PlacementEligibility(str, Enum):
     INELIGIBLE_COMPATIBILITY = "INELIGIBLE_COMPATIBILITY"
     INELIGIBLE_READINESS = "INELIGIBLE_READINESS"
     INELIGIBLE_UNKNOWN = "INELIGIBLE_UNKNOWN"
+    INELIGIBLE_POOL_LIFECYCLE = "INELIGIBLE_POOL_LIFECYCLE"
+    INELIGIBLE_CONCURRENCY = "INELIGIBLE_CONCURRENCY"
 
 
 @dataclass
@@ -120,6 +122,9 @@ class PlacementInput:
     risk_analysis: Dict
     topology: Dict
     capacity_confidence: float
+    # Track C3: pool lifecycle (§7.4.2). Defaults ACTIVE for inputs built
+    # before lifecycle tracking landed.
+    pool_lifecycle: str = "ACTIVE"
 
 
 class PlacementEngine:
@@ -132,13 +137,21 @@ class PlacementEngine:
         ttl_seconds: float = PLACEMENT_TTL_SECONDS,
         migration_time_estimates: Optional[Dict[str, float]] = None,
         freshness: Optional[Dict[str, float]] = None,
+        regime: Optional[str] = None,
+        concurrency: Optional[Any] = None,
     ) -> PlacementRecommendation:
+        """Rank candidates. `regime` gates DEGRADED pools (emergency
+        excludes them); `concurrency` is a PoolConcurrencyTracker peeked
+        (never consumed) for per-pool headroom — exhausted pools yield
+        CAPACITY_UNAVAILABLE exclusion, not queueing.
+        """
         now = datetime.utcnow()
         # Pre-normalize operational cost across ELIGIBLE candidates only.
         eligible_costs = []
         eligibility_cache: Dict[str, PlacementEligibility] = {}
         for inp in inputs:
-            el = self._check_eligibility(inp)
+            el = self._check_eligibility(inp, regime=regime,
+                                         concurrency=concurrency)
             eligibility_cache[inp.pool_id] = el
             if el == PlacementEligibility.ELIGIBLE:
                 eligible_costs.append(self._extract_cost(inp))
@@ -228,7 +241,8 @@ class PlacementEngine:
             assessment_snapshots=snapshots,
         )
 
-    def _check_eligibility(self, inp: PlacementInput) -> PlacementEligibility:
+    def _check_eligibility(self, inp: PlacementInput, regime: Optional[str] = None,
+                           concurrency: Optional[Any] = None) -> PlacementEligibility:
         if inp.compatibility_status.value == "UNKNOWN":
             if self.policy.hard_constraints.get("reject_unknown", True):
                 return PlacementEligibility.INELIGIBLE_UNKNOWN
@@ -237,6 +251,20 @@ class PlacementEngine:
         if inp.readiness_status.value != "READY":
             if self.policy.hard_constraints.get("require_ready", True):
                 return PlacementEligibility.INELIGIBLE_READINESS
+        from orchestrator.pool_lifecycle import eligible_for_regime
+        try:
+            lifecycle_ok = eligible_for_regime(
+                getattr(inp, "pool_lifecycle", "ACTIVE"), regime or "ARBITRAGE")
+        except ValueError:
+            lifecycle_ok = False
+        if not lifecycle_ok:
+            return PlacementEligibility.INELIGIBLE_POOL_LIFECYCLE
+        if concurrency is not None:
+            try:
+                if not concurrency.would_admit(inp.pool_id):
+                    return PlacementEligibility.INELIGIBLE_CONCURRENCY
+            except Exception:
+                return PlacementEligibility.INELIGIBLE_CONCURRENCY
         return PlacementEligibility.ELIGIBLE
 
     def _extract_cost(self, inp: PlacementInput) -> float:

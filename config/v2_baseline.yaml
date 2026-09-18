@@ -26,6 +26,16 @@ execution:
   coordinator_operation_timeout_seconds: 300
   step_timeout_seconds: 60
   unknown_resolution_timeout_seconds: 30
+  # Protocols §24.1: WAN allowances are initial estimates; replace with
+  # measured P95 per-pair latencies before the multi-region pilot (Track A6).
+  ingestion_skew_margin_seconds: 5
+  # Interruption notice window when the provider signal carries none
+  # (Track A: replaced by real IMDS notice windows as ingestion lands).
+  emergency_window_seconds: 120
+  wan_allowance_seconds:
+    default: 15.0
+    pairs:
+      "us-east-1/us-west-2": 20.0
 
 retry:
   operation_max_attempts: 3

@@ -42,6 +42,7 @@ class PlanStepState(str, Enum):
 
 
 class PlanStepType(str, Enum):
+    PRECHECK = "PRECHECK"
     CHECKPOINT = "CHECKPOINT"
     PERSIST = "PERSIST"
     PROVISION = "PROVISION"
@@ -71,6 +72,7 @@ class Criticality(str, Enum):
 
 # Normative per-step rollback/criticality (Protocols #4 §6.5, #8 §10.3).
 STEP_ROLLBACK: dict[str, RollbackClass] = {
+    "PRECHECK": RollbackClass.NONE,
     "CHECKPOINT": RollbackClass.FULL_ROLLBACK,
     "PERSIST": RollbackClass.FULL_ROLLBACK,
     "PROVISION": RollbackClass.FULL_ROLLBACK,
@@ -84,12 +86,16 @@ STEP_ROLLBACK: dict[str, RollbackClass] = {
 }
 
 STEP_CRITICALITY: dict[str, Criticality] = {
+    "PRECHECK": Criticality.BEST_EFFORT,
     "CHECKPOINT": Criticality.CORRECTNESS_CRITICAL,
+    "PERSIST": Criticality.EXECUTION_CRITICAL,
     "RESTORE": Criticality.CORRECTNESS_CRITICAL,
     "VALIDATE": Criticality.CORRECTNESS_CRITICAL,
     "PROVISION": Criticality.EXECUTION_CRITICAL,
     "TRANSFER": Criticality.EXECUTION_CRITICAL,
     "FENCE": Criticality.SAFETY_CRITICAL,
+    "ACTIVATE": Criticality.EXECUTION_CRITICAL,
+    "FINALIZE": Criticality.BEST_EFFORT,
     "CLEANUP": Criticality.BEST_EFFORT,
 }
 
@@ -113,6 +119,10 @@ class PlanStep:
     rollback_class: RollbackClass = RollbackClass.NONE
     resource_requirements: dict = field(default_factory=dict)
     state: PlanStepState = PlanStepState.PENDING
+    # Test-only fault-injection hooks (Protocols §10.8 rule 6). Production
+    # plans MUST carry an empty list; the Coordinator rejects non-empty
+    # lists unless the test harness flag is set.
+    failure_injection_points: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         if isinstance(self.type, str):
@@ -187,6 +197,7 @@ def canonical_plan_dict(plan: MigrationPlanV2) -> dict:
                 "join_policy": s.join_policy,
                 "rollback_class": str(s.rollback_class),
                 "resource_requirements": s.resource_requirements,
+                "failure_injection_points": sorted(s.failure_injection_points or []),
             }
             for s in plan.steps
         ],

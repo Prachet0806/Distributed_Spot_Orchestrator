@@ -67,6 +67,17 @@ class CandidatePool:
     placement_constraints: PoolPlacementConstraints = field(default_factory=PoolPlacementConstraints)
     created_at: datetime = field(default_factory=datetime.utcnow)
     version: int = 1
+    # Track C3: pool lifecycle (ACTIVE→DEGRADED→RETIRING→RETIRED, §7.4.2)
+    # and per-pool migration concurrency limit (double-guarded).
+    lifecycle: str = "ACTIVE"
+    max_concurrent_migrations: int = 2  # v2_baseline concurrency default
+
+    def transition_lifecycle(self, target: str) -> str:
+        """Advance lifecycle along legal edges; raises on illegal jumps."""
+        from orchestrator.pool_lifecycle import transition_lifecycle
+        self.lifecycle = transition_lifecycle(self.lifecycle, target)
+        self.version += 1
+        return self.lifecycle
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +94,8 @@ class CandidatePool:
             "placement_constraints": self.placement_constraints.__dict__,
             "created_at": self.created_at.isoformat(),
             "version": self.version,
+            "lifecycle": self.lifecycle,
+            "max_concurrent_migrations": self.max_concurrent_migrations,
         }
 
     @classmethod
@@ -107,6 +120,8 @@ class CandidatePool:
             placement_constraints=constraints,
             created_at=datetime.fromisoformat(data["created_at"]),
             version=data.get("version", 1),
+            lifecycle=data.get("lifecycle", "ACTIVE"),
+            max_concurrent_migrations=int(data.get("max_concurrent_migrations", 2)),
         )
 
 

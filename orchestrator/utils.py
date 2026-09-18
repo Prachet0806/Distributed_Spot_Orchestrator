@@ -74,7 +74,8 @@ class SSHClient:
         key_path: Optional[str] = None,
         port: int = 22,
         timeout: int = 30,
-        known_hosts_path: Optional[str] = None
+        known_hosts_path: Optional[str] = None,
+        strict: bool = False,
     ):
         """
         Initialize SSH client.
@@ -86,6 +87,8 @@ class SSHClient:
             port: SSH port (default: 22)
             timeout: Connection timeout in seconds (default: 30)
             known_hosts_path: Path to known_hosts file (default: ~/.ssh/known_hosts)
+            strict: Track D2 — require a pre-pinned known_hosts file and
+                refuse first-connect TOFU instead of accept-new.
         
         Raises:
             ValueError: If host is invalid or key path doesn't exist
@@ -130,6 +133,7 @@ class SSHClient:
         
         # Known hosts for host key verification
         self.known_hosts_path = known_hosts_path or os.path.expanduser("~/.ssh/known_hosts")
+        self.strict = strict
         
         self.connected = False
     
@@ -190,6 +194,12 @@ class SSHClient:
                 "-o", "StrictHostKeyChecking=yes",
                 "-o", f"UserKnownHostsFile={self.known_hosts_path}"
             ])
+        elif self.strict:
+            # Track D2: pinned deployments rule on first-connect TOFU.
+            raise RuntimeError(
+                f"Pinned known_hosts file not found: {self.known_hosts_path}. "
+                "Refusing first-connect TOFU (strict mode); pin keys first."
+            )
         else:
             # Warn but allow first connection (will add to known_hosts)
             logging.warning(

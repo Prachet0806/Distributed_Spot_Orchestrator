@@ -16,6 +16,7 @@ def provision_instance(
     profile: str | None = None,
     timeout: int = 300,
     idempotency_token: str | None = None,
+    tags: dict | None = None,
 ):
     """
     Provision a spot instance and return (instance_id, public_ip, public_dns).
@@ -57,9 +58,16 @@ def provision_instance(
         idempotency_token = str(uuid.uuid4())
     
     logger.info(f"Provisioning spot instance in {region} (token: {idempotency_token[:8]})")
-    
+
     session = boto3.Session(profile_name=profile, region_name=region) if profile else boto3.Session(region_name=region)
     ec2 = session.client("ec2", region_name=region)
+
+    tag_spec: list = []
+    if tags:
+        tag_spec = [{
+            "ResourceType": "instance",
+            "Tags": [{"Key": str(k), "Value": str(v)} for k, v in tags.items()],
+        }]
 
     launch_spec = {
         "ImageId": ami_id,
@@ -74,6 +82,8 @@ def provision_instance(
         },
         "ClientToken": idempotency_token,  # Idempotent provisioning
     }
+    if tag_spec:
+        launch_spec["TagSpecifications"] = tag_spec
     if max_spot_price:
         launch_spec["InstanceMarketOptions"]["SpotOptions"]["MaxPrice"] = max_spot_price
 

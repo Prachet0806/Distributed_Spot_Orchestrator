@@ -46,6 +46,14 @@ class CheckpointStore:
         except KeyError:
             raise KeyError(f"checkpoint {checkpoint_id} not found")
 
+    def any_durable(self, lineage_id: str) -> bool:
+        """True when any DURABLE/VALIDATED checkpoint exists for a lineage."""
+        return any(
+            d.get("lineage_id") == lineage_id
+            and d.get("durability") in ("DURABLE", "VALIDATED")
+            for d in self._items.values()
+        )
+
     def set_durability(self, checkpoint_id: str, to_state: str) -> dict:
         doc = self.get(checkpoint_id)
         cur = doc.get("durability", "LOCAL")
