@@ -56,6 +56,71 @@ class PlanStore:
         self._plans[pid] = doc
         return deepcopy(doc)
 
+    # -- S16 admission seam (Track B1): execution-shaped plan documents --
+    # The main loop admits every created plan so crash recovery and the
+    # S16 pre-emption trigger can see it. Steps use the execution shape
+    # ({step_id, type, state, operation_id}) — NOT the planner's duration
+    # estimates — so list_active/frontier logic applies unchanged.
+    # `outcome` is None until mark_plan_outcome stamps it terminal.
+    PLAN_OUTCOMES = frozenset(
+        {"SUCCEEDED", "FAILED", "ABORTED", "SUPERSEDED"})
+
+    def put_plan_doc(self, doc: dict) -> dict:
+        stored = deepcopy(dict(doc or {}))
+        pid = stored.get("plan_id")
+        if not pid:
+            raise ValueError("plan doc requires plan_id")
+        if pid in self._plans:
+            raise PlanExistsError(f"plan {pid} already exists (immutable)")
+        stored.setdefault("version", 0)
+        stored.setdefault("outcome", None)
+        for step in stored.get("steps", []) or []:
+            if isinstance(step, dict):
+                step.setdefault("state", "PENDING")
+                step.setdefault("operation_id", None)
+        if self.dynamodb is not None:
+            table = self.dynamodb.Table(self.table_name)
+            table.put_item(
+                Item=deepcopy(stored),
+                ConditionExpression="attribute_not_exists(plan_id)",
+            )
+        self._plans[pid] = stored
+        return deepcopy(stored)
+
+    def mark_plan_outcome(self, plan_id: str, outcome: str) -> dict:
+        """Stamp a plan-level terminal outcome (S16: active-set hygiene).
+
+        Plans admitted PENDING would otherwise read as in-flight forever.
+        Unknown plan_id or outcome raises; re-marking a terminal plan
+        raises (outcome is write-once, like the plan body).
+        """
+        if outcome not in self.PLAN_OUTCOMES:
+            raise ValueError(f"unknown plan outcome {outcome!r}")
+        try:
+            doc = self._plans[plan_id]
+        except KeyError:
+            raise KeyError(f"plan {plan_id} not found")
+        if doc.get("outcome") in self.PLAN_OUTCOMES:
+            raise PlanStepConflictError(
+                f"plan {plan_id} outcome already {doc.get('outcome')}")
+        doc["outcome"] = outcome
+        doc["version"] = int(doc.get("version", 0)) + 1
+        if self.dynamodb is not None:
+            try:
+                self.dynamodb.Table(self.table_name).update_item(
+                    Key={"plan_id": plan_id},
+                    UpdateExpression="SET #o = :o, version = version + :one",
+                    ConditionExpression="attribute_not_exists(#o)",
+                    ExpressionAttributeNames={"#o": "outcome"},
+                    ExpressionAttributeValues={":o": outcome, ":one": 1},
+                )
+            except Exception as exc:
+                if "ConditionalCheckFailedException" in str(exc):
+                    raise PlanStepConflictError(
+                        f"plan {plan_id} outcome already set") from exc
+                raise
+        return deepcopy(doc)
+
     def get_plan(self, plan_id: str) -> dict:
         if self.dynamodb is not None:
             table = self.dynamodb.Table(self.table_name)
@@ -127,8 +192,28 @@ class PlanStore:
         terminal = {"SUCCEEDED", "FAILED", "SKIPPED"}
         out = []
         for doc in self._plans.values():
+            # Plan-level outcome (S16 seam) outranks step inference: a
+            # marked plan is never in-flight, even with PENDING steps.
+            if doc.get("outcome") in self.PLAN_OUTCOMES:
+                continue
             states = {s.get("state", "PENDING") for s in doc.get("steps", [])}
             if states and states <= terminal:
                 continue
             out.append(deepcopy(doc))
         return out
+
+    def find_preemptible_plan(self, job_id: str, migration_id: str) -> Optional[dict]:
+        """S16 trigger lookup: newest non-terminal, non-EMERGENCY plan doc
+        for this job+attempt (pre-fence arbitrage eligible for emergency
+        pre-emption). None when nothing qualifies. Read-only."""
+        cands = [
+            doc for doc in self._plans.values()
+            if doc.get("job_id") == job_id
+            and doc.get("migration_id") == migration_id
+            and doc.get("outcome") not in self.PLAN_OUTCOMES
+            and str(doc.get("regime", "")).upper() != "EMERGENCY"
+        ]
+        if not cands:
+            return None
+        cands.sort(key=lambda d: d.get("created_at", ""))
+        return deepcopy(cands[-1])

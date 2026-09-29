@@ -172,3 +172,23 @@ class ControlPlaneLease:
             self.store.release(self.lease_id, self.owner)
         finally:
             self._holder = False
+
+
+def check_lease_for_iteration(lease: "ControlPlaneLease") -> tuple[bool, str]:
+    """Per-iteration self-fencing guard for the main loop (Sprint 4).
+
+    Returns (True, "continue") when this process holds a fresh lease,
+    (False, reason) when it must halt actuation: "not-holder" (never
+    acquired) or "fenced" (heartbeat refused — a rival holds the record).
+    Heartbeats on schedule; a due heartbeat that succeeds still continues.
+    Pure over the injected lease (clocks injectable via the lease).
+    """
+    try:
+        if not lease.is_holder():
+            return False, "not-holder"
+        if lease.heartbeat_due():
+            if not lease.heartbeat():
+                return False, "fenced"
+        return True, "continue"
+    except Exception as exc:
+        return False, f"lease-error: {exc}"

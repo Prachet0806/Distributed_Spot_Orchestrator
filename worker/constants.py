@@ -8,7 +8,6 @@ Kept separate from orchestrator constants since worker runs independently.
 from common_constants import (
     WORKSPACE_ROOT,
     CHECKPOINT_DIR,
-    FLAG_DIR,
     SPOT_INTERRUPT_FLAG,
     READY_FLAG,
     REQUIRED_CHECKPOINT_FILES,

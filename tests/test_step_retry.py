@@ -12,7 +12,7 @@ import pytest
 
 from orchestrator.migration_planner import MigrationPlanner, MigrationState
 from orchestrator.migration_coordinator import (
-    MigrationCoordinator, MigrationFailed, OperationUnknownError,
+    MigrationCoordinator, OperationUnknownError,
 )
 from orchestrator.models_v2 import Criticality
 from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
@@ -57,7 +57,7 @@ def _coord(sleeps, **kw):
     kw.setdefault("step_timeout_seconds", 30.0)
     return MigrationCoordinator(
         registry=SimpleNamespace(get=lambda j: None,
-                                 transition=lambda *a, **k: None),
+                                 transition=lambda *a, **_k: None),
         provisioner=SimpleNamespace(), checkpoint_manager=SimpleNamespace(),
         transfer_manager=SimpleNamespace(), validator=SimpleNamespace(),
         cleanup_executor=SimpleNamespace(), **kw)
@@ -351,7 +351,7 @@ def test_supersede_and_replan_marks_superseded_and_returns_successor():
 
     coord = MigrationCoordinator(
         registry=SimpleNamespace(get=lambda j: None,
-                                 transition=lambda *a, **k: None),
+                                 transition=lambda *a, **_k: None),
         provisioner=SimpleNamespace(), checkpoint_manager=SimpleNamespace(),
         transfer_manager=SimpleNamespace(), validator=SimpleNamespace(),
         cleanup_executor=_Cleanup())
@@ -384,13 +384,13 @@ def test_checkpoint_phase_retries_reuse_operation_id(tmp_path):
     coord = MigrationCoordinator(
         registry=reg, provisioner=SimpleNamespace(),
         checkpoint_manager=CheckpointManager(
-            storage=SimpleNamespace(upload=lambda *a, **k: None,
-                                    download=lambda *a, **k: None,
+            storage=SimpleNamespace(upload=lambda *a, **_k: None,
+                                    download=lambda *a, **_k: None,
                                     bucket="bkt"),
             dump_handler=flaky_dump),
         transfer_manager=SimpleNamespace(), validator=SimpleNamespace(),
         cleanup_executor=SimpleNamespace(
-            cleanup_migration=lambda *a, **k: None),
+            cleanup_migration=lambda *a, **_k: None),
         step_timeout_seconds=30.0, sleep_fn=sleeps.append)
     out = coord.execute_plan(_plan())
     assert out.current_state == MigrationState.FAILED

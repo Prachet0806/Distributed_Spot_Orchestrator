@@ -11,10 +11,6 @@ from orchestrator.checkpoint_manager import CheckpointResult, RestoreResult
 WRAPPER_PATH = "/opt/job_workspace/checkpoint/criu_wrapper.sh"
 
 
-def _sh(command: str) -> str:
-    return command
-
-
 def make_dump_handler(transport, wrapper_path: str = WRAPPER_PATH,
                       workspace_root: str = "/opt/job_workspace"):
     def _dump(*, job_id: str, pid: int, host=None, timeout: float = 280.0):

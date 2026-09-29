@@ -48,11 +48,27 @@ class CheckpointStore:
 
     def any_durable(self, lineage_id: str) -> bool:
         """True when any DURABLE/VALIDATED checkpoint exists for a lineage."""
-        return any(
-            d.get("lineage_id") == lineage_id
-            and d.get("durability") in ("DURABLE", "VALIDATED")
-            for d in self._items.values()
-        )
+        return self.latest_durable(lineage_id) is not None
+
+    def latest_durable(self, lineage_id: str) -> Optional[dict]:
+        """Latest DURABLE/VALIDATED checkpoint doc for a lineage, else None.
+
+        Lineage convention: lineage_id == job_id (see criu_handlers,
+        checkpoint_manager fallback). Never raises: missing lineage or
+        unreadable rows yield None (durability is never inferred).
+        """
+        try:
+            cands = [
+                d for d in self._items.values()
+                if d.get("lineage_id") == lineage_id
+                and d.get("durability") in ("DURABLE", "VALIDATED")
+            ]
+        except (AttributeError, TypeError):
+            return None
+        if not cands:
+            return None
+        cands.sort(key=lambda d: d.get("created_at", ""))
+        return deepcopy(cands[-1])
 
     def set_durability(self, checkpoint_id: str, to_state: str) -> dict:
         doc = self.get(checkpoint_id)

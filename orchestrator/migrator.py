@@ -299,7 +299,7 @@ def rollback(self, job_id, reason="migration_failed"):
                 try:
                     ssh = SSHClient(source_ip)
                     ssh.connect()
-                    ssh.run_command(f"sudo pkill -f 'python3 /opt/job_workspace/jobs/monte_carlo.py' 2>/dev/null || true")
+                    ssh.run_command("sudo pkill -f 'python3 /opt/job_workspace/jobs/monte_carlo.py' 2>/dev/null || true")
                     ssh.close()
                 except Exception:
                     pass
@@ -322,7 +322,7 @@ def rollback(self, job_id, reason="migration_failed"):
                 try:
                     ssh = SSHClient(target_ip)
                     ssh.connect()
-                    ssh.run_command(f"sudo shutdown -h now 2>/dev/null || true")
+                    ssh.run_command("sudo shutdown -h now 2>/dev/null || true")
                     ssh.run_command(f"sudo aws ec2 terminate-instances --instance-ids {target_instance_id} 2>/dev/null || true")
                     ssh.close()
                 except Exception:

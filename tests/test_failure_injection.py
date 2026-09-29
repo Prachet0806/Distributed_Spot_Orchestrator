@@ -140,8 +140,7 @@ class TestS3FailureInjection:
         # Mock S3 client to timeout
         with patch.object(manager.s3, "upload_file") as mock_upload:
             from botocore.exceptions import ReadTimeoutError
-            from urllib3.exceptions import ReadTimeoutError as UrllibReadTimeoutError
-            
+
             mock_upload.side_effect = ReadTimeoutError(
                 endpoint_url="https://s3.amazonaws.com",
                 error="Read timeout"
@@ -156,7 +155,7 @@ class TestS3FailureInjection:
         
         # Mock S3 download to return corrupted data
         with patch.object(manager.s3, "download_file") as mock_download:
-            def download_side_effect(bucket, key, path):
+            def download_side_effect(_bucket, key, path):
                 if key.endswith(".tar.gz"):
                     with open(path, "wb") as f:
                         f.write(b"corrupted data")
@@ -341,7 +340,7 @@ class TestNetworkPartitionScenarios:
         client = SSHClient(host="10.0.0.1", key_path=temp_ssh_key)
         call_count = [0]
         
-        def flaky_ssh(*args, **kwargs):
+        def flaky_ssh(*_args, **kwargs):
             call_count[0] += 1
             if call_count[0] <= 2:
                 raise subprocess.TimeoutExpired(cmd="ssh", timeout=30)
@@ -357,7 +356,7 @@ class TestNetworkPartitionScenarios:
         manager = S3Manager(bucket="test-bucket")
         call_count = [0]
         
-        def flaky_upload(*args, **kwargs):
+        def flaky_upload(*_args, **kwargs):
             call_count[0] += 1
             if call_count[0] < 3:
                 from botocore.exceptions import ClientError

@@ -8,7 +8,6 @@ Eliminates hardcoded values and magic numbers across the codebase.
 from common_constants import (
     WORKSPACE_ROOT,
     CHECKPOINT_DIR,
-    FLAG_DIR,
     SPOT_INTERRUPT_FLAG,
     READY_FLAG,
     REQUIRED_CHECKPOINT_FILES,
@@ -19,11 +18,10 @@ COOLDOWN_SECONDS = 3 * 60 * 60  # 3 hours between migrations per job
 STUCK_JOB_THRESHOLD = 15 * 60    # 15 minutes - alert if job stuck in non-RUNNING state
 MIGRATION_POLL_INTERVAL = 60     # 60 seconds between orchestrator polls
 
-# Retry configuration
+# Retry configuration (legacy single-value knobs; §10.8 step_retry.py +
+# config/v2_baseline.yaml `retry:` own the V2 budgets)
 DEFAULT_RETRIES = 3
 INITIAL_RETRY_DELAY = 2          # seconds
-MAX_RETRY_DELAY = 60             # seconds
-RETRY_BACKOFF_FACTOR = 2
 
 # Cache TTLs
 PRICE_CACHE_TTL = 90             # 90 seconds (spot prices update ~5min)

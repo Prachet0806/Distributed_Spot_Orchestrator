@@ -85,6 +85,11 @@ class CheckpointManager:
                 result = None
         if result is None:
             raise KeyError(f"checkpoint {checkpoint_id} unknown: dump first")
+        if result.status == "DURABLE":
+            # I7 executor-side idempotency: re-persist of an already
+            # DURABLE checkpoint is a no-op (bytes are already there).
+            logger.info("Persist replay %s -> already DURABLE", checkpoint_id)
+            return result
         result.status = "PERSISTING"
         if self.storage is not None:
             if job_id is None:

@@ -44,4 +44,66 @@ class HistoryStore:
             raise KeyError(f"history {migration_id} not found")
 
     def list_by_job(self, job_id: str) -> list[dict]:
-        return [deepcopy(r) for r in self._records.values() if r.get("job_id") == job_id]
+        rows = [deepcopy(r) for r in self._records.values() if r.get("job_id") == job_id]
+        if self.dynamodb is not None:
+            # Cross-process read: scan the durable table for this job.
+            # Best-effort; local rows win on migration_id conflict.
+            try:
+                table = self.dynamodb.Table(self.table_name)
+                resp = table.scan(
+                    FilterExpression="job_id = :j",
+                    ExpressionAttributeValues={":j": job_id},
+                )
+                for item in resp.get("Items", []):
+                    if item.get("migration_id") not in self._records:
+                        rows.append(deepcopy(item))
+            except Exception:
+                pass
+        return rows
+
+    def save(self, record) -> dict:
+        """Upsert adapter for MigrationHistory (which calls storage.save).
+
+        Accepts a MigrationRecord dataclass or a plain dict. Unlike
+        insert/enrich (insert-once, enrich-once), save overwrites so the
+        repeated record_start → record_step → record_completion →
+        record_cleanup sequence persists every transition. Local write
+        always applies; DynamoDB put is best-effort when wired.
+        """
+        from dataclasses import asdict, is_dataclass
+        from datetime import datetime
+        from enum import Enum
+
+        if is_dataclass(record):
+            doc = asdict(record)
+        elif isinstance(record, dict):
+            doc = deepcopy(record)
+        else:
+            mid = getattr(record, "migration_id", None)
+            d = dict(getattr(record, "__dict__", {}))
+            if mid is not None:
+                d.setdefault("migration_id", mid)
+            doc = deepcopy(d)
+
+        def _norm(v):
+            if isinstance(v, datetime):
+                return v.isoformat()
+            if isinstance(v, Enum):
+                return v.value
+            if isinstance(v, dict):
+                return {k: _norm(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_norm(x) for x in v]
+            return v
+
+        doc = {k: _norm(v) for k, v in doc.items()}
+        mid = doc.get("migration_id")
+        if not mid:
+            raise ValueError("history record requires migration_id")
+        self._records[mid] = deepcopy(doc)
+        if self.dynamodb is not None:
+            try:
+                self.dynamodb.Table(self.table_name).put_item(Item=deepcopy(doc))
+            except Exception:
+                pass
+        return deepcopy(doc)

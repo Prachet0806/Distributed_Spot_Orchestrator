@@ -300,7 +300,6 @@ class ProactivePolicy:
             )
 
         ready_candidates = [r for r in ready_assessments if r.status.value == "READY"]
-        compat_map = {c.pool_id: c for c in compat_assessments}
 
         if not ready_candidates:
             return PolicyDecision(

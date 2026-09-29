@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional, Callable, Any
 import concurrent.futures
@@ -57,8 +57,11 @@ class MigrationExecutionState:
     expected_epoch: int = 0  # registry epoch we expect (rotates at fencing)
     deadline_exceeded: bool = False
     abort_requested: bool = False
+    replan_requested: Optional[str] = None
+    replan_context: dict = field(default_factory=dict)
     superseded_by: Optional[str] = None
     target_instance_id: Optional[str] = None
+    target_pid: Optional[int] = None
     checkpoint_id: Optional[str] = None
     provisioned: bool = False
     pool_slot_held: bool = False  # Track C3: per-pool concurrency slot
@@ -129,6 +132,19 @@ class MigrationCoordinator:
         # Track B1/I14: append-only AuditStore. FENCE_STARTED is
         # audit-before-irreversible: a failed write blocks fencing.
         audit_store: Optional[Any] = None,
+        # Sprint 2 (Track C2): optional sink receiving per-execution
+        # validation context after restore
+        # ({migration_id, job_id, execution_epoch, target_host,
+        # target_pid}). Feeds Validator L1/L2 transport probes; None
+        # disables publication (probes report inconclusive, never stub-pass).
+        execution_context_sink: Optional[Callable[[dict], None]] = None,
+        # PA-8 (invariant 2): optional pool-definition resolver
+        # (target_pool_id -> definition dict). When present AND the
+        # provisioner offers provision_from_pool, execution provisions
+        # from the candidate definition (region/AMI/SG authoritative).
+        # Otherwise the legacy candidate-ID path is used. None preserves
+        # legacy behavior exactly (all existing tests).
+        pool_definition_provider: Optional[Callable[[str], Optional[dict]]] = None,
     ):
         self.registry = registry
         self.provisioner = provisioner
@@ -148,6 +164,8 @@ class MigrationCoordinator:
         self._sleep = sleep_fn or time.sleep
         self._pool_concurrency = pool_concurrency
         self._audit_store = audit_store
+        self._exec_ctx_sink = execution_context_sink
+        self._pool_definition_provider = pool_definition_provider
         self._monotonic = monotonic_clock or time.monotonic
         self._fence_invalidate = fence_invalidate
         self._fence_terminate = fence_terminate
@@ -157,7 +175,6 @@ class MigrationCoordinator:
 
         self._execution_state: Optional[MigrationExecutionState] = None
         self._state_machine = self._build_state_machine()
-        self._deadline_monitor_active = False
         self._start_mono = 0.0
 
     def _build_state_machine(self) -> dict:
@@ -220,8 +237,21 @@ class MigrationCoordinator:
 
         if plan.is_expired():
             logger.warning(f"Plan {plan.migration_id} expired before execution")
+            # Replan-viable (§25/S04): a successor with fresh evidence gets
+            # a new expiry window. The main loop decides via replan.py.
+            # The job returns to RUNNING — nothing actuated, source healthy
+            # (mirrors FULL_ROLLBACK; FAILED is terminal per v2_transitions,
+            # so it would strand the job with zero side effects).
+            self._execution_state.replan_requested = "plan-expired"
+            self._execution_state.replan_context = {
+                "phase": MigrationState.PLANNED.value}
             self._transition_to(MigrationState.FAILED, "Plan expired")
-            self._job_transition_safe(plan, "FAILED")
+            current = (self._get_job(plan.job_id) or {}).get("state")
+            if current is not None and current != "RUNNING":
+                try:
+                    self._job_transition_safe(plan, "RUNNING")
+                except MigrationFailed:
+                    logger.error("Expired-plan job-state restore failed")
             return self._execution_state
 
         try:
@@ -433,7 +463,28 @@ class MigrationCoordinator:
             tags = {"job_id": plan.job_id, "migration_id": plan.migration_id,
                     "execution_epoch": str(plan.execution_epoch)}
             probe = getattr(self.provisioner, "get_operation_status", None)
-            if callable(provision):
+            # PA-8: candidate-authoritative provisioning. Resolve the
+            # target pool definition and provision from it; any miss
+            # (no provider, no definition, no method) falls back to the
+            # legacy candidate-ID path with an explicit debug log.
+            _from_pool = getattr(self.provisioner, "provision_from_pool", None)
+            _definition = None
+            if callable(_from_pool) and self._pool_definition_provider is not None:
+                try:
+                    _definition = self._pool_definition_provider(plan.target_pool_id)
+                except Exception as exc:
+                    logger.warning("Pool definition lookup failed for %s: %s",
+                                   plan.target_pool_id, exc)
+                    _definition = None
+            if _definition:
+                result = self._run_operation_with_retry(
+                    step_type="PROVISION", operation_id=op_id,
+                    func=lambda: _from_pool(_definition, operation_id=op_id,
+                                            tags=tags),
+                    timeout=self.step_timeout_seconds, probe=probe,
+                    default_code="PROVISION_FAILED",
+                )
+            elif callable(provision):
                 result = self._run_operation_with_retry(
                     step_type="PROVISION", operation_id=op_id,
                     func=lambda: provision(plan.target_pool_id, operation_id=op_id,
@@ -519,6 +570,8 @@ class MigrationCoordinator:
                 raise OperationUnknownError("restore reported UNKNOWN")
             if outcome != "SUCCEEDED":
                 raise MigrationFailed(f"Restore reported {outcome}")
+            state.target_pid = getattr(result, "process_id", None)
+            self._publish_execution_context()
             self._complete_operation(op_id, result)
         except OperationUnknownError as e:
             self._fail_operation(op_id, str(e), unknown=True)
@@ -745,6 +798,9 @@ class MigrationCoordinator:
 
     def _check_plan_validity(self, plan: MigrationPlan):
         if plan.is_expired():
+            self._execution_state.replan_requested = "plan-expired"
+            self._execution_state.replan_context = {
+                "phase": self._execution_state.current_state.value}
             raise MigrationAborted("Plan expired")
         if plan.regime == MigrationRegime.EMERGENCY:
             self._check_deadline_budget(plan)
@@ -757,7 +813,10 @@ class MigrationCoordinator:
             return
         remaining = None
         if plan.absolute_deadline is not None:
-            remaining = (plan.absolute_deadline - datetime.utcnow()).total_seconds()
+            _now = datetime.utcnow()
+            if plan.absolute_deadline.tzinfo is not None and _now.tzinfo is None:
+                _now = _now.replace(tzinfo=timezone.utc)
+            remaining = (plan.absolute_deadline - _now).total_seconds()
         elif plan.deadline_seconds:
             remaining = plan.deadline_seconds - self._elapsed_mono()
         if remaining is None:
@@ -774,6 +833,8 @@ class MigrationCoordinator:
     def _final_gate(self, plan: MigrationPlan, step: str):
         """Last check before an irreversible step: expiry + deadline + epoch."""
         if plan.is_expired():
+            self._execution_state.replan_requested = "plan-expired"
+            self._execution_state.replan_context = {"phase": step}
             raise MigrationAborted(f"Plan expired before {step}")
         if plan.regime == MigrationRegime.EMERGENCY:
             self._check_deadline_budget(plan)
@@ -826,6 +887,27 @@ class MigrationCoordinator:
             return
         raise MigrationFailed(
             "No fence-verify hook configured: fence confirmation refused")
+
+    def _publish_execution_context(self):
+        """Publish post-restore validation context to the optional sink.
+
+        Best-effort: publication failure never breaks execution (probes
+        degrade to inconclusive downstream).
+        """
+        sink = self._exec_ctx_sink
+        state = self._execution_state
+        if sink is None or state is None or state.plan is None:
+            return
+        try:
+            sink({
+                "migration_id": state.plan.migration_id,
+                "job_id": state.plan.job_id,
+                "execution_epoch": state.expected_epoch,
+                "target_host": state.target_instance_id,
+                "target_pid": state.target_pid,
+            })
+        except Exception as exc:
+            logger.warning("execution context publish failed: %s", exc)
 
     def _take_snapshot(self, job_id: str, phase: str) -> Optional[dict]:
         if self._snapshot_provider is None:
@@ -934,7 +1016,10 @@ class MigrationCoordinator:
     def _backoff_or_deadline(self, plan: MigrationPlan, delay: float):
         """Sleep for backoff; backoff consumes the effective deadline (rule 3)."""
         if plan.regime == MigrationRegime.EMERGENCY and plan.absolute_deadline is not None:
-            remaining = (plan.absolute_deadline - datetime.utcnow()).total_seconds()
+            _now = datetime.utcnow()
+            if plan.absolute_deadline.tzinfo is not None and _now.tzinfo is None:
+                _now = _now.replace(tzinfo=timezone.utc)
+            remaining = (plan.absolute_deadline - _now).total_seconds()
             if delay >= remaining:
                 raise DeadlineExceeded(
                     f"backoff {delay:.0f}s exceeds remaining deadline {remaining:.0f}s")
@@ -1155,7 +1240,9 @@ class MigrationCoordinator:
             self._audit("MIGRATION_FAILED",
                         outcome="FAILED",
                         reason=reason,
-                        fencing_confirmed=state.fencing_confirmed)
+                        fencing_confirmed=state.fencing_confirmed,
+                        replan_requested=state.replan_requested,
+                        replan_context=dict(state.replan_context))
         except Exception as exc:
             logger.error("MIGRATION_FAILED audit write failed: %s", exc)
         self._transition_to(MigrationState.FAILED)
@@ -1183,6 +1270,13 @@ class MigrationCoordinator:
         if state.current_state in _POST_FENCE_STATES:
             logger.warning("Deadline exceeded in post-fencing phase; continuing forward")
         else:
+            # Replan-viable (§25/S04): pre-fence deadline drift can be
+            # retried as a successor with fresh evidence and budget.
+            state.replan_requested = "deadline-drift"
+            state.replan_context = {
+                "phase": state.current_state.value,
+                "reason": reason,
+            }
             self._handle_failure(reason)
 
 

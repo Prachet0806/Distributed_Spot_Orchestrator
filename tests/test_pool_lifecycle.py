@@ -185,14 +185,14 @@ def test_coordinator_refuses_provisioning_when_pool_exhausted(tmp_path):
 
     coord = MigrationCoordinator(
         registry=reg, provisioner=SimpleNamespace(
-            provision_with_operation=lambda *a, **k: (_ for _ in ()).throw(
+            provision_with_operation=lambda *a, **_k: (_ for _ in ()).throw(
                 AssertionError("must not provision"))),
         checkpoint_manager=CheckpointManager(
-            storage=SimpleNamespace(upload=lambda *a, **k: None, bucket="b"),
+            storage=SimpleNamespace(upload=lambda *a, **_k: None, bucket="b"),
             dump_handler=_dump),
         transfer_manager=SimpleNamespace(), validator=SimpleNamespace(),
         cleanup_executor=SimpleNamespace(
-            cleanup_migration=lambda *a, **k: None),
+            cleanup_migration=lambda *a, **_k: None),
         step_timeout_seconds=5.0, pool_concurrency=t, sleep_fn=lambda s: None)
     out = coord.execute_plan(_plan())
     assert out.current_state == MigrationState.FAILED
@@ -211,11 +211,11 @@ def test_coordinator_releases_slot_on_terminal_failure(tmp_path):
     coord = MigrationCoordinator(
         registry=reg, provisioner=SimpleNamespace(),
         checkpoint_manager=CheckpointManager(
-            storage=SimpleNamespace(upload=lambda *a, **k: None, bucket="b"),
+            storage=SimpleNamespace(upload=lambda *a, **_k: None, bucket="b"),
             dump_handler=_dump),
         transfer_manager=SimpleNamespace(), validator=SimpleNamespace(),
         cleanup_executor=SimpleNamespace(
-            cleanup_migration=lambda *a, **k: None),
+            cleanup_migration=lambda *a, **_k: None),
         step_timeout_seconds=5.0, pool_concurrency=t, sleep_fn=lambda s: None)
     # Force slot held pre-provisioning path: saturate via checkpoint success
     # is complex; directly exercise acquire/release pairing instead.

@@ -2,6 +2,12 @@
 """Additive. V1 `job_states.ALLOWED_TRANSITIONS` stays frozen for legacy path."""
 
 JOB_TRANSITIONS: dict[str, set[str]] = {
+    # PENDING is the admission staging state (spotctl run / JobAdmissionManager).
+    # PENDING -> RUNNING fires only on live worker telemetry (FRESH heartbeat
+    # + pid); PENDING -> FAILED is admission/provisioning failure. Attr-only
+    # staging (provisioned instance facts) rides transition(..., "PENDING")
+    # same-state updates handled as a carve-out in the registries.
+    "PENDING": {"RUNNING", "FAILED"},
     "REGISTERED": {"READY", "FAILED"},
     "READY": {"RUNNING", "FAILED"},
     "RUNNING": {"MIGRATING", "RECONCILIATION_REQUIRED", "RECOVERY_REQUIRED", "RESTART_REQUIRED", "COMPLETED", "FAILED"},

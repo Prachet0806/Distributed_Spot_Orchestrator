@@ -1,0 +1,318 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Distributed Spot Workload Orchestrator - Runtime Architecture",
+    "quality_profile": "standard",
+    "views": [
+      {
+        "id": "primary-flow",
+        "label": "Primary Migration Flow",
+        "focus": ["jobRegistry", "workloadEstimator", "marketRiskMonitor", "candidateCompat", "recoveryFeasibility", "costRiskEvaluator", "policyEngine", "migrationPlanner", "migrationCoordinator", "infraProvisioner", "criuManager", "migrationValidator"],
+        "note": "Follow the end-to-end migration path from job intake through validation."
+      },
+      {
+        "id": "feedback-loops",
+        "label": "Risk Feedback & Reconciliation",
+        "focus": ["migrationHistory", "costRiskEvaluator", "reconciliationManager", "migrationValidator"],
+        "note": "See how migration outcomes feed back into risk models and reconciliation."
+      },
+      {
+        "id": "observability",
+        "label": "Audit & Observability",
+        "focus": ["auditObservability"],
+        "note": "Cross-cutting observability watching the entire orchestrator core."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "jobRegistry",
+      "type": "backend",
+      "label": "Job Registry",
+      "sublabel": "Intake & scheduling",
+      "pos": [50, 200],
+      "size": [160, 52]
+    },
+    {
+      "id": "workloadEstimator",
+      "type": "backend",
+      "label": "Workload Estimator",
+      "sublabel": "Resource prediction",
+      "pos": [250, 200],
+      "size": [170, 52]
+    },
+    {
+      "id": "marketRiskMonitor",
+      "type": "backend",
+      "label": "Market & Risk Monitor",
+      "sublabel": "Spot pricing signals",
+      "pos": [460, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "candidateCompat",
+      "type": "backend",
+      "label": "Candidate Compatibility",
+      "sublabel": "Instance & zone match",
+      "pos": [680, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "recoveryFeasibility",
+      "type": "backend",
+      "label": "Recovery Feasibility",
+      "sublabel": "CRIU viability",
+      "pos": [900, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "costRiskEvaluator",
+      "type": "backend",
+      "label": "Cost & Risk Evaluator",
+      "sublabel": "Savings vs. risk",
+      "pos": [1120, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "policyEngine",
+      "type": "backend",
+      "label": "Policy Engine",
+      "sublabel": "Arb / Proactive / Emergency",
+      "pos": [1340, 200],
+      "size": [190, 52]
+    },
+    {
+      "id": "migrationPlanner",
+      "type": "backend",
+      "label": "Migration Planner",
+      "sublabel": "Path & timing",
+      "pos": [1570, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "migrationCoordinator",
+      "type": "backend",
+      "label": "Migration Coordinator",
+      "sublabel": "State orchestration",
+      "pos": [1790, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "infraProvisioner",
+      "type": "cloud",
+      "label": "Infra Provisioner",
+      "sublabel": "EC2 Fleet / Spot",
+      "pos": [2010, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "criuManager",
+      "type": "backend",
+      "label": "Checkpoint/Restore (CRIU)",
+      "sublabel": "Checkpoint & restore",
+      "pos": [2230, 200],
+      "size": [180, 52]
+    },
+    {
+      "id": "migrationValidator",
+      "type": "backend",
+      "label": "Migration Validator",
+      "sublabel": "Health & correctness",
+      "pos": [2450, 200],
+      "size": [170, 52]
+    },
+    {
+      "id": "reconciliationManager",
+      "type": "backend",
+      "label": "Reconciliation Manager",
+      "sublabel": "Drift detection & repair",
+      "pos": [2450, 320],
+      "size": [170, 52],
+      "tag": "feedback"
+    },
+    {
+      "id": "migrationHistory",
+      "type": "database",
+      "label": "Migration History",
+      "sublabel": "Outcomes & metrics",
+      "pos": [50, 320],
+      "size": [170, 52],
+      "tag": "feedback"
+    },
+    {
+      "id": "auditObservability",
+      "type": "external",
+      "label": "Audit & Observability",
+      "sublabel": "Metrics, traces, logs",
+      "pos": [50, 60],
+      "size": [170, 52]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "Orchestrator Core",
+      "wraps": ["jobRegistry", "workloadEstimator", "marketRiskMonitor", "candidateCompat", "recoveryFeasibility", "costRiskEvaluator", "policyEngine", "migrationPlanner", "migrationCoordinator", "infraProvisioner", "criuManager", "migrationValidator", "reconciliationManager", "migrationHistory"],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {
+      "from": "jobRegistry",
+      "to": "workloadEstimator",
+      "label": "submit job spec",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "workloadEstimator",
+      "to": "marketRiskMonitor",
+      "label": "resource requirements",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "marketRiskMonitor",
+      "to": "candidateCompat",
+      "label": "viable spot markets",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "candidateCompat",
+      "to": "recoveryFeasibility",
+      "label": "compatible instances",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "recoveryFeasibility",
+      "to": "costRiskEvaluator",
+      "label": "checkpoint viability",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "costRiskEvaluator",
+      "to": "policyEngine",
+      "label": "cost/risk score",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "policyEngine",
+      "to": "migrationPlanner",
+      "label": "migration decision",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "migrationPlanner",
+      "to": "migrationCoordinator",
+      "label": "execution plan",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "migrationCoordinator",
+      "to": "infraProvisioner",
+      "label": "provision targets",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "infraProvisioner",
+      "to": "criuManager",
+      "label": "instances ready",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "criuManager",
+      "to": "migrationValidator",
+      "label": "restored process",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "from": "migrationValidator",
+      "to": "reconciliationManager",
+      "label": "validation result",
+      "variant": "dashed",
+      "route": "orthogonal-v"
+    },
+    {
+      "from": "migrationHistory",
+      "to": "costRiskEvaluator",
+      "label": "historical outcomes",
+      "variant": "dashed",
+      "route": "orthogonal-v",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "from": "auditObservability",
+      "to": "jobRegistry",
+      "label": "observes",
+      "variant": "dashed",
+      "width": 0.5,
+      "route": "orthogonal-v"
+    },
+    {
+      "from": "auditObservability",
+      "to": "costRiskEvaluator",
+      "variant": "dashed",
+      "width": 0.5,
+      "route": "orthogonal-v"
+    },
+    {
+      "from": "auditObservability",
+      "to": "migrationValidator",
+      "variant": "dashed",
+      "width": 0.5,
+      "route": "orthogonal-v"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Primary Migration Path",
+      "items": [
+        "Job Registry → Workload Estimator → Market & Risk Monitor",
+        "→ Candidate Compatibility → Recovery Feasibility",
+        "→ Cost & Risk Evaluator → Policy Engine",
+        "→ Migration Planner → Migration Coordinator",
+        "→ Infrastructure Provisioner → CRIU Manager",
+        "→ Migration Validator"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Feedback & Side Paths",
+      "items": [
+        "Migration History → Cost & Risk Evaluator (risk model training)",
+        "Migration Validator → Reconciliation Manager (drift detection)",
+        "Both marked as feedback/side paths, not main flow"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Cross-Cutting Observability",
+      "items": [
+        "Audit & Observability watches Orchestrator Core boundary",
+        "Emits metrics, traces, and audit logs for all components",
+        "Representative dashed connections show observation scope"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Policy Engine Modes",
+      "items": [
+        "Arbitrage: opportunistic spot savings",
+        "Proactive: preemptive migration before interruption",
+        "Emergency: forced migration on spot reclaim"
+      ]
+    }
+  ]
+}

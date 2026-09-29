@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 from orchestrator.models_v2 import (
     MigrationPlanV2, PlanStep, PlanStepType, RollbackClass,
-    RecoveryDecision, CheckpointRef, ValidationReport, ReconciliationFinding,
+    CheckpointRef,
     canonical_plan_dict, compute_plan_hash, STEP_ROLLBACK,
 )
 from orchestrator.config_loader import load_v2_baseline
@@ -66,3 +66,42 @@ def test_v2_baseline_loads_frozen_values():
     assert base["recovery"]["allow_cold_restart"] is False
     assert base["concurrency"]["max_concurrent_migrations"] == 3
     assert base["transfer"]["multipart_part_size_bytes"] == 67108864
+
+
+def test_i12_engine_router_defaults_v2_and_flags_v1():
+    """I12 router pin: --engine defaults to v2; v1 is frozen-legacy.
+
+    Makes the ADR-024 deletion diff reviewable: the router surface and
+    the frozen V1 import surface are asserted in one place.
+    """
+    import subprocess
+    out = subprocess.run(
+        ["python", "-m", "orchestrator.main", "--help"],
+        capture_output=True, text=True, cwd=".")
+    assert "--engine" in out.stdout
+    assert "{v1,v2}" in out.stdout or "v1" in out.stdout
+    src = open("orchestrator/main.py").read()
+    assert 'default="v2"' in src
+    assert "V1 path (Migrator/DecisionEngine) will be removed" in src
+
+
+def test_i12_v1_surface_frozen_and_separate_from_v2():
+    """I12: V1 classes importable (compat) but warn frozen; V2 is distinct."""
+    import subprocess
+    # Fresh interpreter: package import must emit frozen warnings (ADR-024).
+    out = subprocess.run(
+        ["python", "-W", "always", "-c",
+         "import warnings; warnings.simplefilter('always'); "
+         "import orchestrator"],
+        capture_output=True, text=True, cwd=".")
+    assert "frozen" in out.stderr.lower(), out.stderr[-500:]
+    from orchestrator.decision_engine import DecisionEngine
+    from orchestrator.migrator import Migrator
+    from orchestrator.policy_engine import PolicyEngine
+    assert DecisionEngine is not PolicyEngine
+    assert Migrator.__module__ == "orchestrator.migrator"
+    # V1 modules self-declare frozen status.
+    import orchestrator.decision_engine as _de
+    import orchestrator.migrator as _mi
+    assert "frozen" in (_de.__doc__ or "").lower()
+    assert "frozen" in (_mi.__doc__ or "").lower()

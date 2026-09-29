@@ -89,6 +89,66 @@ class Provisioner:
         self._operations[operation_id] = result.instance_id
         return result
 
+    def provision_from_pool(
+        self,
+        definition: dict,
+        operation_id: Optional[str] = None,
+        timeout: int = 300,
+        tags: Optional[dict] = None,
+    ) -> ProvisionResult:
+        """Candidate-authoritative provisioning (PA-8, invariant 2).
+
+        The pool definition supplies region/AMI/SG/key/instance-type. When
+        the definition lacks AWS fields the global constructor config is
+        used as a warned fallback (legacy runtime.yaml path) — never
+        silently. Emulated pools (provider != "aws" or no AWS fields and
+        no global config) use the in-memory stub.
+        """
+        from storage.pool_registry import validate_pool_definition
+        definition = dict(definition or {})
+        errors = validate_pool_definition(definition, strict_aws=False)
+        pool_id = definition.get("pool_id", "unknown-pool")
+        region = definition.get("region") or self.region
+        ami_id = definition.get("ami_id") or self.ami_id
+        sg = definition.get("security_group_id") or self.security_group_id
+        key = self.key_name
+        itype = definition.get("instance_type") or self.instance_type
+        if errors or not all([region, ami_id, sg, key, itype]):
+            if any([self.region, self.ami_id, self.security_group_id]):
+                logger.warning(
+                    "Pool %s definition incomplete (%s); falling back to "
+                    "global provisioner config (legacy path)",
+                    pool_id, "; ".join(errors) or "missing AWS fields")
+            return self.provision_with_operation(
+                pool_id, operation_id=operation_id, timeout=timeout, tags=tags)
+        if self.ec2_client_factory is not None or (
+                region and ami_id and sg and key and itype):
+            from orchestrator.instance_manager import provision_instance
+            operation_id = operation_id or (
+                f"{int(datetime.utcnow().timestamp() * 1000):013d}{uuid.uuid4().hex[:13]}")
+            if operation_id in self._operations:
+                instance_id = self._operations[operation_id]
+                for result in self._provisioned_instances.values():
+                    if result.instance_id == instance_id:
+                        logger.info("Provision replay %s -> %s",
+                                    operation_id[:8], instance_id)
+                        return result
+            instance_id, public_ip, public_dns = provision_instance(
+                region=region, ami_id=ami_id, security_group_id=sg,
+                key_name=key, instance_type=itype,
+                max_spot_price=self.max_spot_price, timeout=timeout,
+                idempotency_token=operation_id, tags=tags,
+            )
+            result = ProvisionResult(
+                instance_id=instance_id, public_ip=public_ip,
+                public_dns=public_dns, status="running",
+                operation_id=operation_id, provisioned_at=datetime.utcnow(),
+            )
+            self._operations[operation_id] = result.instance_id
+            return result
+        return self.provision_with_operation(
+            pool_id, operation_id=operation_id, timeout=timeout, tags=tags)
+
     def get_operation_status(self, operation_id: str) -> dict:
         """Resolve UNKNOWN outcomes against actual state (never blind retry)."""
         instance_id = self._operations.get(operation_id)

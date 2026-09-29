@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 import uuid
 import logging
+
+if TYPE_CHECKING:
+    from orchestrator.workload_requirements import WorkloadRequirements
+    from orchestrator.candidate_pool import CandidatePool
 
 logger = logging.getLogger(__name__)
 

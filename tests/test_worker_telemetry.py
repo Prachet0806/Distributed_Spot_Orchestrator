@@ -18,7 +18,6 @@ from orchestrator.worker_telemetry import (
     heartbeat_liveness,
     parse_heartbeat,
     parse_preflight_kv,
-    parse_progress,
     parse_refusal,
     preflight_freshness,
     progress_quality,

@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, TYPE_CHECKING
 from enum import Enum
 import uuid
 import yaml
 import logging
+
+if TYPE_CHECKING:
+    from orchestrator.candidate_compatibility import CompatibilityStatus
+    from orchestrator.candidate_readiness import ReadinessStatus
 
 logger = logging.getLogger(__name__)
 

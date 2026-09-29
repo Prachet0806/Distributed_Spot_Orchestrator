@@ -35,15 +35,22 @@ def _run_migrated(total_ticks, work_per_tick, progress_path, persist_every=2000)
 def test_migrated_completion_identical_and_overhead_gated():
     import tempfile
     import os
+    import statistics
 
     total_ticks, work = 60000, 300
-    base_dur, base = _run_baseline(total_ticks, work)
-    with tempfile.TemporaryDirectory() as tmp:
-        prog = os.path.join(tmp, "progress.json")
-        mig_dur, migrated = _run_migrated(total_ticks, work, prog)
-    assert migrated["tick"] == base["tick"] == total_ticks
-    assert migrated["accumulator"] == base["accumulator"]
-    assert migrated["interrupted"] is False
-    overhead = (mig_dur - base_dur) / max(base_dur, 1e-9)
-    print(f"\nbaseline={base_dur:.2f}s migrated={mig_dur:.2f}s overhead={overhead:.3f}")
+    # Wall-clock on shared runners is noisy (observed 0.11-0.43 for the
+    # same code); gate the median of 3 rounds, not a single sample.
+    # The 0.20 threshold itself is unchanged (ADR-022).
+    rounds = []
+    for _ in range(3):
+        base_dur, base = _run_baseline(total_ticks, work)
+        with tempfile.TemporaryDirectory() as tmp:
+            prog = os.path.join(tmp, "progress.json")
+            mig_dur, migrated = _run_migrated(total_ticks, work, prog)
+        assert migrated["tick"] == base["tick"] == total_ticks
+        assert migrated["accumulator"] == base["accumulator"]
+        assert migrated["interrupted"] is False
+        rounds.append((mig_dur - base_dur) / max(base_dur, 1e-9))
+    overhead = statistics.median(rounds)
+    print(f"\nrounds={[f'{r:.3f}' for r in rounds]} median_overhead={overhead:.3f}")
     assert overhead <= 0.20

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from enum import Enum
 import uuid
@@ -62,7 +62,16 @@ class MigrationPlan:
     planner_version: str = "planner-v3"
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
-        return (now or datetime.utcnow()) > self.expires_at
+        now = now or datetime.utcnow()
+        expires_at = self.expires_at
+        if (expires_at.tzinfo is None) != (now.tzinfo is None):
+            # Mixed naive/aware (deadlines.py yields aware absolute
+            # deadlines, which double as emergency expires_at): compare UTC.
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+        return now > expires_at
 
     def is_emergency(self) -> bool:
         return self.regime == MigrationRegime.EMERGENCY
@@ -146,6 +155,13 @@ class MigrationPlanner:
         }
         if stay_analysis:
             input_versions["risk_model_version"] = stay_analysis.risk_model_version
+        if candidate_analysis:
+            # Pin the chosen target's economics provenance (decision
+            # reproducibility, C16): same evidence ⇒ same hash.
+            input_versions["candidate_risk_model_version"] = (
+                candidate_analysis.risk_model_version)
+            input_versions["candidate_confidence"] = str(
+                candidate_analysis.confidence)
         if recovery_feasibility:
             input_versions["feasibility_confidence"] = str(recovery_feasibility.feasibility_confidence)
         if config_versions:

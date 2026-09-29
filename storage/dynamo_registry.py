@@ -179,6 +179,11 @@ class DynamoRegistry:
             if to_state == current_state and ownership_change:
                 # Epoch rotation (fencing invalidation) without lifecycle move.
                 v2_ok = True
+            if to_state == current_state == "PENDING":
+                # Admission staging: record provisioned instance facts
+                # (public_ip/instance_id/pool) without a lifecycle move.
+                # Version still bumps, so concurrent stagings CAS-conflict.
+                v2_ok = True
             try:
                 legacy_ok = is_transition_allowed(current_state, to_state)
             except ValueError:

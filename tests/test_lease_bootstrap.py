@@ -165,7 +165,6 @@ class _MemPlanStore:
 class _Lease:
     def __init__(self, held=True):
         self._held = held
-        self.beats = 0
 
     def is_holder(self):
         return self._held
@@ -174,7 +173,6 @@ class _Lease:
         return self._held
 
     def heartbeat(self):
-        self.beats += 1
         return self._held
 
 

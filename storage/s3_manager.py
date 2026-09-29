@@ -102,7 +102,7 @@ class S3Manager:
                 except OSError:
                     pass
         
-        print(f"✅ Uploaded with SSE-KMS encryption")
+        print("✅ Uploaded with SSE-KMS encryption")
         return archive_name
 
     def download(self, job_id, dst=CHECKPOINT_DIR):

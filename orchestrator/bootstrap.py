@@ -40,18 +40,29 @@ def _parse_time(value: Any) -> Optional[datetime]:
 
 
 def _frontier(steps: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Furthest step not in a terminal state (plan order)."""
+    """Furthest started step not in a terminal state (plan order).
+
+    Started (RUNNING/UNKNOWN) outranks merely PENDING: trailing PENDING
+    steps after a crash point must not masquerade as the frontier (a plan
+    that died in TRANSFER resumes from TRANSFER, not FINALIZE). An
+    all-PENDING plan resumes from its first step.
+    """
     order = {name: i for i, name in enumerate(STEP_ORDER)}
     pending = [s for s in steps
-               if str(s.get("state", "PENDING")).upper() not in TERMINAL_STEP_STATES]
+               if str(s.get("state", "")).upper() not in TERMINAL_STEP_STATES]
     if not pending:
         return None
+
     def _rank(step: Dict[str, Any]) -> int:
         stype = str(step.get("type", "")).upper()
         return order.get(stype, len(order))
+
+    started = [s for s in pending
+               if str(s.get("state", "")).upper() in ("RUNNING", "UNKNOWN")]
+    candidates = started or pending
     # Furthest = max rank; ties keep document order (stable max).
     best, best_rank = None, -1
-    for step in pending:
+    for step in candidates:
         rank = _rank(step)
         if rank >= best_rank:
             best, best_rank = step, rank
@@ -110,7 +121,10 @@ def bootstrap_recovery(
                     outcome = "UNKNOWN"
             entry = {"plan_id": plan_id,
                      "migration_id": doc.get("migration_id"),
-                     "step_id": step.get("step_id"), "operation_id": op_id,
+                     "job_id": doc.get("job_id"),
+                     "step_id": step.get("step_id"),
+                     "step_type": str(step.get("type", "")).upper(),
+                     "operation_id": op_id,
                      "outcome": outcome}
             if outcome in ("SUCCEEDED", "FAILED"):
                 report["unknown_resolved"].append(entry)
@@ -131,22 +145,29 @@ def bootstrap_recovery(
             expiry = _parse_time(doc.get("expires_at"))
             if expiry is not None:
                 remaining = (expiry - now).total_seconds()
-        if remaining is not None and remaining <= 0:
-            report["abandoned"].append({
-                "plan_id": plan_id, "migration_id": doc.get("migration_id"),
-                "reason": "DEADLINE_EXCEEDED"})
-            continue
         frontier = _frontier(doc.get("steps", []) or [])
         if frontier is None:
             continue
         ftype = str(frontier.get("type", "")).upper()
+        forward = ftype in POST_FENCE_STEPS
+        if remaining is not None and remaining <= 0 and not forward:
+            # Pre-fence expiry abandons to recovery. Post-fence expiry
+            # resumes forward-only (COMPLETE_FENCING, I10): a breached
+            # deadline never interrupts an in-progress ownership
+            # transition — matching the live Coordinator, which continues
+            # post-fence instead of aborting.
+            report["abandoned"].append({
+                "plan_id": plan_id, "migration_id": doc.get("migration_id"),
+                "job_id": doc.get("job_id"),
+                "reason": "DEADLINE_EXCEEDED"})
+            continue
         report["resumed"].append({
             "plan_id": plan_id,
             "migration_id": doc.get("migration_id"),
             "job_id": doc.get("job_id"),
             "resume_from_step": frontier.get("step_id"),
             "resume_from_type": ftype,
-            "forward_only": ftype in POST_FENCE_STEPS,
+            "forward_only": forward,
             "remaining_budget_seconds": remaining,
         })
 
@@ -157,3 +178,44 @@ def bootstrap_recovery(
             report["orphans"].append(ref)
 
     return report
+
+
+def collect_active_refs(registry: Any,
+                        states: tuple = ("MIGRATING",
+                                         "RECONCILIATION_REQUIRED")) -> List[Dict[str, Any]]:
+    """Gather registry active-migration refs for the orphan sweep (§14.3.6).
+
+    Never raises: an unreadable registry yields no refs (the bootstrap
+    then treats every in-flight plan as unowned-by-registry, which the
+    sweep surfaces rather than hides).
+    """
+    refs: List[Dict[str, Any]] = []
+    list_by_state = getattr(registry, "list_by_state", None)
+    if not callable(list_by_state):
+        return refs
+    for state in states:
+        try:
+            jobs = list_by_state(state) or []
+        except Exception:
+            continue
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            if job.get("active_migration_id"):
+                refs.append({
+                    "job_id": job.get("job_id"),
+                    "migration_id": job.get("active_migration_id"),
+                    "execution_epoch": int(job.get("execution_epoch", 0) or 0),
+                })
+    return refs
+
+
+def fence_adjacent_unresolved(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Unknown-outcome entries at/after the fence frontier (S10 triage).
+
+    These must gate on reconciliation (never inferred, never resumed):
+    ownership may already have moved. Pre-fence unknowns are left to the
+    periodic sweep (stale/dangling findings), which already covers them.
+    """
+    return [e for e in report.get("unknown_unresolved", [])
+            if str(e.get("step_type", "")).upper() in POST_FENCE_STEPS]

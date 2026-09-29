@@ -338,8 +338,13 @@ class Validator:
         for level in required_levels:
             level_checks = [c for c in checks if c.level == level]
             if not any(c.passed for c in level_checks):
-                # L3 without snapshots is inconclusive, not invalid.
-                if level == ValidationLevel.L3_TOLERANCE_BOUNDED and any(
+                # Evidence-absence is inconclusive, not invalid (I7/I15):
+                # L3 without snapshots, L1 without execution context /
+                # reachable target, L2 without a fresh heartbeat. L4
+                # ownership stays strict: epoch/lineage doubt is INVALID.
+                if level in (ValidationLevel.L1_INFRASTRUCTURE,
+                             ValidationLevel.L2_APPLICATION,
+                             ValidationLevel.L3_TOLERANCE_BOUNDED) and any(
                         c.details.get("inconclusive") for c in level_checks):
                     return ValidationResult.PARTIAL
                 return ValidationResult.FAILED

@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from orchestrator.candidate_pool import PoolGPUProfile
 
 
 class GPURequirement:

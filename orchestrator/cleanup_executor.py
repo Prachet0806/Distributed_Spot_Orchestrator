@@ -98,7 +98,7 @@ class CleanupExecutor:
             logger.error(f"Failed to terminate target instance {instance_id}: {e}")
             raise
 
-    def _cleanup_volume(self, volume_id: str):
+    def _cleanup_volume(self, _volume_id: str):
         pass
 
     def execute_cleanup_plan(self, tasks: list) -> dict:

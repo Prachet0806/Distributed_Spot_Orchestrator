@@ -86,12 +86,12 @@ def cmd_start(args):
             if BOGUS_RC not in str(exc):
                 raise
 
-    _cmd(f"sudo cp /tmp/spot-job.service /etc/systemd/system/spot-job.service")
+    _cmd("sudo cp /tmp/spot-job.service /etc/systemd/system/spot-job.service")
     _cmd("sudo systemctl daemon-reload")
     _cmd(f"pkill -f '{SELF_SAFE}' || true")
     _cmd(f"rm -f {WS}/READY {WS}/job.log")
     _cmd("sudo systemctl restart spot-job.service")
-    out = _run_verified(
+    _run_verified(
         ssh, "true",
         f"test -f {WS}/READY && test $(find {WS}/READY -mmin -2) && echo READY-OK || echo waiting",
         attempts=8, wait=5.0)

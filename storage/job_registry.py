@@ -69,6 +69,10 @@ class JobRegistry:
             if to_state == current_state and ownership_change:
                 # Epoch rotation (fencing invalidation) without lifecycle move.
                 v2_ok = True
+            if to_state == current_state == "PENDING":
+                # Admission staging: record provisioned instance facts
+                # without a lifecycle move (mirrors DynamoRegistry).
+                v2_ok = True
             try:
                 legacy_ok = is_transition_allowed(current_state, to_state)
             except ValueError:

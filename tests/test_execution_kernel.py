@@ -8,7 +8,7 @@ import pytest
 
 from orchestrator.migration_planner import MigrationPlanner, MigrationState
 from orchestrator.migration_coordinator import (
-    MigrationCoordinator, MigrationFailed, OperationUnknownError,
+    MigrationCoordinator, OperationUnknownError,
 )
 from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
 from orchestrator.workload_estimator import WorkloadEstimate
@@ -216,7 +216,10 @@ def test_expired_plan_fails_without_side_effects(tmp_path):
     assert out.current_state == MigrationState.FAILED
     assert calls == []
     assert out.operations == []
-    assert reg.get("job-1")["state"] == "FAILED"
+    # §25: a no-op expiry fails the plan, not the job — FAILED is terminal
+    # per v2_transitions, so the untouched job returns to RUNNING.
+    assert reg.get("job-1")["state"] == "RUNNING"
+    assert out.replan_requested == "plan-expired"
 
 
 def test_fencing_fails_closed_without_hooks(tmp_path):
@@ -272,6 +275,52 @@ def test_postfence_validation_failure_is_forward_only(tmp_path):
     assert job["execution_epoch"] == 1  # fenced ownership stands
 
 
+def test_no_rollback_action_after_fencing_start(tmp_path):
+    """S11 action-level: post-fence failure issues no rollback actions.
+
+    Fault validation after fencing confirmed, then assert at the action
+    layer (not just the transition table): cleanup never runs, the
+    target is never terminated, and fence hooks fire exactly once
+    (no re-fence, no rollback). Restore itself is forward execution
+    (target-side) and is not asserted here.
+    """
+    reg = _registry(tmp_path)
+    calls, cleanup_calls, terminated = [], [], []
+
+    class _RecordingCleanup:
+        def cleanup_migration(self, plan, operations,
+                              safety_critical_only=False):
+            cleanup_calls.append((plan.migration_id, safety_critical_only))
+
+    prov = Provisioner()
+    orig_terminate = prov.terminate
+    prov.terminate = lambda instance_id: terminated.append(instance_id) or True
+    try:
+        coord = MigrationCoordinator(
+            registry=reg,
+            provisioner=prov,
+            checkpoint_manager=CheckpointManager(
+                storage=_Storage(), dump_handler=_dump,
+                restore_handler=_restore),
+            transfer_manager=TransferManager(storage=_Storage()),
+            validator=_Validator(passed=False),
+            cleanup_executor=_RecordingCleanup(),
+            fence_invalidate=lambda plan: calls.append("invalidate"),
+            fence_terminate=lambda plan: calls.append("terminate"),
+            fence_verify=lambda plan: calls.append("verify") or True,
+            step_timeout_seconds=30.0)
+        out = coord.execute_plan(_plan())
+    finally:
+        prov.terminate = orig_terminate
+    assert out.current_state == MigrationState.FAILED
+    assert calls == ["invalidate", "terminate", "verify"]  # fenced exactly once
+    assert cleanup_calls == []  # no rollback cleanup post-fence
+    assert terminated == []  # target retained for forward recovery
+    job = reg.get("job-1")
+    assert job["state"] == "RECOVERY_REQUIRED"
+    assert job["execution_epoch"] == 1
+
+
 def test_epoch_drift_blocks_before_fence(tmp_path):
     reg = _registry(tmp_path)
     coord, calls = _coordinator(reg)
@@ -313,6 +362,47 @@ def test_provisioner_idempotent_replay():
     assert r1.instance_id == r2.instance_id
     assert prov.get_operation_status("op-1")["state"] == "SUCCEEDED"
     assert prov.get_operation_status("op-nope")["state"] == "UNKNOWN"
+
+
+def test_provisioner_triple_execute_single_side_effect():
+    """I7 executor-side: same operation_id 3x provisions exactly once."""
+    prov = Provisioner()
+    made = []
+    orig = prov.provision
+    prov.provision = lambda cid, **kw: (made.append(cid), orig(cid, **kw))[1]
+    try:
+        results = [prov.provision_with_operation("pool-x", operation_id="op-3")
+                   for _ in range(3)]
+    finally:
+        prov.provision = orig
+    assert [r.instance_id for r in results] == [results[0].instance_id] * 3
+    assert made == ["pool-x"]  # underlying provision ran once
+
+
+def test_transfer_triple_execute_single_upload():
+    """I7 executor-side: redelivered transfer op replays, never re-uploads."""
+    mgr = TransferManager(storage=_Storage())
+    first = mgr.upload("job-1", operation_id="op-t")
+    again = mgr.upload("job-1", operation_id="op-t")
+    third = mgr.upload("job-1", operation_id="op-t")
+    assert mgr.storage.uploaded == ["job-1"]  # one side effect
+    assert again is first and third is first  # identical recorded result
+    assert mgr.get_operation_status("op-t")["state"] == "SUCCEEDED"
+    assert mgr.get_operation_status("op-unknown")["state"] == "UNKNOWN"
+    dl = mgr.download("job-1", operation_id="op-d")
+    assert mgr.download("job-1", operation_id="op-d") is dl
+    assert mgr.storage.downloaded == ["job-1"]
+
+
+def test_persist_durable_is_noop_replay():
+    """I7 executor-side: re-persist of DURABLE uploads bytes once."""
+    mgr = CheckpointManager(storage=_Storage(), dump_handler=_dump)
+    res = mgr.dump(job_id="job-1", pid=4242)
+    assert mgr.persist(res.checkpoint_id).status == "DURABLE"
+    uploads = list(mgr.storage.uploaded)
+    assert mgr.persist(res.checkpoint_id).status == "DURABLE"
+    assert mgr.persist(res.checkpoint_id).status == "DURABLE"
+    assert mgr.storage.uploaded == uploads  # no repeat uploads
 
 
 def test_checkpoint_manager_fails_closed():

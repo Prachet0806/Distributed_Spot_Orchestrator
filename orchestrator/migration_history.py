@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -6,6 +7,61 @@ import uuid
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Step-result schema version. v1 stores structured result dicts;
+# v0 rows (legacy) hold stringified results and are read tolerantly.
+RESULT_SCHEMA_VERSION = 1
+
+
+def _normalize_step_result(result: Any) -> tuple[Any, int, bool]:
+    """Normalize a step result for storage.
+
+    Returns (stored_result, schema_version, legacy_flag). Dicts pass
+    through; objects with __dict__ become dicts; scalars are wrapped as
+    {"value": ...} so downstream readers always see a mapping or None.
+    Strings that parse as JSON objects are revived (legacy tolerance).
+    """
+    if result is None:
+        return None, RESULT_SCHEMA_VERSION, False
+    if isinstance(result, dict):
+        return deepcopy(result), RESULT_SCHEMA_VERSION, False
+    if isinstance(result, str):
+        import json
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                return parsed, RESULT_SCHEMA_VERSION, True
+        except (ValueError, TypeError):
+            pass
+        return {"legacy": True, "value": result}, RESULT_SCHEMA_VERSION, True
+    if hasattr(result, "__dict__"):
+        try:
+            return deepcopy(dict(vars(result))), RESULT_SCHEMA_VERSION, False
+        except (TypeError, ValueError):
+            pass
+    return {"value": result}, RESULT_SCHEMA_VERSION, False
+
+
+def _step_result_dict(step: dict) -> dict:
+    """Tolerant reader: step['result'] as a dict ({} when unusable)."""
+    res = (step or {}).get("result")
+    if isinstance(res, dict):
+        return res
+    if isinstance(res, str):
+        import json
+        try:
+            parsed = json.loads(res)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+    return {}
+
+
+def _is_legacy_step(step: dict) -> bool:
+    if (step or {}).get("result_schema", RESULT_SCHEMA_VERSION) < RESULT_SCHEMA_VERSION:
+        return True
+    return bool(_step_result_dict(step).get("legacy"))
 
 
 class MigrationOutcome(str, Enum):
@@ -83,10 +139,13 @@ class MigrationHistory:
     def record_step(self, migration_id: str, step_name: str, status: str, result: Any = None, error: str = None, duration: float = 0):
         record = self._get(migration_id)
         if record:
+            stored, schema, legacy = _normalize_step_result(result)
             record.steps.append({
                 "step": step_name,
                 "status": status,
-                "result": str(result) if result else None,
+                "result": stored,
+                "result_schema": schema,
+                "legacy_result": legacy,
                 "error": error,
                 "duration_seconds": duration,
                 "timestamp": datetime.utcnow().isoformat(),
@@ -125,19 +184,24 @@ class MigrationHistory:
 
     def get_feedback_for_estimator(self, job_id: str) -> list[dict]:
         records = self.get_job_history(job_id)
-        return [
-            {
+        out = []
+        for r in records:
+            if not r.completed_at:
+                continue
+            ckpt = next((s for s in r.steps if s["step"] == "checkpointing"), {})
+            ckpt_res = _step_result_dict(ckpt)
+            out.append({
                 "migration_id": r.migration_id,
-                "actual_checkpoint_size": next((s for s in r.steps if s["step"] == "checkpointing"), {}).get("result", {}).get("size_bytes"),
-                "actual_checkpoint_duration": next((s for s in r.steps if s["step"] == "checkpointing"), {}).get("duration_seconds"),
+                "actual_checkpoint_size": ckpt_res.get("size_bytes"),
+                "actual_checkpoint_duration": ckpt.get("duration_seconds"),
                 "actual_provision_duration": next((s for s in r.steps if s["step"] == "provisioning"), {}).get("duration_seconds"),
                 "actual_transfer_duration": next((s for s in r.steps if s["step"] == "transferring"), {}).get("duration_seconds"),
                 "actual_restore_duration": next((s for s in r.steps if s["step"] == "restoring"), {}).get("duration_seconds"),
                 "outcome": r.outcome.value,
                 "regime": r.regime,
-            }
-            for r in records if r.completed_at
-        ]
+                "legacy_result": _is_legacy_step(ckpt),
+            })
+        return out
 
     def get_feedback_for_risk_model(self) -> list[dict]:
         records = [r for r in self._records if r.completed_at]

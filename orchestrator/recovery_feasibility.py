@@ -48,10 +48,15 @@ class RecoveryFeasibilityEngine:
         compatibility_assessment: CompatibilityAssessment,
         readiness_assessment: ReadinessAssessment,
         interruption_deadline_seconds: Optional[float],
-        plan_steps: list[PlanStepDuration],
+        plan_steps: Optional[list[PlanStepDuration]] = None,
     ) -> RecoveryFeasibility:
         assumptions = []
-        step_dict = {s.name: s for s in plan_steps}
+        # Option B: callers should pass real step estimates (see
+        # build_emergency_plan_steps). None preserves the old crash-fix
+        # behavior (empty plan => deadline-vs-margin check only).
+        if plan_steps is None:
+            plan_steps = []
+            assumptions.append("No plan step estimates provided; critical path assumed 0s")
 
         critical_path = self._compute_critical_path(plan_steps, assumptions)
         safety_margin = max(
@@ -183,3 +188,124 @@ class RecoveryFeasibilityEngine:
             total += group_max
 
         return total
+
+
+# Option B (emergency step modeling): durations mirror
+# MigrationPlanner._build_steps defaults, but checkpoint/transfer are
+# filled from the live workload estimate instead of None. Unknown
+# checkpoint duration stays None so evaluate() yields
+# INSUFFICIENT_EVIDENCE (never a false FEASIBLE).
+DEFAULT_PROVISION_SECONDS = 120.0
+DEFAULT_TRANSFER_SECONDS = 60.0
+DEFAULT_RESTORE_SECONDS = 60.0
+TRANSFER_MBPS = 50.0
+
+# Feedback keys (MigrationHistory.get_feedback_for_estimator) → step names.
+_P95_FEEDBACK_MAP = {
+    "actual_checkpoint_duration": "checkpointing",
+    "actual_provision_duration": "provisioning",
+    "actual_transfer_duration": "transferring",
+    "actual_restore_duration": "restoring",
+}
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    if not sorted_vals:
+        raise ValueError("no values")
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    rank = (pct / 100.0) * (len(sorted_vals) - 1)
+    lo = int(rank)
+    frac = rank - lo
+    return float(sorted_vals[lo] + frac * (sorted_vals[min(lo + 1, len(sorted_vals) - 1)] - sorted_vals[lo]))
+
+
+def p95_step_estimates(feedback: list[dict], min_samples: int = 5,
+                       pct: float = 95.0) -> dict[str, float]:
+    """Measured P95 durations per step from estimator feedback rows.
+
+    Phase C: replaces guessed defaults with history. Steps with fewer
+    than min_samples numeric observations are absent (caller keeps
+    defaults). Never raises on ragged rows.
+    """
+    buckets: dict[str, list[float]] = {}
+    for row in feedback or []:
+        if not isinstance(row, dict):
+            continue
+        for fb_key, step in _P95_FEEDBACK_MAP.items():
+            try:
+                val = row.get(fb_key)
+                if val is None:
+                    continue
+                buckets.setdefault(step, []).append(float(val))
+            except (TypeError, ValueError):
+                continue
+    out: dict[str, float] = {}
+    for step, vals in buckets.items():
+        if len(vals) < min_samples:
+            continue
+        try:
+            out[step] = _percentile(sorted(vals), pct)
+        except ValueError:
+            continue
+    return out
+
+
+def build_emergency_plan_steps(
+    workload_estimate: WorkloadEstimate,
+    transfer_mbps: float = TRANSFER_MBPS,
+    measured_overrides: Optional[dict] = None,
+) -> list[PlanStepDuration]:
+    """Build feasibility step estimates from a workload estimate.
+
+    Phase C: measured_overrides maps step name → P95 seconds (see
+    p95_step_estimates). Measured values replace guessed defaults for
+    checkpointing/provisioning/transferring/restoring; the provider
+    deadline itself is never altered here.
+    """
+    try:
+        conf = float(workload_estimate.prediction_confidence or 0.5)
+    except (TypeError, ValueError):
+        conf = 0.5
+    conf = max(0.0, min(conf, 0.9))
+
+    measured = dict(measured_overrides or {})
+
+    ckpt_dur = measured.get("checkpointing")
+    ckpt_measured = ckpt_dur is not None
+    if ckpt_dur is None:
+        ckpt_dur = getattr(workload_estimate, "checkpoint_duration_estimate_seconds", None)
+    if ckpt_dur is None:
+        checkpoint = PlanStepDuration("checkpointing", None, 0.4)
+    else:
+        checkpoint = PlanStepDuration("checkpointing", float(ckpt_dur),
+                                      conf if not ckpt_measured else min(0.9, conf + 0.1))
+
+    size = getattr(workload_estimate, "checkpoint_size_estimate_bytes", None)
+    if "transferring" in measured:
+        transfer = PlanStepDuration("transferring", float(measured["transferring"]), 0.8)
+    elif size is None:
+        transfer = PlanStepDuration("transferring", DEFAULT_TRANSFER_SECONDS, 0.5)
+    else:
+        try:
+            secs = float(size) / (transfer_mbps * 1024 * 1024) + 5.0
+        except (TypeError, ValueError):
+            secs = DEFAULT_TRANSFER_SECONDS
+        transfer = PlanStepDuration(
+            "transferring", max(10.0, secs), conf if size else 0.5)
+
+    prov_secs = float(measured.get("provisioning", DEFAULT_PROVISION_SECONDS))
+    rest_secs = float(measured.get("restoring", DEFAULT_RESTORE_SECONDS))
+
+    return [
+        PlanStepDuration("prechecking", 10.0, 0.9),
+        checkpoint,
+        PlanStepDuration("persisting", 15.0, 0.6),
+        PlanStepDuration("provisioning", prov_secs, 0.6 if "provisioning" not in measured else 0.8),
+        transfer,
+        PlanStepDuration("restoring", rest_secs, 0.6 if "restoring" not in measured else 0.8),
+        PlanStepDuration("fencing", 30.0, 0.9),
+        PlanStepDuration("validating", 15.0, 0.8),
+        PlanStepDuration("activating", 10.0, 0.9),
+        PlanStepDuration("finalizing", 10.0, 0.9),
+    ]

@@ -124,5 +124,19 @@ class EventLedger:
             return entry and entry.status == ProcessingStatus.COMPLETED
 
     def record_and_check(self, event_id: str, consumer_id: str) -> bool:
+        # Dedup gate with FAILED-retry (S14): a fresh record processes;
+        # COMPLETED/PENDING/PROCESSING redeliveries skip; a FAILED record
+        # re-arms for exactly one more attempt per redispatch (the
+        # dispatcher drives redelivery; no unbounded loop lives here).
         recorded = self.record(event_id, consumer_id)
-        return recorded
+        if recorded:
+            return True
+        try:
+            if self.dynamodb is not None:
+                resp = self.dynamodb.Table(self.table_name).get_item(
+                    Key={"event_id": event_id, "consumer_id": consumer_id})
+                return (resp.get("Item") or {}).get("status") == "FAILED"
+            entry = self._local_cache.get(event_id, {}).get(consumer_id)
+            return entry is not None and entry.status == ProcessingStatus.FAILED
+        except Exception:
+            return False
