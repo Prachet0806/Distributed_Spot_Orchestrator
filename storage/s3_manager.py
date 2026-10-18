@@ -7,6 +7,7 @@ import sys
 import json
 import hashlib
 import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from checkpoint.validate_checkpoint import validate as validate_checkpoint
 from common_constants import CHECKPOINT_DIR
@@ -19,13 +20,14 @@ def _safe_members(tar):
     """Yield members after rejecting absolute paths and path traversal (tar-slip)."""
     for member in tar.getmembers():
         name = member.name
-        if os.path.isabs(name) or ".." in name.split("/"):
+        if (os.path.isabs(name) or ".." in name.split("/") or "\\" in name
+                or ":" in name or not (member.isfile() or member.isdir())):
             raise RuntimeError(f"Unsafe archive member: {name!r}")
         yield member
 
 
 class S3Manager:
-    def __init__(self, bucket, kms_key_id=None, timeout=300):
+    def __init__(self, bucket, kms_key_id=None, timeout=300, *, s3_client=None, endpoint_url=None):
         """
         Initialize S3 manager with encryption and timeout configuration.
         
@@ -47,121 +49,134 @@ class S3Manager:
             read_timeout=self.timeout,
             retries={'max_attempts': 3, 'mode': 'adaptive'}
         )
-        self.s3 = boto3.client("s3", config=config)
+        self.s3 = s3_client if s3_client is not None else boto3.client("s3", config=config, endpoint_url=endpoint_url)
 
     def upload(self, job_id, src=CHECKPOINT_DIR):
-        archive_name = f"{job_id}.tar.gz"
-        archive_path = os.path.join(tempfile.gettempdir(), archive_name)
-        checksum_name = f"{job_id}.sha256"
-        checksum_path = os.path.join(tempfile.gettempdir(), checksum_name)
-        manifest_name = f"{job_id}.manifest.json"
-        manifest_path = os.path.join(tempfile.gettempdir(), manifest_name)
-
-        print(f"📦 Compressing {src} to {archive_path}...")
-        with tarfile.open(archive_path, "w:gz") as tar:
-            tar.add(src, arcname=os.path.basename(src))
-
-        digest = _sha256_file(archive_path)
-        with open(checksum_path, "w") as f:
-            f.write(digest)
-
-        size_bytes = os.path.getsize(archive_path)
-        manifest = {
-            "schema_version": MANIFEST_SCHEMA_VERSION,
-            "job_id": job_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "artifact": {
-                "key": archive_name,
-                "size_bytes": size_bytes,
-                "sha256": digest,
-            },
-            "source": {"checkpoint_dir": src},
-        }
-        with open(manifest_path, "w") as f:
-            json.dump(manifest, f, indent=2, sort_keys=True)
-
-        print(f"⬆️  Uploading to s3://{self.bucket}/{archive_name}...")
-        
-        # Prepare encryption configuration
-        extra_args = {
-            'ServerSideEncryption': 'aws:kms'
-        }
-        if self.kms_key_id:
-            extra_args['SSEKMSKeyId'] = self.kms_key_id
-        
-        # Upload with SSE-KMS encryption enforced
-        try:
-            self.s3.upload_file(archive_path, self.bucket, archive_name, ExtraArgs=extra_args)
-            self.s3.upload_file(checksum_path, self.bucket, checksum_name, ExtraArgs=extra_args)
-            self.s3.upload_file(manifest_path, self.bucket, manifest_name, ExtraArgs=extra_args)
-        finally:
-            # Clean up temp files regardless of success/failure
-            for p in (archive_path, checksum_path, manifest_path):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-        
-        print("✅ Uploaded with SSE-KMS encryption")
-        return archive_name
-
-    def download(self, job_id, dst=CHECKPOINT_DIR):
-        archive_name = f"{job_id}.tar.gz"
-        archive_path = os.path.join(tempfile.gettempdir(), archive_name)
-        checksum_name = f"{job_id}.sha256"
-        checksum_path = os.path.join(tempfile.gettempdir(), checksum_name)
-        manifest_name = f"{job_id}.manifest.json"
-        manifest_path = os.path.join(tempfile.gettempdir(), manifest_name)
-
-        print(f"⬇️  Downloading s3://{self.bucket}/{archive_name}...")
-        self.s3.download_file(self.bucket, archive_name, archive_path)
-        self.s3.download_file(self.bucket, checksum_name, checksum_path)
-        try:
-            self.s3.download_file(self.bucket, manifest_name, manifest_path)
-        except Exception:
-            pass  # manifests predate this change; checksum remains authoritative
-
-        expected = None
-        with open(checksum_path) as f:
-            expected = f.read().strip()
-        actual = _sha256_file(archive_path)
-        if expected != actual:
-            raise RuntimeError("Checkpoint checksum mismatch")
-
-        if os.path.exists(manifest_path):
+        self._validate_identity(job_id)
+        validate_checkpoint(src)
+        for root, dirs, files in os.walk(src):
+            for name in dirs + files:
+                if os.path.islink(os.path.join(root, name)):
+                    raise RuntimeError("checkpoint cannot contain links")
+        with tempfile.TemporaryDirectory(prefix="checkpoint-upload-") as tmp:
+            archive_path = os.path.join(tmp, "artifact.tar.gz")
+            import gzip
+            with open(archive_path, "wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as zipped:
+                with tarfile.open(fileobj=zipped, mode="w") as tar:
+                    tar.add(src, arcname="checkpoint")
+            digest = _sha256_file(archive_path)
+            archive_name = f"{job_id}.tar.gz"
+            extra = {"ServerSideEncryption": "aws:kms", "Metadata": {"sha256": digest}}
+            if self.kms_key_id:
+                extra["SSEKMSKeyId"] = self.kms_key_id
             try:
-                with open(manifest_path) as f:
-                    manifest = json.load(f)
-                m_artifact = manifest.get("artifact", {})
-                if m_artifact.get("sha256") and m_artifact["sha256"] != actual:
-                    raise RuntimeError("Checkpoint manifest checksum mismatch")
-                if m_artifact.get("size_bytes") is not None and int(m_artifact["size_bytes"]) != os.path.getsize(archive_path):
-                    raise RuntimeError("Checkpoint manifest size mismatch")
-            finally:
-                try:
-                    os.remove(manifest_path)
-                except OSError:
-                    pass
+                previous = self.s3.head_object(Bucket=self.bucket, Key=archive_name)
+            except Exception as exc:
+                code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+                if code not in {"404", "NoSuchKey", "NotFound"}:
+                    raise
+                previous = None
+            if previous and previous.get("Metadata", {}).get("sha256") != digest:
+                raise RuntimeError("checkpoint object identity is immutable")
+            if previous is None:
+                self.s3.upload_file(archive_path, self.bucket, archive_name, ExtraArgs=extra)
+            head = self.s3.head_object(Bucket=self.bucket, Key=archive_name)
+            files = {str(path.relative_to(Path(src))).replace("\\", "/"): {"sha256": _sha256_file(path), "size_bytes": path.stat().st_size}
+                     for path in Path(src).rglob("*") if path.is_file()}
+            manifest = {"files": files, "schema_version": MANIFEST_SCHEMA_VERSION, "job_id": job_id,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "artifact": {"key": archive_name, "size_bytes": os.path.getsize(archive_path),
+                                     "sha256": digest, "version_id": head.get("VersionId")}}
+            checksum_path, manifest_path = os.path.join(tmp, "sha256"), os.path.join(tmp, "manifest.json")
+            with open(checksum_path, "w") as out:
+                out.write(digest)
+            with open(manifest_path, "w") as out:
+                json.dump(manifest, out, sort_keys=True)
+            self.s3.upload_file(checksum_path, self.bucket, f"{job_id}.sha256", ExtraArgs=extra)
+            # Publish manifest last: its presence is the commit point.
+            manifest_bytes = Path(manifest_path).read_bytes()
+            write_args = {"Bucket": self.bucket, "Key": f"{job_id}.manifest.json",
+                          "Body": manifest_bytes, "IfNoneMatch": "*",
+                          "ServerSideEncryption": "aws:kms",
+                          "Metadata": {"sha256": hashlib.sha256(manifest_bytes).hexdigest()}}
+            if self.kms_key_id:
+                write_args["SSEKMSKeyId"] = self.kms_key_id
+            try:
+                self.s3.put_object(**write_args)
+            except Exception as exc:
+                code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+                if code not in {"412", "PreconditionFailed"}:
+                    raise
+                committed = self.manifest(job_id)
+                if committed["artifact"]["sha256"] != digest:
+                    raise RuntimeError("checkpoint manifest identity conflict") from exc
+            return archive_name
 
-        print(f"📂 Extracting to {dst}...")
-        extract_dir = os.path.dirname(dst) or "."
-        os.makedirs(dst, exist_ok=True)
-        with tarfile.open(archive_path) as tar:
-            tar.extractall(path=extract_dir, members=_safe_members(tar))
-        try:
-            validate_checkpoint(dst)
-        except RuntimeError:
-            # Clean up only the extracted checkpoint dir — never the workspace.
-            import shutil
-            shutil.rmtree(dst, ignore_errors=True)
-            raise
+    @staticmethod
+    def _validate_identity(identity):
+        import re
+        if not isinstance(identity, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", identity):
+            raise ValueError("unsafe checkpoint identity")
 
-        # Clean up temp files
-        try:
-            os.remove(archive_path)
-            os.remove(checksum_path)
-        except OSError:
-            pass
+    def manifest(self, identity):
+        self._validate_identity(identity)
+        doc = json.loads(self.s3.get_object(Bucket=self.bucket, Key=f"{identity}.manifest.json")["Body"].read())
+        if doc.get("schema_version") != MANIFEST_SCHEMA_VERSION or doc.get("job_id") != identity:
+            raise RuntimeError("Unsupported or mismatched checkpoint manifest schema")
+        if doc.get("artifact", {}).get("key") != f"{identity}.tar.gz":
+            raise RuntimeError("checkpoint manifest artifact identity mismatch")
+        return doc
+
+    def download(self, job_id, dst=CHECKPOINT_DIR, expected_checksum=None):
+        import shutil
+        from pathlib import Path
+        self._validate_identity(job_id)
+        manifest = self.manifest(job_id)
+        artifact = manifest["artifact"]
+        destination = Path(dst).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            raise RuntimeError("checkpoint destination already exists; use an isolated staging directory")
+        with tempfile.TemporaryDirectory(prefix="checkpoint-download-", dir=destination.parent) as tmp:
+            archive_path = os.path.join(tmp, "artifact.tar.gz")
+            kwargs = {"ExtraArgs": {"VersionId": artifact["version_id"]}} if artifact.get("version_id") else {}
+            self.s3.download_file(self.bucket, artifact["key"], archive_path, **kwargs)
+            actual = _sha256_file(archive_path)
+            if actual != artifact["sha256"] or (expected_checksum and actual != expected_checksum):
+                raise RuntimeError("Checkpoint checksum mismatch")
+            if os.path.getsize(archive_path) != int(artifact["size_bytes"]):
+                raise RuntimeError("Checkpoint manifest size mismatch")
+            stage = Path(tmp) / "images"
+            stage.mkdir()
+            directory_modes = []
+            with tarfile.open(archive_path) as tar:
+                for member in _safe_members(tar):
+                    parts = member.name.split("/")
+                    if parts[0] != "checkpoint":
+                        raise RuntimeError("archive has an unexpected root")
+                    target = stage.joinpath(*parts[1:])
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        directory_modes.append((target, member.mode & 0o777))
+                    elif member.isfile():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with tar.extractfile(member) as inp, target.open("wb") as out:
+                            shutil.copyfileobj(inp, out)
+                        target.chmod(member.mode & 0o777)
+            for directory, mode in sorted(directory_modes, key=lambda item: len(item[0].parts), reverse=True):
+                directory.chmod(mode)
+            validate_checkpoint(stage)
+            os.replace(stage, destination)
+        return manifest
+
+    def cleanup_migration_artifacts(self, migration_id):
+        # Durable checkpoints are governed by lineage retention and locks.
+        return []
+
+    def delete(self, checkpoint_id):
+        self._validate_identity(checkpoint_id)
+        for suffix in (".manifest.json", ".sha256", ".tar.gz"):
+            self.s3.delete_object(Bucket=self.bucket, Key=checkpoint_id + suffix)
 
 
 def main():
@@ -187,13 +202,13 @@ def main():
         sys.exit(1)
 
 
-if __name__ == "__main__":
-    main()
-
-
 def _sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+if __name__ == "__main__":
+    main()

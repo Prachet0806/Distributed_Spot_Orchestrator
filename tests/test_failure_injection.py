@@ -9,7 +9,7 @@ import time
 import tempfile
 import os
 
-from orchestrator.utils import retry, SSHClient
+from orchestrator.utils import SSHClient
 from orchestrator.instance_manager import provision_instance
 from storage.s3_manager import S3Manager
 
@@ -25,52 +25,6 @@ def temp_ssh_key():
         os.unlink(temp_key.name)
 
 
-class TestRetryFailureInjection:
-    """Test retry logic under various failure conditions."""
-    
-    def test_retry_succeeds_after_transient_failures(self):
-        """Test retry succeeds after temporary failures."""
-        call_count = [0]
-        
-        def flaky_function():
-            call_count[0] += 1
-            if call_count[0] < 3:
-                raise RuntimeError(f"Transient error #{call_count[0]}")
-            return "success"
-        
-        # Should succeed on 3rd attempt
-        result = retry(flaky_function, retries=5, initial_delay=0.1)
-        assert result == "success"
-        assert call_count[0] == 3
-    
-    def test_retry_fails_after_max_retries(self):
-        """Test retry fails after exhausting all retries."""
-        def always_fails():
-            raise RuntimeError("Permanent failure")
-        
-        with pytest.raises(RuntimeError, match="Permanent failure"):
-            retry(always_fails, retries=3, initial_delay=0.1)
-    
-    def test_retry_exponential_backoff_timing(self):
-        """Test exponential backoff increases delay correctly."""
-        timestamps = []
-        
-        def capture_timestamp():
-            timestamps.append(time.time())
-            if len(timestamps) < 4:
-                raise RuntimeError("Retry")
-            return "done"
-        
-        retry(capture_timestamp, retries=4, initial_delay=0.1, backoff_factor=2, jitter=False)
-        
-        # Calculate actual delays between attempts
-        actual_delays = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
-        
-        # Should see roughly: 0.1s, 0.2s, 0.4s delays (exponential backoff)
-        assert len(actual_delays) >= 2
-        # Each delay should be larger than the previous (exponential growth)
-        for i in range(1, len(actual_delays)):
-            assert actual_delays[i] > actual_delays[i-1], f"Delay {i} ({actual_delays[i]:.3f}s) should be > delay {i-1} ({actual_delays[i-1]:.3f}s)"
 
 
 class TestSSHFailureInjection:
@@ -149,12 +103,12 @@ class TestS3FailureInjection:
             with pytest.raises(Exception):  # Will be ReadTimeoutError
                 manager.upload("test-job", src="/tmp/checkpoint")
     
-    def test_s3_checksum_mismatch(self):
+    def test_s3_checksum_mismatch(self, tmp_path):
         """Test S3 download with checksum mismatch."""
-        manager = S3Manager(bucket="test-bucket")
+        manager = S3Manager(bucket="test-bucket", s3_client=Mock())
         
         # Mock S3 download to return corrupted data
-        with patch.object(manager.s3, "download_file") as mock_download:
+        with patch.object(manager.s3, "download_file") as mock_download, patch.object(manager, "manifest", return_value={"artifact": {"key": "test-job.tar.gz", "sha256": "expected", "size_bytes": 14}}):
             def download_side_effect(_bucket, key, path):
                 if key.endswith(".tar.gz"):
                     with open(path, "wb") as f:
@@ -166,7 +120,7 @@ class TestS3FailureInjection:
             mock_download.side_effect = download_side_effect
             
             with pytest.raises(RuntimeError, match="Checkpoint checksum mismatch"):
-                manager.download("test-job", dst="/tmp/checkpoint")
+                manager.download("test-job", dst=str(tmp_path / "checkpoint"))
     
     def test_s3_bucket_not_found(self):
         """Test S3 operations when bucket doesn't exist."""
@@ -330,46 +284,3 @@ class TestInstanceProvisioningFailureInjection:
             call_args = mock_ec2.run_instances.call_args_list[0]
             assert "ClientToken" in call_args[1]
             assert call_args[1]["ClientToken"] == token
-
-
-class TestNetworkPartitionScenarios:
-    """Test system behavior under network partition scenarios."""
-    
-    def test_ssh_intermittent_connectivity(self, temp_ssh_key):
-        """Test SSH with intermittent connectivity."""
-        client = SSHClient(host="10.0.0.1", key_path=temp_ssh_key)
-        call_count = [0]
-        
-        def flaky_ssh(*_args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] <= 2:
-                raise subprocess.TimeoutExpired(cmd="ssh", timeout=30)
-            return MagicMock(returncode=0, stdout="success", stderr="")
-        
-        with patch("subprocess.run", side_effect=flaky_ssh):
-            # Should succeed with retry
-            result = retry(lambda: client.run_command("echo test"), retries=5, initial_delay=0.1)
-            assert call_count[0] == 3
-    
-    def test_s3_intermittent_access(self):
-        """Test S3 with intermittent access."""
-        manager = S3Manager(bucket="test-bucket")
-        call_count = [0]
-        
-        def flaky_upload(*_args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] < 3:
-                from botocore.exceptions import ClientError
-                raise ClientError(
-                    {"Error": {"Code": "RequestTimeout", "Message": "Timeout"}},
-                    "PutObject"
-                )
-        
-        with patch.object(manager.s3, "upload_file", side_effect=flaky_upload):
-            # S3 client has built-in retries, but we can test our retry wrapper
-            with pytest.raises(Exception):  # Will fail after retries
-                retry(
-                    lambda: manager.upload("test-job", src="/tmp/checkpoint"),
-                    retries=2,
-                    initial_delay=0.1
-                )

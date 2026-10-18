@@ -3,6 +3,7 @@ import argparse
 import logging
 import logging.config
 import os
+import re
 import time
 import threading
 from datetime import datetime
@@ -48,8 +49,8 @@ from orchestrator.constants import (
     MIGRATION_BACKOFF_SECONDS,
 )
 from orchestrator.rate_limiter import TokenBucketRateLimiter
-from storage.job_registry import JobRegistry
 from storage.dynamo_registry import DynamoRegistry
+from storage.backend import encode, decode
 
 
 def load_logging_config(path="config/logging.yaml"):
@@ -77,14 +78,14 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'{"error":"forbidden"}')
             return
 
-        if self.path == "/metrics":
+        if parsed.path == "/metrics":
             payload = get_metrics().render_prometheus().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-type", "text/plain; version=0.0.4")
             self.end_headers()
             self.wfile.write(payload)
             return
-        if self.path == "/health":
+        if parsed.path == "/health":
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
@@ -109,7 +110,7 @@ def _stage_pending(registry, job_id, attrs, log=None):
     """Attr-only PENDING staging (same-state CAS). Never raises: a
     conflict means a concurrent writer won — the next tick re-reads."""
     try:
-        registry.transition(job_id, "PENDING", **attrs)
+        return registry.transition(job_id, "PENDING", **attrs)
     except Exception as exc:
         if log is not None:
             try:
@@ -122,7 +123,7 @@ def _handle_pending_job(job, job_id, current_region, *, prices,
                         instance_type, pool_store, compatibility_engine,
                         placement_engine, provisioner, rate_limiter,
                         registry, transport_for, pending_attempt,
-                        tele_attempt, now, log=None):
+                        tele_attempt, now, log=None, launch_handler=None):
     """Own one PENDING tick: provision-then-promote. Never raises, never
     migrates. All worker facts (IP/instance/pid) are provisioner- or
     telemetry-observed, never user-supplied (invariants 1-3)."""
@@ -132,6 +133,18 @@ def _handle_pending_job(job, job_id, current_region, *, prices,
             last = tele_attempt.get(job_id, 0.0)
             if now - last < PENDING_TELEMETRY_POLL_SECONDS:
                 return
+            if launch_handler is not None and not job.get("pid"):
+                if not job.get("launch_operation_id"):
+                    from orchestrator.models_v2 import new_ulid_like
+                    staged = _stage_pending(registry, job_id, {"launch_operation_id": new_ulid_like()}, log)
+                    if staged is None:
+                        return
+                    job = staged
+                launch_result = launch_handler(job)
+                staged = _stage_pending(registry, job_id, {"launch_operation_id": launch_result["operation_id"], "pid": launch_result["pid"], "process_start": launch_result.get("process_start", "")}, log)
+                if staged is None:
+                    return
+                job = staged
             tele_attempt[job_id] = now
             try:
                 if _try_promote_pending_job(
@@ -164,20 +177,22 @@ def _handle_pending_job(job, job_id, current_region, *, prices,
             except Exception:
                 _def = None
             _def = _def or {}
+            digest = _def.get("runtime_artifact_digest")
+            if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                continue
             candidate_pools[r] = CandidatePool(
                 pool_id=pool_id,
                 provider=_def.get("provider", "aws"),
-                account_id="123456789",
+                account_id=_def.get("account_id", ""),
                 region=_def.get("region", r),
                 availability_zone=_def.get("availability_zone", f"{r}a"),
                 instance_type=_def.get("instance_type", instance_type),
                 architecture=_def.get("architecture", "x86_64"),
                 runtime_profile=PoolRuntimeProfile(
-                    artifact_digest=_def.get("runtime_artifact_digest")
-                    or "sha256:abc123",
+                    artifact_digest=digest,
                     architecture=_def.get("architecture", "x86_64"),
                 ),
-                capacity_profile=PoolCapacityProfile(max_instances=10),
+                capacity_profile=PoolCapacityProfile(max_instances=_def.get("max_instances", 1)),
             )
             try:
                 candidate_pools[r].lifecycle = _def.get("lifecycle", "ACTIVE")
@@ -204,13 +219,17 @@ def _handle_pending_job(job, job_id, current_region, *, prices,
                     f"pool-{target}-{instance_type}").get("definition", {})
             except Exception:
                 _def = None
-            tags = {"job_id": job_id, "admission": "initial"}
-            if _def:
-                result = provisioner.provision_from_pool(
-                    _def, tags=tags)
-            else:
-                result = provisioner.provision_with_operation(
-                    target, tags=tags)
+            tags = {"job_id": job_id, "admission": "initial",
+                    "execution_epoch": str(job.get("execution_epoch", 0))}
+            if not _def:
+                raise ValueError("No authoritative initial pool definition")
+            op_id = job.get("admission_operation_id")
+            if not op_id:
+                from orchestrator.models_v2 import new_ulid_like
+                op_id = new_ulid_like()
+                if _stage_pending(registry, job_id, {"admission_operation_id": op_id}, log) is None:
+                    return
+            result = provisioner.provision_from_pool(_def, tags=tags, operation_id=op_id)
             _stage_pending(registry, job_id, {
                 "public_ip": getattr(result, "public_ip", None),
                 "instance_id": getattr(result, "instance_id", None),
@@ -293,19 +312,24 @@ def _requirements_for_job(job, log=None) -> "WorkloadRequirements":
     """Derive placement requirements from the job's workload contract.
 
     PA-10: replaces the fixed 1-CPU/1GB fabrication. Jobs admitted via
-    `spotctl run` carry `workload_contract`; legacy rows without one fall
-    back to the old defaults with an explicit debug log (not silent).
+    `spotctl run` carry `workload_contract`; records without one are rejected.
     """
-    contract = (job or {}).get("workload_contract") or {}
-    res = contract.get("resources", {}) if isinstance(contract, dict) else {}
+    contract = (job or {}).get("workload_contract")
+    if not isinstance(contract, dict) or not isinstance(contract.get("resources"), dict):
+        raise ValueError("V2 jobs require a workload contract with resources")
+    res = contract["resources"]
     try:
-        cpu = max(1, int(res.get("cpu", 1)))
+        cpu = int(res["cpu"])
+        if cpu <= 0:
+            raise ValueError("CPU requirement must be positive")
     except (TypeError, ValueError):
-        cpu = 1
+        raise ValueError("invalid CPU requirement")
     try:
-        mem = max(256, int(res.get("memory_mb", 1024)))
+        mem = int(res["memory_mb"])
+        if mem <= 0:
+            raise ValueError("memory requirement must be positive")
     except (TypeError, ValueError):
-        mem = 1024
+        raise ValueError("invalid memory requirement")
     gpu = bool(res.get("gpu", False))
     try:
         storage = max(1, int(res.get("storage_gb", 10)))
@@ -319,12 +343,6 @@ def _requirements_for_job(job, log=None) -> "WorkloadRequirements":
     digest = rt.get("artifact_digest") or contract.get("runtime_artifact_digest", "")
     regions = [str(r) for r in (pl.get("regions") or []) if r]
     secrets = list(contract.get("required_secret_refs", []) or [])
-    if not contract and log is not None:
-        try:
-            log.debug("Job %s has no workload contract; using default "
-                      "requirements (legacy row)", job.get("job_id"))
-        except Exception:
-            pass
     return WorkloadRequirements(
         cpu_architecture="x86_64",
         min_cpu=cpu,
@@ -343,14 +361,13 @@ def _telemetry_capacity_for_job(job) -> tuple:
 
     PA-9 (shim stage): jobs carrying a `worker_telemetry` mapping
     (heartbeat age, progress, preflight) drive readiness evidence;
-    rows without it get the legacy synthetic defaults, flagged
-    synthetic=True so the fabrication is explicit, not silent.
+    rows without it have unknown capacity and no artifact evidence.
     STALE/MISSING heartbeat degrades confidence (readiness UNKNOWN
     downstream) — it never reports healthy.
     """
     tele = (job or {}).get("worker_telemetry") or {}
     if not isinstance(tele, dict) or not tele:
-        return 0.8, True, True
+        return 0.0, False, False
     try:
         from orchestrator.worker_telemetry import heartbeat_liveness
         live = heartbeat_liveness(tele.get("heartbeat"))
@@ -395,6 +412,9 @@ def _admit_plan_to_store(plan_store, plan, log=None):
             })
         plan_store.put_plan_doc({
             "plan_id": plan.plan_id,
+            "execution_plan": decode(encode(plan)),
+            "execution_epoch": plan.execution_epoch,
+            "expires_at": plan.expires_at.isoformat(),
             "migration_id": plan.migration_id,
             "job_id": plan.job_id,
             "regime": getattr(getattr(plan, "regime", None), "value",
@@ -411,13 +431,13 @@ def _admit_plan_to_store(plan_store, plan, log=None):
             else datetime.now(_tz.utc).isoformat(),
             "steps": steps,
         })
-    except Exception as exc:
-        if log is not None:
-            try:
-                log.debug("Plan admission skipped for %s: %s",
-                          getattr(plan, "migration_id", "?"), exc)
-            except Exception:
-                pass
+    except KeyError:
+        existing = plan_store.get_plan(plan.plan_id)
+        if existing.get("plan_hash") != plan.plan_hash:
+            raise RuntimeError("plan admission identity conflict")
+    except Exception:
+        raise
+    return plan_store.get_plan(plan.plan_id)
 
 
 def _mark_plan_outcome(plan_store, plan, outcome, log=None):
@@ -485,7 +505,10 @@ def _try_promote_pending_job(job, job_id, registry, transport_for, log=None):
             except Exception:
                 pass
         return False
-    if live.get("liveness") != "FRESH" or not (hb or {}).get("pid"):
+    if (live.get("liveness") != "FRESH" or not (hb or {}).get("pid")
+            or hb.get("job_id") != job_id
+            or hb.get("instance_id") != job.get("instance_id")
+            or hb.get("execution_epoch") != job.get("execution_epoch")):
         return False
     try:
         pid = int(hb["pid"])
@@ -591,14 +614,621 @@ def _select_initial_pool(job, requirements, prices, candidate_pools,
     return eligible[0]
 
 
+
+def quarantine_restart_frontiers(report, plan_store, registry, log):
+    """Keep a recovered frontier inactive until its external receipts resolve."""
+    frontiers = [*report.get("resumed", []), *report.get("unknown_unresolved", [])]
+    for item in frontiers:
+        doc = plan_store.get_plan(item["plan_id"])
+        if not doc.get("execution_plan"):
+            raise RuntimeError("active V2 plan lacks an executable body")
+        log.error("Plan %s requires crash-phase reconciliation at %s",
+                  item["plan_id"], item.get("resume_from_type", item.get("step_type")))
+        if item.get("job_id"):
+            current = registry.get(item["job_id"])
+            if current.get("state") == "MIGRATING":
+                registry.transition(item["job_id"], "RECONCILIATION_REQUIRED")
+    for item in report.get("orphans", []):
+        if not item.get("job_id"):
+            continue
+        current = registry.get(item["job_id"])
+        if current.get("state") == "MIGRATING":
+            log.error("Job %s references an absent migration plan %s",
+                      item["job_id"], item.get("migration_id"))
+            registry.transition(item["job_id"], "RECONCILIATION_REQUIRED")
+
+
+def run_iteration(context):
+    """One bounded production iteration, with injected dependencies and clock."""
+    _cpr_lease = context.values['_cpr_lease']
+    _ingestion = context.values['_ingestion']
+    _max_replans = context.values['_max_replans']
+    _pending_attempt = context.values['_pending_attempt']
+    _persisted_pools = context.values['_persisted_pools']
+    _replan_counts = context.values['_replan_counts']
+    _replan_mod = context.values['_replan_mod']
+    _seen_interruptions = context.values['_seen_interruptions']
+    _tele_attempt = context.values['_tele_attempt']
+    _transport_for = context.values['_transport_for']
+    _wired_coordinator = context.values['_wired_coordinator']
+    admission_provisioner = context.values['admission_provisioner']
+    args = context.values['args']
+    cfg = context.values['cfg']
+    check_lease_for_iteration = context.values['check_lease_for_iteration']
+    checkpoint_store = context.values['checkpoint_store']
+    compatibility_engine = context.values['compatibility_engine']
+    estimator = context.values['estimator']
+    evaluator = context.values['evaluator']
+    event_dispatcher = context.values['event_dispatcher']
+    favorable_streaks = context.values['favorable_streaks']
+    feasibility_engine = context.values['feasibility_engine']
+    history = context.values['history']
+    include_states = context.values['include_states']
+    instance_type = context.values['instance_type']
+    last_migration_ts = context.values['last_migration_ts']
+    last_reconcile = context.values['last_reconcile']
+    load_v2_baseline = context.values['load_v2_baseline']
+    log = context.values['log']
+    placement_engine = context.values['placement_engine']
+    plan_store = context.values['plan_store']
+    planner = context.values['planner']
+    policy = context.values['policy']
+    pool_store = context.values['pool_store']
+    price_cache = context.values['price_cache']
+    rate_limiter = context.values['rate_limiter']
+    readiness_engine = context.values['readiness_engine']
+    reconcile_interval = context.values['reconcile_interval']
+    reconciliation = context.values['reconciliation']
+    registry = context.values['registry']
+    watcher = context.values['watcher']
+    _lease_ok, _lease_action = check_lease_for_iteration(_cpr_lease) if args.migrate else (True, "observe")
+    if not _lease_ok:
+        log.error("Control-plane lease lost (%s); halting actuation",
+                  _lease_action)
+        return False
+    now = context.wall_clock()
+
+    if price_cache["data"] and now - price_cache["ts"] < PRICE_CACHE_TTL:
+        prices = price_cache["data"]
+    else:
+        prices = watcher.poll()
+        price_cache = {"ts": now, "data": prices}
+
+    log.info("Prices: %s", {r: round(v["price"], 5) for r, v in prices.items()})
+
+    if args.migrate and now - last_reconcile >= reconcile_interval:
+        reconciliation.reconcile(ReconciliationTrigger.PERIODIC_SWEEP)
+        last_reconcile = now
+
+    jobs = []
+    if args.multi_job:
+        for st in include_states:
+            jobs.extend(registry.list_by_state(st))
+    else:
+        jobs = [registry.get(args.job_id)]
+
+    for job in jobs:
+        job_id = job.get("job_id")
+        current_region = job.get("region") or args.current_region
+        if not job_id or not current_region:
+            continue
+
+        if job.get("state") and job.get("state") != "RUNNING":
+            last_updated = job.get("last_updated")
+            if last_updated:
+                try:
+                    updated_dt = datetime.fromisoformat(last_updated.replace("Z", ""))
+                    updated_ts = updated_dt.timestamp()
+                    if now - updated_ts > args.stuck_seconds:
+                        log.warning("ALERT job %s stuck in %s for >%ss", job_id, job.get("state"), args.stuck_seconds)
+                except Exception:
+                    pass
+            if job.get("state") == "PENDING":
+                if not args.migrate:
+                    continue
+                # Later pass: admitted jobs are owned end-to-end.
+                # Provisioned (has IP) -> telemetry promotion attempt.
+                # Unprovisioned -> initial placement + provision.
+                # Either way nothing migrates this tick.
+                _handle_pending_job(
+                    job, job_id, current_region,
+                    prices=prices, instance_type=instance_type,
+                    pool_store=pool_store,
+                    compatibility_engine=compatibility_engine,
+                    placement_engine=placement_engine,
+                    provisioner=admission_provisioner,
+                    rate_limiter=rate_limiter,
+                    registry=registry,
+                    transport_for=_transport_for,
+                    pending_attempt=_pending_attempt,
+                    tele_attempt=_tele_attempt,
+                    now=now, log=log, launch_handler=context.values.get("launch_handler"),
+                )
+                continue
+            continue
+
+        workload_type = job.get("workload_type", "medium")
+        execution_epoch = job.get("execution_epoch", 0)
+        current_price = prices.get(current_region, {}).get("price", 0)
+        candidate_prices = {r: p["price"] for r, p in prices.items() if r != current_region}
+        interruption_risk = prices.get(current_region, {}).get("interruption_probability")
+        if interruption_risk is None:
+            log.warning("Job %s lacks interruption-risk evidence; skipping economics", job_id)
+            continue
+
+        observation = None
+        if job.get("progress") is not None:
+            observation = WorkloadObservation(
+                job_id=job_id,
+                execution_epoch=execution_epoch,
+                progress=job.get("progress"),
+                checkpoint_size_bytes=job.get("checkpoint_size_bytes"),
+                checkpoint_duration_seconds=job.get("checkpoint_duration_seconds"),
+                cpu_utilization=job.get("cpu_utilization"),
+                memory_utilization=job.get("memory_utilization"),
+                observed_at=datetime.utcnow(),
+                observation_confidence=job.get("observation_confidence", 0.5),
+            )
+
+        workload_estimate = estimator.estimate(job_id, execution_epoch, workload_type, observation)
+
+        # PA-10: requirements come from the job's workload contract
+        # (spotctl admission), not a fixed fabrication.
+        requirements = _requirements_for_job(job, log)
+
+        # Candidate pools: registry definitions are authoritative;
+        # per-tick construction only fills gaps for unregistered
+        # regions, then persists them (never silently invents).
+        from storage.pool_registry import (
+            definition_from_pool, validate_pool_definition,
+        )
+        candidate_pools = {}
+        definitions = {}
+        for r, price in candidate_prices.items():
+            pool_id = f"pool-{r}-{instance_type}"
+            try:
+                definition = pool_store.get_pool(pool_id)["definition"]
+            except KeyError:
+                continue
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                definition.get("runtime_artifact_digest") or ""):
+                continue
+            definitions[r] = definition
+            pool = CandidatePool(pool_id=pool_id, provider=definition.get("provider", "aws"),
+                account_id=definition.get("account_id", ""), region=definition["region"],
+                availability_zone=definition.get("availability_zone", ""), instance_type=definition["instance_type"],
+                architecture=definition.get("architecture", "x86_64"),
+                runtime_profile=PoolRuntimeProfile(artifact_digest=definition["runtime_artifact_digest"],
+                    architecture=definition.get("architecture", "x86_64")),
+                capacity_profile=PoolCapacityProfile(max_instances=definition.get("max_instances", 1)))
+            pool.lifecycle = definition.get("lifecycle", "ACTIVE")
+            candidate_pools[r] = pool
+
+        # Telemetry-driven readiness (PA-9): worker-reported evidence
+        # when the job carries it; synthetic defaults otherwise,
+        # explicitly flagged. STALE telemetry degrades (invariant 4).
+        _tele_conf, _tele_artifact, _tele_synthetic = \
+            _telemetry_capacity_for_job(job)
+        if _tele_synthetic:
+            log.debug("Job %s readiness evidence is synthetic "
+                      "(no worker telemetry yet)", job_id)
+        # Assess compatibility and readiness
+        compat_assessments = {}
+        ready_assessments = {}
+        for r, pool in candidate_pools.items():
+            compat = compatibility_engine.assess(requirements, pool)
+            compat_assessments[r] = compat
+
+            from orchestrator.readiness_evidence import readiness_arguments
+            provider = context.values.get("readiness_evidence_provider")
+            evidence = provider(pool.pool_id) if provider else definitions[r].get("readiness_evidence")
+            ready = readiness_engine.assess(requirements, pool, **readiness_arguments(evidence))
+            ready_assessments[r] = ready
+
+        # Filter emergency-eligible pools
+        emergency_pools = [
+            r for r in candidate_pools
+            if compat_assessments[r].status.value == "COMPATIBLE"
+            and ready_assessments[r].status.value == "READY"
+        ]
+
+        stay_analysis = evaluator.evaluate_stay(current_price, workload_estimate, interruption_risk)
+        candidate_analyses = []
+        for r in emergency_pools:
+            ca = evaluator.evaluate_candidate(
+                current_price,
+                prices[r]["price"],
+                workload_estimate,
+                interruption_risk,
+                checkpoint_size_bytes=workload_estimate.checkpoint_size_estimate_bytes,
+                checkpoint_duration_seconds=workload_estimate.checkpoint_duration_estimate_seconds,
+            )
+            ca.target_pool_id = r
+            candidate_analyses.append(ca)
+
+        regime = MigrationRegime.ARBITRAGE
+        _active_interruption = None
+        if args.check_spot_flag:
+            source_ip = job.get("public_ip")
+            if source_ip and _spot_flag_detected(source_ip, args.spot_flag_path, log):
+                # Ingestion lane owns the event + deadline (§24.1, S21).
+                # Presence-without-content degrades to now() as
+                # effective_at; content carries the IMDS detected_at.
+                _flag_doc = _ingestion.read_spot_flag(
+                    source_ip, args.spot_flag_path, log)
+                if _flag_doc is None:
+                    from datetime import timezone as _tz
+                    _flag_doc = {"detected_at": datetime.now(_tz.utc).isoformat(),
+                                 "source": "flag-presence"}
+                _evt = _ingestion.ingest_interruption(
+                    _flag_doc, job_id=job_id,
+                    execution_epoch=job.get("execution_epoch", 0),
+                    instance_id=job.get("instance_id", ""),
+                    source_region=current_region,
+                    home_region=cfg.get("dynamodb_region"))
+                if _evt is None:
+                    log.warning("Job %s spot flag unreadable; staying in %s",
+                                job_id, regime.value)
+                elif _evt.event_id in _seen_interruptions:
+                    log.info("Job %s duplicate interruption %s; already handled",
+                             job_id, _evt.event_id)
+                else:
+                    _stale, _reason = _ingestion.is_stale_event(_evt, job)
+                    if _stale:
+                        log.warning("Job %s interruption %s dropped (%s)",
+                                    job_id, _evt.event_id, _reason)
+                    else:
+                        try:
+                            event_dispatcher.dispatch(_evt) if args.migrate else None
+                        except Exception as exc:
+                            log.warning("Interruption dispatch failed for %s: %s",
+                                        job_id, exc)
+                        _active_interruption = _evt
+                        regime = MigrationRegime.EMERGENCY
+                        try:
+                            _lag = float((_evt.payload or {}).get(
+                                "detection_lag_seconds", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            _lag = 0.0
+                        log.warning("Job %s spot interruption %s; triggering "
+                                    "EMERGENCY regime (detection_lag=%.1fs)",
+                                    job_id, _evt.event_id, _lag)
+
+        # Hysteresis bookkeeping (ADR-006): streak of economically
+        # favorable observations per job; reset when no saving candidate.
+        try:
+            _best_saving = max(
+                (c.cost_breakdown.expected_savings for c in candidate_analyses),
+                default=0.0,
+            )
+        except Exception:
+            _best_saving = 0.0
+        if _best_saving > 0:
+            favorable_streaks[job_id] = favorable_streaks.get(job_id, 0) + 1
+        else:
+            favorable_streaks[job_id] = 0
+        _cooldown_cfg = policy.arbitrage.config.cooldown_seconds
+        _last = last_migration_ts.get(job_id)
+        _cooldown_left = max(0.0, _cooldown_cfg - (now - _last)) if _last else 0.0
+
+        # Placement ranking (ADR-009): economics-free rank over eligible
+        # candidates; policy keeps target authority but now decides over
+        # placement-ordered lists so its [0] pick == placement top.
+        # Previously placement_engine was built but never called and the
+        # plan used candidate_analyses[0] (iteration order).
+        if emergency_pools:
+            try:
+                _ca_by_pool = {c.target_pool_id: c for c in candidate_analyses}
+                _placement_inputs = []
+                for r in emergency_pools:
+                    _compat_a = compat_assessments[r]
+                    _ready_a = ready_assessments[r]
+                    _placement_inputs.append(PlacementInput(
+                        pool_id=r,
+                        compatibility_status=_compat_a.status,
+                        readiness_status=_ready_a.status,
+                        compatibility_dimensions={
+                            d.dimension: (d.status.value == "COMPATIBLE")
+                            for d in getattr(_compat_a, "dimensions", [])},
+                        readiness_checks=[
+                            {"status": c.status.value}
+                            for c in getattr(_ready_a, "checks", [])],
+                        cost_analysis=_ca_by_pool.get(r),
+                        risk_analysis={"interruption_probability": interruption_risk},
+                        topology={},
+                        capacity_confidence=float(
+                            getattr(getattr(_ready_a, "capacity_evidence", None),
+                                    "confidence", 0.5) or 0.5),
+                        pool_lifecycle=getattr(
+                            candidate_pools.get(r), "lifecycle", "ACTIVE"),
+                    ))
+                _rec = placement_engine.rank(
+                    _placement_inputs, regime=regime.value)
+                _order = [rc.pool_id for rc in _rec.ranked_candidates]
+                _order_set = set(_order)
+                emergency_pools = (
+                    [r for r in _order if r in compat_assessments]
+                    + [r for r in emergency_pools if r not in _order_set]
+                )
+                candidate_analyses.sort(
+                    key=lambda c: emergency_pools.index(c.target_pool_id)
+                    if c.target_pool_id in emergency_pools else len(emergency_pools))
+                if _rec.selected_candidate_id is not None:
+                    log.info("Job %s placement selected %s (%d candidates)",
+                             job_id, _rec.selected_candidate_id,
+                             len(_rec.ranked_candidates))
+                else:
+                    log.warning("Job %s placement selected none; "
+                                "keeping prior order", job_id)
+            except Exception as exc:
+                log.warning("Job %s placement ranking failed, "
+                            "keeping prior order: %s", job_id, exc)
+
+        feasibility = None
+        absolute_deadline = None
+        if regime == MigrationRegime.EMERGENCY and emergency_pools:
+            # Protocols §24.1: the deadline arrives computed from the
+            # ingestion lane (Sprint 1); the presence-only fallback below only
+            # covers presence-without-content notices. Window comes from
+            # the frozen baseline; provider notice windows replace it.
+            from orchestrator.deadlines import (
+                compute_absolute_deadline, remaining_budget_seconds,
+            )
+            from datetime import timezone
+            _ingested_deadline = None
+            if _active_interruption is not None:
+                _raw = (_active_interruption.payload or {}).get("absolute_deadline")
+                try:
+                    _ingested_deadline = datetime.fromisoformat(
+                        str(_raw).replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    _ingested_deadline = None
+            if _ingested_deadline is not None:
+                absolute_deadline = _ingested_deadline
+                _window = float((_active_interruption.payload or {}).get(
+                    "window_seconds", 120.0))
+                _deadline = remaining_budget_seconds(absolute_deadline) or _window
+            else:
+                try:
+                    _baseline = load_v2_baseline()
+                    _window = float(_baseline.get("execution", {}).get(
+                        "emergency_window_seconds", 120.0))
+                except Exception:
+                    _window, _baseline = 120.0, None
+                _detected_at = datetime.now(timezone.utc)
+                absolute_deadline = compute_absolute_deadline(
+                    _detected_at, _window, current_region,
+                    emergency_pools[0], cfg.get("dynamodb_region"),
+                    _baseline)
+                _deadline = remaining_budget_seconds(absolute_deadline) or _window
+            # Invariant 6: evaluate recovery feasibility independently
+            # for EVERY eligible candidate; drop infeasible ones before
+            # policy selection. Emergency target =
+            # placement ∩ compatible ∩ ready ∩ recovery-feasible.
+            # _steps shared (estimate-driven); compat/readiness differ.
+            _plan_steps = build_emergency_plan_steps(
+                workload_estimate,
+                measured_overrides=_measured_step_overrides(
+                    history, job_id, log),
+            )
+            _feas_by_pool: dict = {}
+            for _r in emergency_pools:
+                try:
+                    _feas_by_pool[_r] = feasibility_engine.evaluate(
+                        workload_estimate,
+                        compat_assessments[_r],
+                        ready_assessments[_r],
+                        _deadline,
+                        _plan_steps,
+                    )
+                except Exception as exc:
+                    log.warning("Job %s feasibility failed for %s: %s",
+                                job_id, _r, exc)
+            _allow_cold = bool(getattr(
+                getattr(policy, "recovery", None), "config", None)
+                is not None and getattr(
+                    policy.recovery.config, "allow_cold_restart", False))
+            _survivors = []
+            for _r in emergency_pools:  # keep placement order
+                _f = _feas_by_pool.get(_r)
+                _st = getattr(getattr(_f, "status", None), "value", None)
+                if _st == "FEASIBLE":
+                    _survivors.append(_r)
+                elif _st == "INSUFFICIENT_EVIDENCE" and _allow_cold:
+                    _survivors.append(_r)
+                else:
+                    log.info("Job %s emergency candidate %s excluded (%s)",
+                             job_id, _r,
+                             _st or "no feasibility")
+            if not _survivors:
+                log.warning("Job %s no feasible emergency candidate; "
+                            "ABANDON", job_id)
+                feasibility = None
+                emergency_pools = []
+                candidate_analyses = []
+            else:
+                emergency_pools = _survivors
+                candidate_analyses = [
+                    c for c in candidate_analyses
+                    if c.target_pool_id in _survivors]
+                feasibility = _feas_by_pool[_survivors[0]]
+            # Invariant 5: durability comes from the authoritative
+            # checkpoint store, never from migration intent. Missing or
+            # uncertain => False => cold-restart/ABANDON branches.
+            _checkpoint_durable = query_checkpoint_durable(
+                checkpoint_store, job_id, log)
+            if not _checkpoint_durable:
+                log.info("Job %s has no durable checkpoint; "
+                         "recovery will consider cold-restart/ABANDON",
+                         job_id)
+            decision = policy.decide(
+                regime, stay_analysis, candidate_analyses, workload_estimate,
+                [compat_assessments[r] for r in emergency_pools],
+                [ready_assessments[r] for r in emergency_pools],
+                recovery_feasibility=feasibility,
+                recovery_cost=None,
+                checkpoint_durable=_checkpoint_durable,
+                job_context={"workload_type": workload_type},
+                risk_context={"interruption_probability": interruption_risk},
+            )
+            # Emergency decisions carry assessment pool_ids
+            # ("pool-<region>-<type>"); the loop keys assessments by
+            # region. Remap so downstream lookups never KeyError.
+            if (decision.target_candidate_id is not None
+                    and decision.target_candidate_id not in compat_assessments):
+                for _rk, _ca in compat_assessments.items():
+                    if getattr(_ca, "pool_id", None) == decision.target_candidate_id:
+                        decision.target_candidate_id = _rk
+                        break
+        else:
+            decision = policy.decide(
+                regime, stay_analysis, candidate_analyses, workload_estimate,
+                [compat_assessments[r] for r in emergency_pools],
+                [ready_assessments[r] for r in emergency_pools],
+                job_context={"workload_type": workload_type},
+                risk_context={"interruption_probability": interruption_risk},
+                favorable_observations=favorable_streaks.get(job_id, 0),
+                cooldown_remaining_seconds=_cooldown_left,
+            )
+
+        log.info("Job %s decision: action=%s target=%s reason=%s regime=%s",
+                 job_id, decision.decision.value, decision.target_candidate_id, decision.reason, regime.value)
+
+        if decision.decision.value not in ("MIGRATE", "RECOVER"):
+            continue
+
+        last_ts = last_migration_ts.get(job_id)
+        if regime != MigrationRegime.EMERGENCY and last_ts and (now - last_ts) < args.cooldown_seconds:
+            log.info("Job %s cooldown active; skipping migration", job_id)
+            continue
+
+        if not decision.target_candidate_id:
+            log.warning("Job %s has no target candidate; skipping", job_id)
+            continue
+
+        if args.migrate:
+            migration_limiter = context.values.get("emergency_rate_limiter", rate_limiter) if regime == MigrationRegime.EMERGENCY else rate_limiter
+            if not migration_limiter.acquire(timeout=0):
+                stats = migration_limiter.get_stats()
+                log.info("Job %s migration rate-limited (active=%s/%s)", job_id, stats["active_count"], stats["max_concurrent"])
+                get_metrics().inc("migration_rate_limited_total")
+                continue
+
+            try:
+                source_pool_id = job.get("pool_id", f"source-{current_region}")
+                target_pool_id = decision.target_candidate_id
+
+                compat = compat_assessments[target_pool_id]
+                ready = ready_assessments[target_pool_id]
+
+                # Economics provenance for the chosen target (not just
+                # iteration-order [0]): match the analysis whose
+                # target_pool_id == decision target.
+                _chosen_analysis = next(
+                    (c for c in candidate_analyses
+                     if getattr(c, "target_pool_id", None) == target_pool_id),
+                    candidate_analyses[0] if candidate_analyses else None,
+                )
+                plan = planner.create_plan(
+                    job_id=job_id,
+                    execution_epoch=execution_epoch,
+                    regime=regime,
+                    policy_decision=decision,
+                    source_pool_id=source_pool_id,
+                    target_pool_id=target_pool_id,
+                    workload_estimate=workload_estimate,
+                    recovery_feasibility=feasibility if regime == MigrationRegime.EMERGENCY else None,
+                    stay_analysis=stay_analysis,
+                    candidate_analysis=_chosen_analysis,
+                    absolute_deadline=absolute_deadline,
+                    source_identity=job,
+                )
+                # Fencing needs the source execution identity at run time.
+                plan.pid = job.get("pid")
+                plan.source_host = job.get("public_ip")
+
+                history.record_start(plan, decision, stay_analysis, feasibility if regime == MigrationRegime.EMERGENCY else None)
+                # S16 seam: admit the plan so crash recovery and the
+                # pre-emption lookup can see it (best-effort).
+                _admit_plan_to_store(plan_store, plan, log)
+
+                def on_state_change(old, new):
+                    log.info("Migration %s state: %s -> %s", plan.migration_id, old.value, new.value)
+
+                executor = _wired_coordinator()
+                execution_state = executor.execute_plan(plan, on_state_change)
+                for op in execution_state.operations:
+                    duration = (op.completed_at - op.started_at).total_seconds() if op.completed_at else 0
+                    history.record_step(plan.migration_id, op.step_name, op.status, op.result, op.error, duration)
+
+                if execution_state.current_state.value == "SUCCESS":
+                    history.record_completion(plan.migration_id, "SUCCESS")
+                    _mark_plan_outcome(plan_store, plan, "SUCCEEDED", log)
+                    last_migration_ts[job_id] = context.wall_clock()
+                    if _active_interruption is not None:
+                        _seen_interruptions.add(_active_interruption.event_id)
+                elif execution_state.current_state.value == "ABORTED":
+                    history.record_completion(plan.migration_id, "ABORTED")
+                    _mark_plan_outcome(plan_store, plan, "ABORTED", log)
+                elif execution_state.current_state.value == "SUPERSEDED":
+                    history.record_completion(plan.migration_id, "SUPERSEDED")
+                    _mark_plan_outcome(plan_store, plan, "SUPERSEDED", log)
+                else:
+                    history.record_completion(plan.migration_id, "FAILED", str(execution_state))
+                    _mark_plan_outcome(plan_store, plan, "FAILED", log) if registry.get(job_id).get("state") == "RUNNING" else None
+                    # Replan path (§25/S15/S04): pre-fence failures with
+                    # a replan signal get bounded successor attempts.
+                    # Post-fence outcomes never reach here with a signal
+                    # (forward recovery owns them).
+                    _signal = _replan_mod.replan_signal_for(execution_state)
+                    if _signal is not None and _replan_mod.budget_remaining(
+                            _replan_counts, plan.migration_id, _max_replans):
+                        _attempt = _replan_mod.note_replan(
+                            _replan_counts, plan.migration_id)
+                        log.info("Job %s replan attempt %d (%s)",
+                                 job_id, _attempt, _signal)
+                        try:
+                            _fresh_estimate = estimator.estimate(
+                                job_id, execution_epoch, workload_type, None)
+                            _successor = planner.create_successor_plan(
+                                plan, f"{_signal}#{_attempt}", _fresh_estimate)
+                            _successor.pid = job.get("pid")
+                            _successor.source_host = job.get("public_ip")
+                            history.record_start(
+                                _successor, decision, stay_analysis, None)
+                            _admit_plan_to_store(plan_store, _successor, log)
+                            _succ_state = executor.execute_plan(
+                                _successor, on_state_change)
+                            if _succ_state.current_state.value == "SUCCESS":
+                                history.record_completion(
+                                    _successor.migration_id, "SUCCESS")
+                                _mark_plan_outcome(
+                                    plan_store, _successor, "SUCCEEDED", log)
+                                last_migration_ts[job_id] = time.time()
+                            else:
+                                history.record_completion(
+                                    _successor.migration_id, "FAILED",
+                                    str(_succ_state))
+                                _mark_plan_outcome(
+                                    plan_store, _successor, "FAILED", log)
+                        except Exception as exc:
+                            log.warning("Job %s replan attempt failed: %s",
+                                        job_id, exc)
+
+            finally:
+                migration_limiter.release()
+        else:
+            log.info("Job %s migration suggested (dry-run). Use --migrate to execute.", job_id)
+
+    context.values.update(price_cache=price_cache, last_reconcile=last_reconcile)
+    return True
+
 def main():
     parser = argparse.ArgumentParser(description="V2 Orchestrator: Observe -> Estimate -> Compatibility -> Feasibility -> Economics -> Policy -> Plan -> Execute")
     parser.add_argument("--job-id", help="Job ID in the registry (required in single-job mode)")
     parser.add_argument("--current-region", help="Current region of the job (single-job mode)")
     parser.add_argument("--regions", help="Comma-separated regions to poll; if omitted uses runtime config candidate_regions")
     parser.add_argument("--instance-type", help="Instance type; defaults to runtime config instance_type")
-    parser.add_argument("--policy", default="orchestrator/sla_policy.yaml", help="SLA policy path")
-    parser.add_argument("--registry-path", default="storage/job_registry.json", help="Path to job registry JSON")
     parser.add_argument("--interval", type=int, default=MIGRATION_POLL_INTERVAL, help=f"Poll interval seconds (default {MIGRATION_POLL_INTERVAL})")
     parser.add_argument("--migrate", action="store_true", help="If set, execute migrations when decided")
     parser.add_argument("--cooldown-seconds", type=int, default=COOLDOWN_SECONDS, help=f"Min seconds between migrations for a job (default {COOLDOWN_SECONDS//3600}h)")
@@ -606,27 +1236,17 @@ def main():
     parser.add_argument("--multi-job", action="store_true", help="Enable multi-job mode (iterate over all PENDING/RUNNING jobs)")
     parser.add_argument("--states", default="PENDING,RUNNING", help="Comma-separated states to include in multi-job mode (default PENDING,RUNNING)")
     parser.add_argument("--stuck-seconds", type=int, default=STUCK_JOB_THRESHOLD, help=f"Alert if job state is unchanged longer than this (default {STUCK_JOB_THRESHOLD//60}min)")
-    parser.add_argument("--spot-flag-path", default="/tmp/spot_interrupt", help="Worker spot interruption flag path")
+    parser.add_argument("--spot-flag-path", default="/opt/job_workspace/flags/spot_interrupt", help="Worker spot interruption flag path")
     parser.add_argument("--check-spot-flag", action="store_true", help="Check worker for spot interruption flag and trigger emergency recovery")
     parser.add_argument("--max-migrations-per-hour", type=int, default=MAX_MIGRATIONS_PER_HOUR, help=f"Max migrations per hour (default {MAX_MIGRATIONS_PER_HOUR})")
     parser.add_argument("--max-concurrent-migrations", type=int, default=MAX_CONCURRENT_MIGRATIONS, help=f"Max concurrent migrations (default {MAX_CONCURRENT_MIGRATIONS})")
     parser.add_argument("--reconcile-interval", type=int, default=300, help="Reconciliation sweep interval seconds (default 300)")
-    parser.add_argument("--engine", choices=["v1", "v2"], default="v2",
-                        help="Execution engine: v2 (default, Planner->Coordinator) or v1 (frozen legacy Migrator compat, ADR-024)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
     logging.getLogger().setLevel(args.log_level)
     load_logging_config()
     log = logging.getLogger("orchestrator.main")
-    log.info("Engine selected: %s", args.engine)
-    if args.engine == "v1":
-        log.warning(
-            "V1 engine is frozen legacy (ADR-024). Use --engine v2 for all new "
-            "work; V1 path (Migrator/DecisionEngine) will be removed after "
-            "AWS E2E + soak gates."
-        )
-
     cfg = load_runtime_config()
 
     regions = []
@@ -641,12 +1261,10 @@ def main():
     if not instance_type:
         raise SystemExit("instance_type not set (pass --instance-type or set in config/runtime.yaml)")
 
-    if cfg.get("registry_backend") == "dynamo" and cfg.get("dynamodb_table"):
-        registry = DynamoRegistry(cfg["dynamodb_table"], region_name=cfg.get("dynamodb_region"))
-        log.info("Using DynamoDB registry: table=%s region=%s", cfg["dynamodb_table"], cfg.get("dynamodb_region"))
-    else:
-        registry = JobRegistry(args.registry_path)
-        log.info("Using JSON registry: %s", args.registry_path)
+    if cfg.get("registry_backend") != "dynamo":
+        raise SystemExit("V2 requires the DynamoDB registry backend")
+    registry = DynamoRegistry(cfg["dynamodb_table"], region_name=cfg.get("dynamodb_region"))
+    log.info("Using DynamoDB registry: table=%s region=%s", cfg["dynamodb_table"], cfg.get("dynamodb_region"))
 
     # Initialize V2 components
     watcher = SpotPriceWatcher(regions=regions, instance_type=instance_type)
@@ -678,8 +1296,7 @@ def main():
     except SystemExit:
         raise
     except Exception as exc:
-        log.warning("V2 baseline load failed, using defaults: %s", exc)
-        policy = PolicyEngine(ArbitragePolicyConfig())
+        raise SystemExit(f"V2 baseline load failed: {exc}") from exc
     planner = MigrationPlanner()
     
     # Sprint 2 (Track C2): shared worker transports + validation context
@@ -687,12 +1304,18 @@ def main():
     # Coordinator's execution_context_sink after restore; without context
     # they report inconclusive, never stub-pass (I7/I15).
     from worker.transport import SSHWorkerTransport
+    from orchestrator.utils import SSHClient
     from orchestrator import validator_probes as _probes
     _transports: dict[str, SSHWorkerTransport] = {}
 
+    if args.migrate and (not cfg.get("ssh_private_key_path") or not cfg.get("ssh_known_hosts_path")):
+        raise SystemExit("migration requires SSH_PRIVATE_KEY_PATH and SSH_KNOWN_HOSTS_PATH")
+
     def _transport_for(host: str) -> SSHWorkerTransport:
         if host not in _transports:
-            _transports[host] = SSHWorkerTransport(host)
+            client = SSHClient(host, user="ubuntu", key_path=cfg.get("ssh_private_key_path"),
+                known_hosts_path=cfg.get("ssh_known_hosts_path"), strict=True)
+            _transports[host] = SSHWorkerTransport(host, ssh_client=client, strict_host_keys=True)
         return _transports[host]
 
     _validation_contexts: dict[str, dict] = {}
@@ -705,33 +1328,19 @@ def main():
 
     _probe_context = _probes.make_context_provider(_validation_contexts)
 
-    provisioner = Provisioner()
-    checkpoint_mgr = CheckpointManager()
-    transfer_mgr = TransferManager()
-    validator = Validator(
+    validator = Validator(default_tolerance={"version": "batch-state-v2", "metrics": {"progress_delta": {"tolerance_type": "RELATIVE", "value": .05}}},
         infra_probe=_probes.make_infra_probe(_transport_for, _probe_context),
         app_probe=_probes.make_app_probe(_transport_for, _probe_context),
     )
-    cleanup = CleanupExecutor(provisioner=provisioner, storage_manager=None, checkpoint_manager=checkpoint_mgr)
     history = MigrationHistory()
 
-    # Track B1: V2 execution stores share one DynamoDB resource. Local
-    # backends until `terraform apply` lands the tables (Track A2); with
-    # registry_backend=dynamo the same objects persist to DynamoDB.
+    # Track B1: production stores share the authoritative registry resource.
+    # Resource initialization failure never selects an in-memory backend.
     # Table names match infra/aws/dynamodb.tf.
-    dynamodb_resource = None
-    if cfg.get("registry_backend") == "dynamo":
-        try:
-            import boto3
-            dynamodb_resource = boto3.resource(
-                "dynamodb", region_name=cfg.get("dynamodb_region"))
-            log.info("V2 execution stores using DynamoDB in %s",
-                     cfg.get("dynamodb_region"))
-        except Exception as exc:
-            log.warning("DynamoDB resource init failed, local stores: %s", exc)
-    else:
-        log.info("V2 execution stores using local backends (registry_backend=%s)",
-                 cfg.get("registry_backend"))
+    dynamodb_resource = registry.dynamodb
+    log.info("V2 execution stores using DynamoDB in %s", cfg.get("dynamodb_region"))
+    from storage.operation_store import OperationStore
+    operation_store = OperationStore(dynamodb_resource=dynamodb_resource)
     plan_store = PlanStore(dynamodb_resource=dynamodb_resource)
     checkpoint_store = CheckpointStore(dynamodb_resource=dynamodb_resource)
     audit_store = AuditStore(dynamodb_resource=dynamodb_resource)
@@ -743,6 +1352,24 @@ def main():
     # on restart (Risk Model feedback loop starved).
     history.storage = history_store
     pool_store = PoolRegistryStore(dynamodb_resource=dynamodb_resource)
+    if args.migrate:
+        from pathlib import Path
+        from storage.config_store import ConfigStore
+        config_store = ConfigStore(dynamodb_resource=dynamodb_resource)
+        config_store.publish("baseline", _base["runtime"]["engine_version"], _base)
+        placement_doc = yaml.safe_load(Path("config/placement_policy.yaml").read_text())
+        config_store.publish("placement", placement_doc["version"], placement_doc)
+    from storage.s3_manager import S3Manager
+    checkpoint_bucket = cfg.get("checkpoint_bucket")
+    checkpoint_kms = cfg.get("checkpoint_kms_key_arn") or os.getenv("CHECKPOINT_KMS_KEY_ARN")
+    if args.migrate and (not checkpoint_bucket or not checkpoint_kms):
+        raise SystemExit("migration requires checkpoint bucket and KMS key ARN")
+    checkpoint_storage = S3Manager(checkpoint_bucket, kms_key_id=checkpoint_kms) if checkpoint_bucket else None
+    provisioner = Provisioner(key_name=cfg.get("ssh_key_name"),
+        max_spot_price=cfg.get("max_spot_price"), operation_store=operation_store, regions=regions)
+    checkpoint_mgr = CheckpointManager(storage=checkpoint_storage, checkpoint_store=checkpoint_store)
+    cleanup = CleanupExecutor(provisioner=provisioner, storage_manager=checkpoint_storage,
+        checkpoint_manager=checkpoint_mgr)
     # pool_store persists candidate pool definitions from the per-job loop
     # below (once per pool_id, version 1); capacity/readiness stay live.
     # Phase B: seed from config/pools.json when present (`spotctl runtime
@@ -753,7 +1380,7 @@ def main():
         from storage.pool_registry import load_definitions_file
         import os as _os
         _pools_file = _os.path.join("config", "pools.json")
-        for _pid, _def in load_definitions_file(_pools_file).items():
+        for _pid, _def in (load_definitions_file(_pools_file).items() if args.migrate else []):
             try:
                 pool_store.put_pool(_pid, dict(_def), version=1)
                 _seeded_pool_ids.add(_pid)
@@ -782,13 +1409,11 @@ def main():
 
     def _wired_coordinator():
         """Coordinator bound to real stores, transports, and fence hooks."""
-        from storage.s3_manager import S3Manager
         from orchestrator.criu_handlers import (
             make_dump_handler_for, make_restore_handler_for,
-            make_fence_hooks_for,
+            make_fence_hooks_for, make_restore_status_provider_for,
         )
-        bucket = cfg.get("checkpoint_bucket")
-        s3 = S3Manager(bucket=bucket) if bucket else None
+        s3 = checkpoint_storage
         transfer = TransferManager(storage=s3)
 
         def _pid_resolver(plan):
@@ -798,28 +1423,37 @@ def main():
                 job = {}
             return job.get("public_ip"), job.get("pid")
 
-        checkpoint = CheckpointManager(
-            storage=s3,
+        checkpoint = CheckpointManager(storage=s3,
             dump_handler=make_dump_handler_for(_transport_for),
             restore_handler=make_restore_handler_for(_transport_for),
             checkpoint_store=checkpoint_store,
-        )
-        provisioner_cfg = Provisioner(
-            region=cfg.get("target_region") or cfg.get("source_region"),
-            ami_id=cfg.get("target_ami_id") or None,
-            security_group_id=cfg.get("target_security_group_id") or None,
-            key_name=cfg.get("ssh_key_name"),
-            instance_type=instance_type,
-            max_spot_price=cfg.get("max_spot_price"),
-        )
-        hooks = make_fence_hooks_for(_transport_for, pid_resolver=_pid_resolver)
+            status_provider=make_restore_status_provider_for(
+                _transport_for, operation_store, plan_store))
+        provisioner_cfg = provisioner
+        import json, shlex
+        from orchestrator.worker_controller import make_controller_fence_hooks, file_refusal
+        def channel_for(host):
+            def channel(command):
+                result = _transport_for(host).run_command(
+                    "sudo -n python3 -I /opt/spot-worker-control/control_entry.py --command "
+                    + shlex.quote(json.dumps(command)), timeout=30)
+                if result["returncode"] != 0:
+                    raise RuntimeError("worker controller outcome uncertain")
+                return json.loads(result["stdout"])
+            return channel
+        hooks = make_controller_fence_hooks(channel_for,
+            lambda plan: {"host": plan.source_host, "pid": plan.pid, "instance_id": plan.source_instance_id},
+            command_metadata=lambda plan: {"process_start": plan.source_process_start,
+                                          "lease": {"owner": _cpr_lease.owner, "generation": _cpr_lease.generation}},
+            refusal_sink=lambda refusal: file_refusal(refusal, reconciliation,
+                job_id=refusal.get("job_id", ""), migration_id=refusal.get("migration_id")))
 
         def _pool_definition_for(target_pool_id: str):
             """Resolve a target pool definition for execution (PA-8).
 
             Plan targets are region keys (or full pool_ids after the
             emergency remap); the store keys full pool_ids. Try both.
-            None => coordinator uses the legacy global-config path.
+            None => execution refuses the missing pool definition.
             """
             candidates = [target_pool_id]
             try:
@@ -843,18 +1477,46 @@ def main():
             utilization). Restored execution must present the same shaped
             evidence; identical pre/post passes tolerance, drift fails it.
             """
-            try:
-                job = registry.get(job_id)
-            except Exception:
+            from orchestrator.worker_telemetry import WorkerTelemetryReader
+            if phase == "pre":
+                host = registry.get(job_id).get("public_ip")
+            else:
+                contexts = [ctx for ctx in _validation_contexts.values() if ctx.get("job_id") == job_id]
+                host = contexts[-1].get("target_host") if contexts else None
+            if not host:
                 return None
-            snap = {
-                "progress": job.get("progress", 0.0) or 0.0,
-                "cpu_utilization_delta": job.get("cpu_utilization", 0.5) or 0.5,
-                "memory_utilization_delta": job.get("memory_utilization", 0.5) or 0.5,
-                "progress_delta": job.get("progress", 0.0) or 0.0,
-            }
-            return snap
+            report = WorkerTelemetryReader(_transport_for(host)).read_progress()
+            if not report:
+                return None
+            raw = report.get("raw", {})
+            progress = report.get("progress")
+            if progress is None:
+                progress = raw.get("tick", raw.get("iterations_done"))
+            if progress is None:
+                return None
+            return {"progress_delta": progress}
 
+        def _target_contained(state):
+            if not state.target_host or not state.target_pid or not state.target_process_start:
+                return False
+            response = _transport_for(state.target_host).run_command(
+                "cd /opt/job_workspace && python3 -I "
+                "/opt/spot-worker-control/control_entry.py process-control inspect "
+                f"--pid {int(state.target_pid)} --start {shlex.quote(state.target_process_start)}",
+                timeout=15)
+            if response["returncode"] != 0:
+                return False
+            try:
+                receipt = json.loads(response["stdout"])
+            except ValueError:
+                return False
+            return receipt.get("same_process") is True and receipt.get("contained") is True
+
+        from orchestrator.worker_execution import WorkerExecution, CheckpointDataPath
+        from storage.pool_reservations import PoolReservations
+        target_worker = WorkerExecution(_transport_for, guard=_cpr_lease.assert_fresh,
+            controller_channel_factory=channel_for,
+            lease_proof=lambda: {"owner": _cpr_lease.owner, "generation": _cpr_lease.generation})
         return MigrationCoordinator(
             registry=registry,
             provisioner=provisioner_cfg,
@@ -873,6 +1535,12 @@ def main():
             snapshot_provider=_snapshot_provider,
             execution_context_sink=_publish_validation_context,
             pool_definition_provider=_pool_definition_for,
+            operation_store=operation_store, actuation_guard=_cpr_lease.assert_fresh,
+            activation_handler=target_worker.activate,
+            rollback_source=WorkerExecution(_transport_for, guard=_cpr_lease.assert_fresh).resume_source,
+            checkpoint_data_path=CheckpointDataPath(_transport_for, s3, checkpoint_store),
+            pool_reservations=PoolReservations(dynamodb_resource=dynamodb_resource),
+            target_containment_probe=_target_contained,
         )
 
     # NOTE: only the `_wired_coordinator()` instance below executes plans;
@@ -898,7 +1566,8 @@ def main():
     _cpr_lease = ControlPlaneLease(
         _lease_store,
         owner=f"cpr-{_socket.gethostname()}-{os.getpid()}")
-    _status_probe_targets = (provisioner, checkpoint_mgr, transfer_mgr)
+    _coordinator = _wired_coordinator()
+    _status_probe_targets = (operation_store, _coordinator.provisioner, _coordinator.checkpoint_manager, _coordinator.transfer_manager)
 
     def _resolve_operation_status(op_id):
         for _ex in _status_probe_targets:
@@ -906,10 +1575,7 @@ def main():
             if not callable(_probe):
                 continue
             try:
-                try:
-                    _rep = _probe(op_id)
-                except TypeError:
-                    _rep = _probe()
+                _rep = _probe(op_id)
             except Exception:
                 continue
             _outcome, _, _ = MigrationCoordinator._probe_outcome(_rep)
@@ -921,11 +1587,14 @@ def main():
         lease=_cpr_lease,
         plan_store=plan_store,
         active_refs=_bootstrap_mod.collect_active_refs(registry),
-        resolve_operation=_resolve_operation_status)
+        resolve_operation=_resolve_operation_status) if args.migrate else {
+        "halted": False, "abandoned": [], "unknown_unresolved": [], "resumed": [], "orphans": []}
     if _boot_report["halted"]:
         log.error("Bootstrap halted (%s); refusing to actuate",
                   _boot_report["halt_reason"])
         raise SystemExit(1)
+    if args.migrate:
+        _cpr_lease.start()
     for _ab in _boot_report["abandoned"]:
         log.warning("Bootstrap abandoned plan %s (%s); routing job %s to recovery",
                     _ab.get("plan_id"), _ab.get("reason"), _ab.get("job_id"))
@@ -949,12 +1618,10 @@ def main():
             })
         except Exception as exc:
             log.warning("Fence-uncertainty finding filing failed: %s", exc)
-    for _rs in _boot_report["resumed"]:
-        log.warning("Bootstrap resume report: plan %s from %s (%sforward-only, "
-                    "budget %ss); step-resume execution deferred, no actuation",
-                    _rs.get("plan_id"), _rs.get("resume_from_type"),
-                    "" if _rs.get("forward_only") else "not ",
-                    _rs.get("remaining_budget_seconds"))
+    # A persisted SUCCEEDED phase may have lost its context write, and an
+    # ISSUED phase may have run. Keep the frontier inactive until receipts
+    # resolve instead of replaying external operations.
+    quarantine_restart_frontiers(_boot_report, plan_store, registry, log)
     if _boot_report["orphans"]:
         log.warning("Bootstrap orphans (%d) feed the periodic sweep: %s",
                     len(_boot_report["orphans"]), _boot_report["orphans"])
@@ -996,17 +1663,8 @@ def main():
         args.max_concurrent_migrations,
         MIGRATION_BACKOFF_SECONDS,
     )
-    # Admission provisioning shares the global config as a warned legacy
-    # fallback; pool definitions are authoritative (PA-8). Counts against
-    # the same limiter: a provision is a provisioning API call.
-    admission_provisioner = Provisioner(
-        region=cfg.get("target_region") or cfg.get("source_region"),
-        ami_id=cfg.get("target_ami_id") or None,
-        security_group_id=cfg.get("target_security_group_id") or None,
-        key_name=cfg.get("ssh_key_name"),
-        instance_type=instance_type,
-        max_spot_price=cfg.get("max_spot_price"),
-    )
+    # Admission and migration provisioning require authoritative pool definitions.
+    admission_provisioner = provisioner
     # Later pass throttles (in-memory; restart resets to retry-soon):
     # provision attempts per job, telemetry polls per job.
     _pending_attempt: dict[str, float] = {}
@@ -1024,615 +1682,66 @@ def main():
 
     include_states = [s.strip() for s in args.states.split(",") if s.strip()] if args.states else ["PENDING", "RUNNING"]
 
-    while True:
-        # Self-fencing guard (§14.1): without a fresh lease this process
-        # must not actuate. Break out (supervisor restarts → bootstrap
-        # reruns) rather than polling blind.
-        _lease_ok, _lease_action = check_lease_for_iteration(_cpr_lease)
-        if not _lease_ok:
-            log.error("Control-plane lease lost (%s); halting actuation",
-                      _lease_action)
-            break
-        now = time.time()
-
-        if price_cache["data"] and now - price_cache["ts"] < PRICE_CACHE_TTL:
-            prices = price_cache["data"]
-        else:
-            prices = watcher.poll()
-            price_cache = {"ts": now, "data": prices}
-
-        log.info("Prices: %s", {r: round(v["price"], 5) for r, v in prices.items()})
-
-        if now - last_reconcile >= reconcile_interval:
-            reconciliation.reconcile(ReconciliationTrigger.PERIODIC_SWEEP)
-            last_reconcile = now
-
-        jobs = []
-        if args.multi_job:
-            for st in include_states:
-                jobs.extend(registry.list_by_state(st))
-        else:
-            jobs = [registry.get(args.job_id)]
-
-        for job in jobs:
-            job_id = job.get("job_id")
-            current_region = job.get("region") or args.current_region
-            if not job_id or not current_region:
-                continue
-
-            if job.get("state") and job.get("state") != "RUNNING":
-                last_updated = job.get("last_updated")
-                if last_updated:
-                    try:
-                        updated_dt = datetime.fromisoformat(last_updated.replace("Z", ""))
-                        updated_ts = updated_dt.timestamp()
-                        if now - updated_ts > args.stuck_seconds:
-                            log.warning("ALERT job %s stuck in %s for >%ss", job_id, job.get("state"), args.stuck_seconds)
-                    except Exception:
-                        pass
-                if job.get("state") == "PENDING":
-                    # Later pass: admitted jobs are owned end-to-end.
-                    # Provisioned (has IP) -> telemetry promotion attempt.
-                    # Unprovisioned -> initial placement + provision.
-                    # Either way nothing migrates this tick.
-                    _handle_pending_job(
-                        job, job_id, current_region,
-                        prices=prices, instance_type=instance_type,
-                        pool_store=pool_store,
-                        compatibility_engine=compatibility_engine,
-                        placement_engine=placement_engine,
-                        provisioner=admission_provisioner,
-                        rate_limiter=rate_limiter,
-                        registry=registry,
-                        transport_for=_transport_for,
-                        pending_attempt=_pending_attempt,
-                        tele_attempt=_tele_attempt,
-                        now=now, log=log,
-                    )
-                    continue
-
-            workload_type = job.get("workload_type", "medium")
-            execution_epoch = job.get("execution_epoch", 0)
-            current_price = prices.get(current_region, {}).get("price", 0)
-            candidate_prices = {r: p["price"] for r, p in prices.items() if r != current_region}
-            interruption_risk = prices.get(current_region, {}).get("volatility", 0.1)
-
-            observation = None
-            if job.get("progress") is not None:
-                observation = WorkloadObservation(
-                    job_id=job_id,
-                    execution_epoch=execution_epoch,
-                    progress=job.get("progress"),
-                    checkpoint_size_bytes=job.get("checkpoint_size_bytes"),
-                    checkpoint_duration_seconds=job.get("checkpoint_duration_seconds"),
-                    cpu_utilization=job.get("cpu_utilization"),
-                    memory_utilization=job.get("memory_utilization"),
-                    observed_at=datetime.utcnow(),
-                    observation_confidence=job.get("observation_confidence", 0.5),
-                )
-
-            workload_estimate = estimator.estimate(job_id, execution_epoch, workload_type, observation)
-
-            # PA-10: requirements come from the job's workload contract
-            # (spotctl admission), not a fixed fabrication.
-            requirements = _requirements_for_job(job, log)
-
-            # Candidate pools: registry definitions are authoritative;
-            # per-tick construction only fills gaps for unregistered
-            # regions, then persists them (never silently invents).
-            from storage.pool_registry import (
-                definition_from_pool, validate_pool_definition,
-            )
-            candidate_pools = {}
-            for r, p in candidate_prices.items():
-                pool_id = f"pool-{r}-{instance_type}"
-                _def = None
-                try:
-                    _def = pool_store.get_pool(pool_id).get("definition", {})
-                except Exception:
-                    _def = None
-                if _def:
-                    pool = CandidatePool(
-                        pool_id=pool_id,
-                        provider=_def.get("provider", "aws"),
-                        account_id="123456789",
-                        region=_def.get("region", r),
-                        availability_zone=_def.get("availability_zone", f"{r}a"),
-                        instance_type=_def.get("instance_type", instance_type),
-                        architecture=_def.get("architecture", "x86_64"),
-                        runtime_profile=PoolRuntimeProfile(
-                            artifact_digest=_def.get("runtime_artifact_digest") or "sha256:abc123",
-                            architecture=_def.get("architecture", "x86_64"),
-                        ),
-                        capacity_profile=PoolCapacityProfile(
-                            max_instances=10,
-                        ),
-                    )
-                    try:
-                        pool.lifecycle = _def.get("lifecycle", "ACTIVE")
-                    except Exception:
-                        pass
-                else:
-                    pool = CandidatePool(
-                        pool_id=pool_id,
-                        provider="aws",
-                        account_id="123456789",
-                        region=r,
-                        availability_zone=f"{r}a",
-                        instance_type=instance_type,
-                        architecture="x86_64",
-                        runtime_profile=PoolRuntimeProfile(
-                            artifact_digest="sha256:abc123",
-                            architecture="x86_64",
-                        ),
-                        capacity_profile=PoolCapacityProfile(
-                            max_instances=10,
-                        ),
-                    )
-                candidate_pools[r] = pool
-
-            # Persist pool definitions (durable config) once per pool_id.
-            # Registry rows are authoritative on later ticks (PA-7).
-            for r, pool in candidate_pools.items():
-                if pool.pool_id in _persisted_pools:
-                    continue
-                try:
-                    _new_def = definition_from_pool(pool)
-                    _errs = validate_pool_definition(_new_def, strict_aws=False)
-                    if _errs:
-                        log.debug("Pool %s definition incomplete: %s",
-                                  pool.pool_id, "; ".join(_errs))
-                    pool_store.put_pool(pool.pool_id, _new_def, version=1)
-                    _persisted_pools.add(pool.pool_id)
-                except Exception as exc:
-                    # put_pool raises on version conflict / Dynamo
-                    # conditional failure — definitions are static, so a
-                    # conflict means another writer already persisted it.
-                    log.debug("Pool persist skipped for %s: %s",
-                              pool.pool_id, exc)
-                    _persisted_pools.add(pool.pool_id)
-
-            # Telemetry-driven readiness (PA-9): worker-reported evidence
-            # when the job carries it; synthetic defaults otherwise,
-            # explicitly flagged. STALE telemetry degrades (invariant 4).
-            _tele_conf, _tele_artifact, _tele_synthetic = \
-                _telemetry_capacity_for_job(job)
-            if _tele_synthetic:
-                log.debug("Job %s readiness evidence is synthetic "
-                          "(no worker telemetry yet)", job_id)
-            # Assess compatibility and readiness
-            compat_assessments = {}
-            ready_assessments = {}
-            for r, pool in candidate_pools.items():
-                compat = compatibility_engine.assess(requirements, pool)
-                compat_assessments[r] = compat
-
-                # Create default readiness evidence
-                iam_ready = IAMReadiness(
-                    secret_resolution_verified=True,
-                    kms_access_verified=True,
-                    instance_profile_ready=True,
-                    policy_attached=True,
-                )
-                network_ready = NetworkReadiness(
-                    vpc_configured=True,
-                    subnet_available=True,
-                    security_groups_ready=True,
-                    eni_attachable=True,
-                )
-                storage_ready = StorageReadiness(
-                    checkpoint_bucket_accessible=True,
-                    ebs_attachable=True,
-                    snapshot_creation_verified=True,
-                )
-                capacity_evidence = CapacityEvidence(
-                    status=CapacityStatus.AVAILABLE,
-                    source=EvidenceSource.HISTORICAL_PROVISIONING,
-                    observed_at=datetime.utcnow(),
-                    confidence=_tele_conf,
-                    provisioning_success_rate=_tele_conf,
-                    sample_count=10,
-                )
-                
-                ready = readiness_engine.assess(
-                    requirements, candidate_pools[r],
-                    iam_ready=iam_ready, network_ready=network_ready, storage_ready=storage_ready,
-                    capacity_evidence=capacity_evidence,
-                    artifact_available=_tele_artifact,
-                )
-                ready_assessments[r] = ready
-
-            # Filter emergency-eligible pools
-            emergency_pools = [
-                r for r in candidate_pools 
-                if compat_assessments[r].status.value == "COMPATIBLE" 
-                and ready_assessments[r].status.value == "READY"
-            ]
-
-            stay_analysis = evaluator.evaluate_stay(current_price, workload_estimate, interruption_risk)
-            candidate_analyses = []
-            for r in emergency_pools:
-                ca = evaluator.evaluate_candidate(
-                    current_price,
-                    prices[r],
-                    workload_estimate,
-                    interruption_risk,
-                    checkpoint_size_bytes=workload_estimate.checkpoint_size_estimate_bytes,
-                    checkpoint_duration_seconds=workload_estimate.checkpoint_duration_estimate_seconds,
-                )
-                ca.target_pool_id = r
-                candidate_analyses.append(ca)
-
-            regime = MigrationRegime.ARBITRAGE
-            _active_interruption = None
-            if args.check_spot_flag:
-                source_ip = job.get("public_ip")
-                if source_ip and _spot_flag_detected(source_ip, args.spot_flag_path, log):
-                    # Ingestion lane owns the event + deadline (§24.1, S21).
-                    # Presence-without-content degrades to now() as
-                    # effective_at; content carries the IMDS detected_at.
-                    _flag_doc = _ingestion.read_spot_flag(
-                        source_ip, args.spot_flag_path, log)
-                    if _flag_doc is None:
-                        from datetime import timezone as _tz
-                        _flag_doc = {"detected_at": datetime.now(_tz.utc).isoformat(),
-                                     "source": "flag-presence"}
-                    _evt = _ingestion.ingest_interruption(
-                        _flag_doc, job_id=job_id,
-                        execution_epoch=job.get("execution_epoch", 0),
-                        instance_id=job.get("instance_id", ""),
-                        source_region=current_region,
-                        home_region=cfg.get("dynamodb_region"))
-                    if _evt is None:
-                        log.warning("Job %s spot flag unreadable; staying in %s",
-                                    job_id, regime.value)
-                    elif _evt.event_id in _seen_interruptions:
-                        log.info("Job %s duplicate interruption %s; already handled",
-                                 job_id, _evt.event_id)
-                    else:
-                        _stale, _reason = _ingestion.is_stale_event(_evt, job)
-                        if _stale:
-                            log.warning("Job %s interruption %s dropped (%s)",
-                                        job_id, _evt.event_id, _reason)
-                        else:
-                            _seen_interruptions.add(_evt.event_id)
-                            try:
-                                event_dispatcher.dispatch(_evt)
-                            except Exception as exc:
-                                log.warning("Interruption dispatch failed for %s: %s",
-                                            job_id, exc)
-                            _active_interruption = _evt
-                            regime = MigrationRegime.EMERGENCY
-                            try:
-                                _lag = float((_evt.payload or {}).get(
-                                    "detection_lag_seconds", 0.0) or 0.0)
-                            except (TypeError, ValueError):
-                                _lag = 0.0
-                            log.warning("Job %s spot interruption %s; triggering "
-                                        "EMERGENCY regime (detection_lag=%.1fs)",
-                                        job_id, _evt.event_id, _lag)
-
-            # Hysteresis bookkeeping (ADR-006): streak of economically
-            # favorable observations per job; reset when no saving candidate.
-            try:
-                _best_saving = max(
-                    (c.cost_breakdown.expected_savings for c in candidate_analyses),
-                    default=0.0,
-                )
-            except Exception:
-                _best_saving = 0.0
-            if _best_saving > 0:
-                favorable_streaks[job_id] = favorable_streaks.get(job_id, 0) + 1
-            else:
-                favorable_streaks[job_id] = 0
-            _cooldown_cfg = getattr(policy.arbitrage.config, "effective_cooldown_seconds",
-                                    policy.arbitrage.config.cooldown_hours * 3600.0)
-            _last = last_migration_ts.get(job_id)
-            _cooldown_left = max(0.0, _cooldown_cfg - (now - _last)) if _last else 0.0
-
-            # Placement ranking (ADR-009): economics-free rank over eligible
-            # candidates; policy keeps target authority but now decides over
-            # placement-ordered lists so its [0] pick == placement top.
-            # Previously placement_engine was built but never called and the
-            # plan used candidate_analyses[0] (iteration order).
-            if emergency_pools:
-                try:
-                    _ca_by_pool = {c.target_pool_id: c for c in candidate_analyses}
-                    _placement_inputs = []
-                    for r in emergency_pools:
-                        _compat_a = compat_assessments[r]
-                        _ready_a = ready_assessments[r]
-                        _placement_inputs.append(PlacementInput(
-                            pool_id=r,
-                            compatibility_status=_compat_a.status,
-                            readiness_status=_ready_a.status,
-                            compatibility_dimensions={
-                                d.dimension: (d.status.value == "COMPATIBLE")
-                                for d in getattr(_compat_a, "dimensions", [])},
-                            readiness_checks=[
-                                {"status": c.status.value}
-                                for c in getattr(_ready_a, "checks", [])],
-                            cost_analysis=_ca_by_pool.get(r),
-                            risk_analysis={"interruption_probability": interruption_risk},
-                            topology={},
-                            capacity_confidence=float(
-                                getattr(getattr(_ready_a, "capacity_evidence", None),
-                                        "confidence", 0.5) or 0.5),
-                            pool_lifecycle=getattr(
-                                candidate_pools.get(r), "lifecycle", "ACTIVE"),
-                        ))
-                    _rec = placement_engine.rank(
-                        _placement_inputs, regime=regime.value)
-                    _order = [rc.pool_id for rc in _rec.ranked_candidates]
-                    _order_set = set(_order)
-                    emergency_pools = (
-                        [r for r in _order if r in compat_assessments]
-                        + [r for r in emergency_pools if r not in _order_set]
-                    )
-                    candidate_analyses.sort(
-                        key=lambda c: emergency_pools.index(c.target_pool_id)
-                        if c.target_pool_id in emergency_pools else len(emergency_pools))
-                    if _rec.selected_candidate_id is not None:
-                        log.info("Job %s placement selected %s (%d candidates)",
-                                 job_id, _rec.selected_candidate_id,
-                                 len(_rec.ranked_candidates))
-                    else:
-                        log.warning("Job %s placement selected none; "
-                                    "keeping prior order", job_id)
-                except Exception as exc:
-                    log.warning("Job %s placement ranking failed, "
-                                "keeping prior order: %s", job_id, exc)
-
-            feasibility = None
-            absolute_deadline = None
-            if regime == MigrationRegime.EMERGENCY and emergency_pools:
-                # Protocols §24.1: the deadline arrives computed from the
-                # ingestion lane (Sprint 1); the legacy recompute below only
-                # covers presence-without-content notices. Window comes from
-                # the frozen baseline; provider notice windows replace it.
-                from orchestrator.deadlines import (
-                    compute_absolute_deadline, remaining_budget_seconds,
-                )
-                from datetime import timezone
-                _ingested_deadline = None
-                if _active_interruption is not None:
-                    _raw = (_active_interruption.payload or {}).get("absolute_deadline")
-                    try:
-                        _ingested_deadline = datetime.fromisoformat(
-                            str(_raw).replace("Z", "+00:00"))
-                    except (ValueError, TypeError):
-                        _ingested_deadline = None
-                if _ingested_deadline is not None:
-                    absolute_deadline = _ingested_deadline
-                    _window = float((_active_interruption.payload or {}).get(
-                        "window_seconds", 120.0))
-                    _deadline = remaining_budget_seconds(absolute_deadline) or _window
-                else:
-                    try:
-                        _baseline = load_v2_baseline()
-                        _window = float(_baseline.get("execution", {}).get(
-                            "emergency_window_seconds", 120.0))
-                    except Exception:
-                        _window, _baseline = 120.0, None
-                    _detected_at = datetime.now(timezone.utc)
-                    absolute_deadline = compute_absolute_deadline(
-                        _detected_at, _window, current_region,
-                        emergency_pools[0], cfg.get("dynamodb_region"),
-                        _baseline)
-                    _deadline = remaining_budget_seconds(absolute_deadline) or _window
-                # Invariant 6: evaluate recovery feasibility independently
-                # for EVERY eligible candidate; drop infeasible ones before
-                # policy selection. Emergency target =
-                # placement ∩ compatible ∩ ready ∩ recovery-feasible.
-                # _steps shared (estimate-driven); compat/readiness differ.
-                _plan_steps = build_emergency_plan_steps(
-                    workload_estimate,
-                    measured_overrides=_measured_step_overrides(
-                        history, job_id, log),
-                )
-                _feas_by_pool: dict = {}
-                for _r in emergency_pools:
-                    try:
-                        _feas_by_pool[_r] = feasibility_engine.evaluate(
-                            workload_estimate,
-                            compat_assessments[_r],
-                            ready_assessments[_r],
-                            _deadline,
-                            _plan_steps,
-                        )
-                    except Exception as exc:
-                        log.warning("Job %s feasibility failed for %s: %s",
-                                    job_id, _r, exc)
-                _allow_cold = bool(getattr(
-                    getattr(policy, "recovery", None), "config", None)
-                    is not None and getattr(
-                        policy.recovery.config, "allow_cold_restart", False))
-                _survivors = []
-                for _r in emergency_pools:  # keep placement order
-                    _f = _feas_by_pool.get(_r)
-                    _st = getattr(getattr(_f, "status", None), "value", None)
-                    if _st == "FEASIBLE":
-                        _survivors.append(_r)
-                    elif _st == "INSUFFICIENT_EVIDENCE" and _allow_cold:
-                        _survivors.append(_r)
-                    else:
-                        log.info("Job %s emergency candidate %s excluded (%s)",
-                                 job_id, _r,
-                                 _st or "no feasibility")
-                if not _survivors:
-                    log.warning("Job %s no feasible emergency candidate; "
-                                "ABANDON", job_id)
-                    feasibility = None
-                    emergency_pools = []
-                    candidate_analyses = []
-                else:
-                    emergency_pools = _survivors
-                    candidate_analyses = [
-                        c for c in candidate_analyses
-                        if c.target_pool_id in _survivors]
-                    feasibility = _feas_by_pool[_survivors[0]]
-                # Invariant 5: durability comes from the authoritative
-                # checkpoint store, never from migration intent. Missing or
-                # uncertain => False => cold-restart/ABANDON branches.
-                _checkpoint_durable = query_checkpoint_durable(
-                    checkpoint_store, job_id, log)
-                if not _checkpoint_durable:
-                    log.info("Job %s has no durable checkpoint; "
-                             "recovery will consider cold-restart/ABANDON",
-                             job_id)
-                decision = policy.decide(
-                    regime, stay_analysis, candidate_analyses, workload_estimate,
-                    [compat_assessments[r] for r in emergency_pools],
-                    [ready_assessments[r] for r in emergency_pools],
-                    recovery_feasibility=feasibility,
-                    recovery_cost=None,
-                    checkpoint_durable=_checkpoint_durable,
-                    job_context={"workload_type": workload_type},
-                    risk_context={"interruption_probability": interruption_risk},
-                )
-                # Emergency decisions carry assessment pool_ids
-                # ("pool-<region>-<type>"); the loop keys assessments by
-                # region. Remap so downstream lookups never KeyError.
-                if (decision.target_candidate_id is not None
-                        and decision.target_candidate_id not in compat_assessments):
-                    for _rk, _ca in compat_assessments.items():
-                        if getattr(_ca, "pool_id", None) == decision.target_candidate_id:
-                            decision.target_candidate_id = _rk
-                            break
-            else:
-                decision = policy.decide(
-                    regime, stay_analysis, candidate_analyses, workload_estimate,
-                    [compat_assessments[r] for r in emergency_pools],
-                    [ready_assessments[r] for r in emergency_pools],
-                    job_context={"workload_type": workload_type},
-                    risk_context={"interruption_probability": interruption_risk},
-                    favorable_observations=favorable_streaks.get(job_id, 0),
-                    cooldown_remaining_seconds=_cooldown_left,
-                )
-
-            log.info("Job %s decision: action=%s target=%s reason=%s regime=%s", 
-                     job_id, decision.decision.value, decision.target_candidate_id, decision.reason, regime.value)
-
-            if decision.decision.value not in ("MIGRATE", "RECOVER"):
-                continue
-
-            last_ts = last_migration_ts.get(job_id)
-            if last_ts and (now - last_ts) < args.cooldown_seconds:
-                log.info("Job %s cooldown active; skipping migration", job_id)
-                continue
-
-            if not decision.target_candidate_id:
-                log.warning("Job %s has no target candidate; skipping", job_id)
-                continue
-
-            if args.migrate:
-                if not rate_limiter.acquire(timeout=0):
-                    stats = rate_limiter.get_stats()
-                    log.info("Job %s migration rate-limited (active=%s/%s)", job_id, stats["active_count"], stats["max_concurrent"])
-                    get_metrics().inc("migration_rate_limited_total")
-                    continue
-
-                try:
-                    source_pool_id = job.get("pool_id", f"source-{current_region}")
-                    target_pool_id = decision.target_candidate_id
-
-                    compat = compat_assessments[target_pool_id]
-                    ready = ready_assessments[target_pool_id]
-
-                    # Economics provenance for the chosen target (not just
-                    # iteration-order [0]): match the analysis whose
-                    # target_pool_id == decision target.
-                    _chosen_analysis = next(
-                        (c for c in candidate_analyses
-                         if getattr(c, "target_pool_id", None) == target_pool_id),
-                        candidate_analyses[0] if candidate_analyses else None,
-                    )
-                    plan = planner.create_plan(
-                        job_id=job_id,
-                        execution_epoch=execution_epoch,
-                        regime=regime,
-                        policy_decision=decision,
-                        source_pool_id=source_pool_id,
-                        target_pool_id=target_pool_id,
-                        workload_estimate=workload_estimate,
-                        recovery_feasibility=feasibility if regime == MigrationRegime.EMERGENCY else None,
-                        stay_analysis=stay_analysis,
-                        candidate_analysis=_chosen_analysis,
-                        absolute_deadline=absolute_deadline,
-                    )
-                    # Fencing needs the source execution identity at run time.
-                    plan.pid = job.get("pid")
-                    plan.source_host = job.get("public_ip")
-
-                    history.record_start(plan, decision, stay_analysis, feasibility if regime == MigrationRegime.EMERGENCY else None)
-                    # S16 seam: admit the plan so crash recovery and the
-                    # pre-emption lookup can see it (best-effort).
-                    _admit_plan_to_store(plan_store, plan, log)
-
-                    def on_state_change(old, new):
-                        log.info("Migration %s state: %s -> %s", plan.migration_id, old.value, new.value)
-
-                    executor = _wired_coordinator()
-                    execution_state = executor.execute_plan(plan, on_state_change)
-
-                    if execution_state.current_state.value == "SUCCESS":
-                        history.record_completion(plan.migration_id, "SUCCESS")
-                        _mark_plan_outcome(plan_store, plan, "SUCCEEDED", log)
-                        last_migration_ts[job_id] = time.time()
-                    elif execution_state.current_state.value == "ABORTED":
-                        history.record_completion(plan.migration_id, "ABORTED")
-                        _mark_plan_outcome(plan_store, plan, "ABORTED", log)
-                    elif execution_state.current_state.value == "SUPERSEDED":
-                        history.record_completion(plan.migration_id, "SUPERSEDED")
-                        _mark_plan_outcome(plan_store, plan, "SUPERSEDED", log)
-                    else:
-                        history.record_completion(plan.migration_id, "FAILED", str(execution_state))
-                        _mark_plan_outcome(plan_store, plan, "FAILED", log)
-                        # Replan path (§25/S15/S04): pre-fence failures with
-                        # a replan signal get bounded successor attempts.
-                        # Post-fence outcomes never reach here with a signal
-                        # (forward recovery owns them).
-                        _signal = _replan_mod.replan_signal_for(execution_state)
-                        if _signal is not None and _replan_mod.budget_remaining(
-                                _replan_counts, plan.migration_id, _max_replans):
-                            _attempt = _replan_mod.note_replan(
-                                _replan_counts, plan.migration_id)
-                            log.info("Job %s replan attempt %d (%s)",
-                                     job_id, _attempt, _signal)
-                            try:
-                                _fresh_estimate = estimator.estimate(
-                                    job_id, execution_epoch, workload_type, None)
-                                _successor = planner.create_successor_plan(
-                                    plan, f"{_signal}#{_attempt}", _fresh_estimate)
-                                _successor.pid = job.get("pid")
-                                _successor.source_host = job.get("public_ip")
-                                history.record_start(
-                                    _successor, decision, stay_analysis, None)
-                                _admit_plan_to_store(plan_store, _successor, log)
-                                _succ_state = executor.execute_plan(
-                                    _successor, on_state_change)
-                                if _succ_state.current_state.value == "SUCCESS":
-                                    history.record_completion(
-                                        _successor.migration_id, "SUCCESS")
-                                    _mark_plan_outcome(
-                                        plan_store, _successor, "SUCCEEDED", log)
-                                    last_migration_ts[job_id] = time.time()
-                                else:
-                                    history.record_completion(
-                                        _successor.migration_id, "FAILED",
-                                        str(_succ_state))
-                                    _mark_plan_outcome(
-                                        plan_store, _successor, "FAILED", log)
-                            except Exception as exc:
-                                log.warning("Job %s replan attempt failed: %s",
-                                            job_id, exc)
-
-                finally:
-                    rate_limiter.release()
-            else:
-                log.info("Job %s migration suggested (dry-run). Use --migrate to execute.", job_id)
-
-        time.sleep(args.interval)
+    from orchestrator.runtime_context import RuntimeContext
+    from orchestrator.worker_execution import WorkerExecution
+    worker_execution = WorkerExecution(_transport_for, guard=_cpr_lease.assert_fresh)
+    context = RuntimeContext({
+        "launch_handler": worker_execution.launch,
+        "emergency_rate_limiter": TokenBucketRateLimiter(max_per_hour=120, max_concurrent=args.max_concurrent_migrations, min_interval_seconds=0),
+        '_cpr_lease': _cpr_lease,
+        '_ingestion': _ingestion,
+        '_max_replans': _max_replans,
+        '_pending_attempt': _pending_attempt,
+        '_persisted_pools': _persisted_pools,
+        '_replan_counts': _replan_counts,
+        '_replan_mod': _replan_mod,
+        '_seen_interruptions': _seen_interruptions,
+        '_tele_attempt': _tele_attempt,
+        '_transport_for': _transport_for,
+        '_wired_coordinator': _wired_coordinator,
+        'admission_provisioner': admission_provisioner,
+        'args': args,
+        'cfg': cfg,
+        'check_lease_for_iteration': check_lease_for_iteration,
+        'checkpoint_store': checkpoint_store,
+        'compatibility_engine': compatibility_engine,
+        'estimator': estimator,
+        'evaluator': evaluator,
+        'event_dispatcher': event_dispatcher,
+        'favorable_streaks': favorable_streaks,
+        'feasibility_engine': feasibility_engine,
+        'history': history,
+        'include_states': include_states,
+        'instance_type': instance_type,
+        'last_migration_ts': last_migration_ts,
+        'last_reconcile': last_reconcile,
+        'load_v2_baseline': lambda: _base,
+        'log': log,
+        'placement_engine': placement_engine,
+        'plan_store': plan_store,
+        'planner': planner,
+        'policy': policy,
+        'pool_store': pool_store,
+        'price_cache': price_cache,
+        'rate_limiter': rate_limiter,
+        'readiness_engine': readiness_engine,
+        'reconcile_interval': reconcile_interval,
+        'reconciliation': reconciliation,
+        'registry': registry,
+        'watcher': watcher,
+    })
+    if args.migrate:
+        _cpr_lease.start()
+    try:
+        while run_iteration(context):
+            time.sleep(args.interval)
+    finally:
+        if args.migrate:
+            _cpr_lease.release()
+        health_server.shutdown()
+        health_server.server_close()
+        for transport in _transports.values():
+            transport.close()
 
 
 if __name__ == "__main__":

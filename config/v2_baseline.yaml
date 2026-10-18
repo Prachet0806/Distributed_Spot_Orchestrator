@@ -53,19 +53,8 @@ concurrency:
 transfer:
   multipart_part_size_bytes: 67108864
 
-placement:
-  version: v3
-  weights:
-    compatibility: 0.30
-    readiness: 0.25
-    capacity: 0.20
-    locality: 0.10
-    reliability: 0.10
-    operational_cost: 0.05
-  tie_break: [score, freshness, capacity_confidence, migration_time, pool_id_lexicographic]
-
 runtime:
-  engine_version: pinned_at_admission
+  engine_version: v2
   worker_os: ubuntu-22.04
   worker_arch: x86_64
   criu: pinned

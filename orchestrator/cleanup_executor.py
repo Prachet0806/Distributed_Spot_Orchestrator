@@ -56,6 +56,8 @@ class CleanupExecutor:
         plan: Any,
         operations: list,
         safety_critical_only: bool = False,
+        outcome: str = "FAILED",
+        target_instance_id: str = None,
     ) -> list[str]:
         completed = []
 
@@ -63,9 +65,13 @@ class CleanupExecutor:
             self._cleanup_partial_artifacts(plan.migration_id)
             completed.append("partial_artifacts")
 
-        target = getattr(plan, "target_pool_id", None) or getattr(
-            plan, "target_candidate_id", None)
-        if target:
+        target = target_instance_id
+        if target is None:
+            for op in operations:
+                if getattr(op, "step_name", "") == "provisioning":
+                    result = getattr(op, "result", None)
+                    target = result.get("instance_id") if isinstance(result, dict) else getattr(result, "instance_id", None)
+        if target and outcome != "SUCCESS":
             self._terminate_target_instance(target)
             completed.append("target_instance")
 

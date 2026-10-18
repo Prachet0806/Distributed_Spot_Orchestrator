@@ -88,6 +88,12 @@ class _FakeTransport:
     def close(self):
         pass
 
+    def fetch_directory(self, remote, local):
+        from pathlib import Path
+        directory = Path(local)
+        directory.mkdir(parents=True)
+        (directory / "core-123.img").write_bytes(b"checkpoint fixture")
+
 
 def test_dump_handler_success_and_failures():
     ok = handlers.make_dump_handler(_FakeTransport(rc=0))
@@ -108,13 +114,18 @@ def test_dump_handler_success_and_failures():
 
 def test_restore_handler_outcome_mapping():
     mk = handlers.make_restore_handler
-    assert mk(_FakeTransport(rc=0, stdout="12345"))(
-        checkpoint_id="c").outcome == "SUCCEEDED"
-    r = mk(_FakeTransport(rc=0, stdout="12345"))(checkpoint_id="c")
+    success = json.dumps({"state": "SUCCEEDED", "result": {"process_id": 12345,
+        "process_start": "900", "contained": True}})
+    transport = _FakeTransport(rc=0, stdout=success)
+    r = mk(transport)(checkpoint_id="c", operation_id="op-1")
     assert r.process_id == 12345 and r.success is True
-    assert mk(_FakeTransport(rc=2))(checkpoint_id="c").outcome == "UNKNOWN"
-    assert mk(_FakeTransport(rc=3))(checkpoint_id="c").outcome == "PARTIAL_RESTORE"
-    assert mk(_FakeTransport(rc=1))(checkpoint_id="c").outcome == "FAILED"
+    assert "restore run --operation-id op-1" in transport.commands[0]
+    assert mk(_FakeTransport(rc=2, stdout='{"state":"UNKNOWN"}'))(
+        checkpoint_id="c", operation_id="op-2").outcome == "UNKNOWN"
+    assert mk(_FakeTransport(rc=3, stdout='{"state":"UNKNOWN"}'))(
+        checkpoint_id="c", operation_id="op-3").outcome == "UNKNOWN"
+    assert mk(_FakeTransport(rc=1, stdout='{"state":"FAILED"}'))(
+        checkpoint_id="c", operation_id="op-4").outcome == "FAILED"
 
 
 def test_verify_and_fence_hooks():

@@ -226,3 +226,23 @@ def test_s3_rejects_tar_slip(aws_env, tmp_path):
     with tarfile.open(evil_tar) as tar:
         with pytest.raises(RuntimeError):
             list(_safe_members(tar))
+
+
+@pytest.mark.parametrize("state", ["CHECKPOINTING", "UPLOADING", "DOWNLOADING", "TERMINATED"])
+def test_dynamo_rejects_retired_states(registry, state):
+    registry.create("j", state="RUNNING")
+    with pytest.raises(RuntimeError, match="Invalid state transition"):
+        registry.transition("j", state)
+    with pytest.raises(ValueError):
+        registry.create("old", state=state)
+    assert not hasattr(registry, "update")
+
+
+def test_dynamo_rejects_old_record_shapes(registry):
+    registry.table.put_item(Item={"job_id": "old", "state": "RUNNING", "version": 0})
+    with pytest.raises(ValueError, match="missing fields"):
+        registry.get("old")
+    registry.create("j", state="RUNNING")
+    with pytest.raises(ValueError, match="Only V2"):
+        registry.transition("j", "RUNNING", engine_version="v1")
+    assert "engine_version" not in registry.get("j")

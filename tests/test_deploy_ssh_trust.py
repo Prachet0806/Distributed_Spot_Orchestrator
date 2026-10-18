@@ -106,3 +106,29 @@ def test_deploy_main_aborts_when_emu_trust_set(monkeypatch, tmp_path):
     assert emu_trust_mode() is True
     with pytest.raises(SystemExit, match="EMU_TRUST_MODE"):
         deploy_worker.main(["--ip", "1.2.3.4", "--key", _key(tmp_path)])
+
+
+def test_deploy_requires_root_owned_control_tree():
+    class Output:
+        def __init__(self, content, code=0):
+            self.content = content.encode()
+            self.channel = MagicMock(recv_exit_status=MagicMock(return_value=code))
+
+        def read(self):
+            return self.content
+
+    class SSH:
+        def __init__(self, mode="755"):
+            self.mode = mode
+            self.commands = []
+
+        def exec_command(self, command):
+            self.commands.append(command)
+            output = "sha256:" + "a" * 64 if "--self-check" in command else "0 " + self.mode
+            return None, Output(output), Output("")
+
+    ssh = SSH()
+    assert deploy_worker.verify_worker_control(ssh) == "sha256:" + "a" * 64
+    assert "-I" in ssh.commands[-1]
+    with pytest.raises(RuntimeError, match="writable"):
+        deploy_worker.verify_worker_control(SSH("777"))

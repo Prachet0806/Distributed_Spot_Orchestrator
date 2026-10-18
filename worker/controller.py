@@ -34,7 +34,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-PRIMITIVE_ACTIONS = ("terminate", "verify", "preflight")
+PRIMITIVE_ACTIONS = ("terminate", "verify", "preflight", "activate")
 
 
 class ControllerError(RuntimeError):
@@ -69,6 +69,7 @@ class WorkerController:
         admission_epoch: Optional[int] = None,
         executor: Any = None,
         clock: Optional[Callable[[], datetime]] = None,
+        journal=None, lease_validator=None,
     ):
         binding = boot_identity(instance_id, admission_epoch)
         self.instance_id: str = binding["instance_id"]
@@ -77,6 +78,9 @@ class WorkerController:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._replay: Dict[str, Dict[str, Any]] = {}
         self.refusals: List[Dict[str, Any]] = []
+        self.journal = journal
+        self.lease_validator = lease_validator
+        self._requests = {}
         self.command_log: List[Dict[str, Any]] = []
 
     # -- W1 lifecycle evidence --
@@ -110,8 +114,6 @@ class WorkerController:
         if not isinstance(command, dict):
             return self._refuse("", None, "UNKNOWN_OPERATION")
         operation_id = str(command.get("operation_id", "") or "")
-        if operation_id and operation_id in self._replay:
-            return dict(self._replay[operation_id])  # W4: converge, no re-exec
         if command.get("instance_id") != self.instance_id:
             return self._refuse(operation_id,
                                 command.get("expected_execution_epoch"),
@@ -127,7 +129,22 @@ class WorkerController:
         if action not in PRIMITIVE_ACTIONS:
             # I8: decision-shaped commands are not executable primitives.
             return self._refuse(operation_id, expected, "UNKNOWN_OPERATION")
+        if not operation_id:
+            return self._refuse(operation_id, expected, "UNKNOWN_OPERATION")
+        if self.lease_validator is not None and not self.lease_validator(command):
+            return self._refuse(operation_id, expected, "LEASE_EXPIRED")
+        if operation_id in self._replay:
+            if self._requests[operation_id] != command:
+                return self._refuse(operation_id, expected, "OPERATION_CONFLICT")
+            return dict(self._replay[operation_id])
+        if self.journal is not None:
+            replay = self.journal.begin(command)
+            if replay is not None:
+                return replay
         result = self._execute(action, command, operation_id)
+        if self.journal is not None:
+            self.journal.finish(command, result)
+        self._requests[operation_id] = dict(command)
         if operation_id:
             self._replay[operation_id] = dict(result)
         return result
@@ -157,6 +174,13 @@ class WorkerController:
             out = self._executor.preflight()
             return {"accepted": True, "operation_id": operation_id,
                     "action": action, "output": out}
+        if action == "activate":
+            pid = command.get("pid")
+            if pid is None or not command.get("process_start") or not command.get("job_id"):
+                raise ControllerError("activate needs job and process identity")
+            receipt = self._executor.activate(int(pid), int(command["expected_execution_epoch"]))
+            return {"accepted": True, "operation_id": operation_id,
+                    "action": action, "pid": int(pid), "receipt": receipt}
         raise ControllerError(f"unreachable action {action!r}")  # pragma: no cover
 
     def _refuse(self, operation_id: str, expected: Any,

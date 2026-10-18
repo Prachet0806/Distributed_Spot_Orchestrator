@@ -3,6 +3,7 @@
 Vehicles: C-PLACE (ranking/expiry/tie-break preserved), I15-adjacent
 bounded-concurrency evidence, S22-adjacent CAPACITY_UNAVAILABLE semantics.
 """
+from storage.audit_store import AuditStore
 import json
 from types import SimpleNamespace
 
@@ -138,13 +139,13 @@ def test_placement_excludes_exhausted_pool_as_capacity_unavailable():
 
 # -- coordinator execution guard (guard 2) --
 def _registry(tmp_path):
-    from storage.job_registry import JobRegistry
+    from storage.memory_registry import MemoryRegistry
     path = tmp_path / "registry.json"
     path.write_text(json.dumps({"job-1": {
         "job_id": "job-1", "state": "RUNNING", "region": "ap-south-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    return JobRegistry(str(path))
+    return MemoryRegistry(json.loads(path.read_text()))
 
 
 def _plan():
@@ -176,14 +177,14 @@ def test_coordinator_refuses_provisioning_when_pool_exhausted(tmp_path):
 
     dump_calls = []
 
-    def _dump(job_id, pid, host, timeout=300.0):
+    def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
         from orchestrator.checkpoint_manager import CheckpointResult
         dump_calls.append(1)
         return CheckpointResult(checkpoint_id="chk", size_bytes=1,
                                 duration_seconds=0.01, digest="d",
                                 status="LOCAL", job_id=job_id, lineage_id=job_id)
 
-    coord = MigrationCoordinator(
+    coord = MigrationCoordinator(audit_store=AuditStore(),
         registry=reg, provisioner=SimpleNamespace(
             provision_with_operation=lambda *a, **_k: (_ for _ in ()).throw(
                 AssertionError("must not provision"))),
@@ -205,10 +206,10 @@ def test_coordinator_releases_slot_on_terminal_failure(tmp_path):
     reg = _registry(tmp_path)
     t = PoolConcurrencyTracker(default_max=1)
 
-    def _dump(job_id, pid, host, timeout=300.0):
+    def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
         raise RuntimeError("uncoded dump failure")
 
-    coord = MigrationCoordinator(
+    coord = MigrationCoordinator(audit_store=AuditStore(),
         registry=reg, provisioner=SimpleNamespace(),
         checkpoint_manager=CheckpointManager(
             storage=SimpleNamespace(upload=lambda *a, **_k: None, bucket="b"),

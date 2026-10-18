@@ -1,57 +1,45 @@
-import unittest
-import tempfile
-import os
-import json
-from storage.job_registry import JobRegistry
+"""V2 emulation registry rejects retired states and record shapes."""
+import pytest
+from storage.memory_registry import MemoryRegistry
 
-class TestJobRegistry(unittest.TestCase):
-    def setUp(self):
-        """Create temporary registry file for testing"""
-        self.temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
-        initial_data = {
-            "job-1": {
-                "state": "RUNNING",
-                "region": "us-east-1",
-                "pid": 1234,
-                "public_ip": "1.2.3.4"
-            }
-        }
-        json.dump(initial_data, self.temp_file)
-        self.temp_file.close()
-        self.registry = JobRegistry(self.temp_file.name)
-    
-    def tearDown(self):
-        """Clean up temporary file"""
-        if os.path.exists(self.temp_file.name):
-            os.unlink(self.temp_file.name)
-    
-    def test_get_job(self):
-        """Test retrieving a job"""
-        job = self.registry.get("job-1")
-        self.assertEqual(job["state"], "RUNNING")
-        self.assertEqual(job["region"], "us-east-1")
-        self.assertEqual(job["pid"], 1234)
-        self.assertEqual(job["public_ip"], "1.2.3.4")
-    
-    def test_update_job_state(self):
-        """Test updating job state"""
-        self.registry.update("job-1", "CHECKPOINTING")
-        job = self.registry.get("job-1")
-        self.assertEqual(job["state"], "CHECKPOINTING")
-    
-    def test_update_job_with_kwargs(self):
-        """Test updating job with additional fields"""
-        self.registry.update("job-1", "RUNNING", region="us-west-2", public_ip="5.6.7.8")
-        job = self.registry.get("job-1")
-        self.assertEqual(job["state"], "RUNNING")
-        self.assertEqual(job["region"], "us-west-2")
-        self.assertEqual(job["public_ip"], "5.6.7.8")
-    
-    def test_get_nonexistent_job(self):
-        """Test getting non-existent job raises error"""
-        with self.assertRaises(KeyError):
-            self.registry.get("job-nonexistent")
 
-if __name__ == '__main__':
-    unittest.main()
+def test_v2_create_transition_and_copy_isolation():
+    reg = MemoryRegistry()
+    reg.create("j", state="RUNNING", region="us-east-1")
+    record = reg.get("j")
+    record["state"] = "FAILED"
+    assert reg.get("j")["state"] == "RUNNING"
+    out = reg.transition("j", "MIGRATING", expected_version=0,
+                         expected_epoch=0, active_migration_id="m")
+    assert out["version"] == 1 and out["execution_epoch"] == 0
+    with pytest.raises(RuntimeError, match="Optimistic lock"):
+        reg.transition("j", "RUNNING", expected_version=0)
+    with pytest.raises(RuntimeError, match="Epoch conflict"):
+        reg.transition("j", "RUNNING", expected_epoch=1)
+    out = reg.transition("j", "RUNNING", ownership_change=True)
+    assert out["execution_epoch"] == 1 and out["active_migration_id"] is None
+    assert reg.list_by_state("RUNNING") == [out]
 
+
+@pytest.mark.parametrize("state", ["CHECKPOINTING", "UPLOADING", "PROVISIONING", "TERMINATED"])
+def test_retired_states_rejected(state):
+    reg = MemoryRegistry()
+    reg.create("j", state="RUNNING")
+    with pytest.raises(RuntimeError, match="Invalid state transition"):
+        reg.transition("j", state)
+    with pytest.raises(ValueError):
+        reg.create("old", state=state)
+
+
+def test_old_record_shapes_rejected():
+    with pytest.raises(ValueError, match="missing fields"):
+        MemoryRegistry({"j": {"job_id": "j", "state": "RUNNING"}})
+    with pytest.raises(ValueError, match="Only V2"):
+        MemoryRegistry().create("j", state="RUNNING", engine_version="v1")
+    assert not hasattr(MemoryRegistry(), "update")
+
+
+@pytest.mark.parametrize("counter", [None, "0", -1, True])
+def test_v2_counters_are_not_upgraded(counter):
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        MemoryRegistry().create("j", state="RUNNING", execution_epoch=counter)

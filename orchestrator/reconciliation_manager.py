@@ -15,13 +15,7 @@ class ReconciliationTrigger(str, Enum):
 
 
 class MismatchType(str, Enum):
-    # Legacy values (kept for compat).
-    SOURCE_STILL_ALIVE = "SOURCE_STILL_ALIVE"
-    TARGET_UNREACHABLE = "TARGET_UNREACHABLE"
-    ORPHAN_RESOURCE = "ORPHAN_RESOURCE"
     EPOCH_MISMATCH = "EPOCH_MISMATCH"
-    REGISTRY_INFRA_MISMATCH = "REGISTRY_INFRA_MISMATCH"
-    MIGRATION_DANGLING = "MIGRATION_DANGLING"
     # V2 taxonomy (Protocols #11 §13.3).
     SOURCE_STILL_ALIVE_AFTER_FENCE = "SOURCE_STILL_ALIVE_AFTER_FENCE"
     TARGET_MISSING = "TARGET_MISSING"
@@ -43,10 +37,6 @@ class ReconciliationAction(str, Enum):
     NO_ACTION = "NO_ACTION"
 
 
-# Legacy alias (was a duplicate class + the source of a NameError).
-ReconnectionAction = ReconciliationAction
-
-
 class FindingStatus(str, Enum):
     OPEN = "OPEN"
     ACKNOWLEDGED = "ACKNOWLEDGED"
@@ -59,7 +49,6 @@ class FindingStatus(str, Enum):
 OWNERSHIP_GATE_TYPES = frozenset({
     MismatchType.SPLIT_BRAIN, MismatchType.UNKNOWN_OWNERSHIP,
     MismatchType.EPOCH_MISMATCH, MismatchType.SOURCE_STILL_ALIVE_AFTER_FENCE,
-    MismatchType.SOURCE_STILL_ALIVE,
 })
 
 _STATUS_FLOW = {
@@ -396,10 +385,6 @@ class ReconciliationManager:
                 job = self.registry.get(finding.job_id)
                 if job.get("state") != "RECONCILIATION_REQUIRED":
                     transition(finding.job_id, "RECONCILIATION_REQUIRED")
-            else:
-                update = getattr(self.registry, "update", None)
-                if callable(update):
-                    update(finding.job_id, "RECONCILIATION_REQUIRED")
         except Exception as exc:
             logger.error("Reconciliation gate transition failed for %s: %s",
                          finding.job_id, exc)

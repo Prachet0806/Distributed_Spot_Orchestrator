@@ -61,6 +61,7 @@ def make_controller_fence_hooks(
     identity_resolver: Callable[[Any], Dict[str, Any]],
     epoch_resolver: Optional[Callable[[Any], int]] = None,
     refusal_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+    command_metadata=None,
 ) -> Dict[str, Callable[[Any], Any]]:
     """Fence hooks speaking the epoch-gated controller protocol.
 
@@ -90,10 +91,13 @@ def make_controller_fence_hooks(
         except Exception as exc:
             raise RuntimeError(f"controller channel failed: {exc}")
 
-    def _handle_refusal(result: Dict[str, Any], action: str):
+    def _handle_refusal(result: Dict[str, Any], action: str, plan=None):
         refusal = result.get("refusal") or {
             "reason": result.get("reason", "UNKNOWN"),
             "operation_id": result.get("operation_id", "")}
+        if plan is not None:
+            refusal = {**refusal, "job_id": getattr(plan, "job_id", ""),
+                       "migration_id": getattr(plan, "migration_id", None)}
         if refusal_sink is not None:
             try:
                 refusal_sink(dict(refusal))
@@ -107,26 +111,28 @@ def make_controller_fence_hooks(
         host, pid, instance_id, expected = _resolve(plan)
         result = _send(host, {
             "instance_id": instance_id,
-            "operation_id": new_ulid_like(),
+            **(command_metadata(plan) if command_metadata else {}),
+            "operation_id": f"{plan.plan_id}:terminate" if getattr(plan, "plan_id", None) else new_ulid_like(),
             "expected_execution_epoch": expected,
             "action": "terminate",
             "pid": int(pid),
         })
         if not result.get("accepted"):
-            _handle_refusal(result, "terminate")
+            _handle_refusal(result, "terminate", plan)
         # Signal-sent is not fence-confirmed: _verify decides confirmation.
 
     def _verify(plan) -> bool:
         host, pid, instance_id, expected = _resolve(plan)
         result = _send(host, {
             "instance_id": instance_id,
-            "operation_id": new_ulid_like(),
+            **(command_metadata(plan) if command_metadata else {}),
+            "operation_id": f"{plan.plan_id}:verify" if getattr(plan, "plan_id", None) else new_ulid_like(),
             "expected_execution_epoch": expected,
             "action": "verify",
             "pid": int(pid),
         })
         if not result.get("accepted"):
-            _handle_refusal(result, "verify")
+            _handle_refusal(result, "verify", plan)
         return bool(result.get("process_dead", False))
 
     def _invalidate(plan):

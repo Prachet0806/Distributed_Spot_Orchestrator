@@ -5,9 +5,9 @@
 ![AWS](https://img.shields.io/badge/AWS-EC2%20Spot%20|%20S3%20|%20DynamoDB-orange?logo=amazon-aws\&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**Cost-optimize long-running batch workloads by live-migrating running processes between AWS regions.**
+**Experimental control plane for cost-aware placement and migration of restricted CPU batch workloads.**
 
-Submit a job with one command and the V2 control plane takes ownership: provisioning, spot-price placement, CRIU live migration, interruption recovery, and savings reporting. Running processes are treated as portable state — frozen with CRIU and resumed where compute is cheapest.
+The V2 control plane implements admission, placement, durable state, checkpoint transfer, fencing, and validation gates. Local AWS-service emulation passes; a local Linux lab has completed a real CRIU dump and verified checkpoint transfer but restore currently fails inside CRIU on WSL2. Live AWS migration and completed-job savings have not been qualified.
 
 > **What V2 does not promise:** exactly-once execution (future goal, not a guarantee), full coordinator HA / leader election (deferred — single-writer lease + CAS instead), multi-cloud, fleet-wide optimization, or ML-driven policy. See [Non-goals](#non-goals).
 
@@ -25,7 +25,7 @@ One separation rule governs the whole design:
 | Estimation | What is likely next? | Workload estimator (progress, remaining runtime, checkpoint size/duration + confidence) |
 | Economics | What does each option cost? | Cost/risk evaluator, recovery-feasibility engine (critical-path vs deadline) |
 | Policy | What should we do? | Arbitrage / proactive / recovery policies with precedence `EMERGENCY > PROACTIVE > ARBITRAGE` |
-| Execution | Do it exactly once | Migration planner (immutable hash-pinned plan) → coordinator (sole command issuer) |
+| Execution | Issue controlled steps and track outcomes | Migration planner (immutable hash-pinned plan) → coordinator (sole command issuer) |
 | Validation | Did it actually work? | L1 infra → L2 app → L3 tolerance → L4 strict validator; inconclusive never promotes |
 
 Two regimes share this pipeline but obey different clocks: **arbitrage** can wait for better information (hysteresis, cooldowns, short-job rules); **emergency recovery** must fit inside a provider interruption deadline, so it uses a dedicated fast path (parallel checkpoint ∥ provision, forward-only after fencing, cold-restart fallback).
@@ -69,9 +69,11 @@ Admitted (`PENDING`) jobs are owned the same way: the loop provisions an initial
 | Checkpoint Metadata | `spot_arbitrage_checkpoints` | Durability (`LOCAL→PERSISTING→DURABLE`), lineage, locks, GC floor |
 | Audit Store | `spot_arbitrage_audit` | Append-only mandatory events |
 | Migration History | `spot_arbitrage_migration_history` | Estimated-vs-actual per migration (feeds estimator + risk feedback) |
-| Configuration | S3-versioned `config/{domain}/v{N}.yaml` | Pinned policy/placement/baseline versions referenced by plans |
+| Configuration | `spot_arbitrage_config` | Immutable versioned policy/placement/baseline documents |
+| Operations | `spot_arbitrage_operations` | Durable request binding and outcome receipts |
+| Pool reservations | `spot_arbitrage_pool_reservations` | CAS-protected migration capacity |
 
-On restart the orchestrator acquires the lease, replays the §14.3 bootstrap report (in-flight → UNKNOWN resolution → budget → frontier → sweep → resume), and never actuates without a fresh lease. You never re-register or repair jobs by hand after a crash.
+On restart the orchestrator acquires the lease and inspects in-flight plans and operation receipts. The restart path still needs full crash-phase qualification; do not use it as evidence of automatic recovery in production.
 
 ---
 
@@ -79,9 +81,9 @@ On restart the orchestrator acquires the lease, replays the §14.3 bootstrap rep
 
 ### Prerequisites
 
-* Python 3.10+, Terraform 1.5+, configured AWS CLI
+* Python 3.10+, Terraform 1.5+, configured AWS CLI for eventual live qualification
 * SSH key pair uploaded to all target regions
-* Ubuntu 22.04 worker AMI with CRIU (`sudo criu check` passes), Python, and `criu_wrapper.sh`; copy it to every candidate region (AMI baking itself stays out-of-band for v1)
+* Ubuntu 22.04 worker AMI with CRIU (`sudo criu check` passes), Python, and `criu_wrapper.sh`; copy the qualified image to every candidate region
 
 ### 1. Infrastructure (Terraform — never hand-create tables)
 
@@ -91,7 +93,7 @@ terraform init
 terraform apply
 ```
 
-This creates the DynamoDB tables, KMS key, and hardened checkpoint bucket. Confirm tables + GSIs ACTIVE before proceeding.
+This creates the DynamoDB tables, KMS key, and checkpoint bucket. Review `terraform plan` and confirm tables + GSIs ACTIVE before proceeding.
 
 ### 2. Configure pools and runtime
 
@@ -119,11 +121,20 @@ The job is admitted `PENDING` with an immutable workload contract. The loop prov
 
 ```bash
 export CHECKPOINT_BUCKET=<your_bucket>
+export CHECKPOINT_KMS_KEY_ARN=<terraform_output_checkpoint_kms_key_arn>
+export SSH_PRIVATE_KEY_PATH=<path_to_worker_key>
+export SSH_KNOWN_HOSTS_PATH=<path_to_pinned_worker_hosts>
 python -m orchestrator.main --multi-job \
   --regions us-east-1,us-west-2 --instance-type t3.micro --migrate
 ```
 
-Key flags: `--engine v2` (default; `v1` is frozen legacy per ADR-024), `--states PENDING,RUNNING`, `--max-migrations-per-hour`, `--max-concurrent-migrations`, `--check-spot-flag` (worker interruption lane), `--reconcile-interval`, `--health-port`. Health: `GET /health`, Prometheus metrics at `/metrics` (set `HEALTH_AUTH_TOKEN` to require `?token=`).
+The sole execution engine is V2. Key flags: `--states PENDING,RUNNING`, `--max-migrations-per-hour`, `--max-concurrent-migrations`, `--check-spot-flag` (worker interruption lane), `--reconcile-interval`, `--health-port`. Health: `GET /health`, Prometheus metrics at `/metrics` (set `HEALTH_AUTH_TOKEN` to require `?token=`).
+
+### Credential-free validation
+
+Install `requirements-dev.txt` and run `python scripts/run_local_lab.py --mode services`. This executes the production iteration with injected services, cross-process Moto HTTP restart checks, and durable-store tests. Linux root with CRIU and SSH can also run `python scripts/run_local_lab.py --mode linux`; this lab must complete restore, fencing, activation, and fresh target progress before claiming real migration. Evidence is written to `lab-results/`.
+
+See [the pre-credential handoff](docs/PRE_CREDENTIAL_HANDOFF.md) for current results and the remaining qualification gates.
 
 ### 5. Observe economics
 
@@ -163,7 +174,7 @@ The AWS proof matrix (crash-mid-migration, duplicate provision, checksum corrupt
 
 ## Contributor path
 
-Repo map: `orchestrator/` (control plane) · `worker/` (job runner, controller, transports) · `storage/` (8 stores + transition tables) · `config/` (runtime, placement, baseline, logging) · `infra/aws/` (Terraform) · `scripts/` (`spotctl.py` user CLI, `deploy_worker.py`, `worker_ctl.py`, `registry_cli.py` legacy) · `tests/` (333-test S/P/C suite).
+Repo map: `orchestrator/` (control plane) · `worker/` (job runner, controller, transports) · `storage/` (8 stores + transition tables) · `config/` (runtime, placement, baseline, logging) · `infra/aws/` (Terraform) · `scripts/` (`spotctl.py` user CLI, `deploy_worker.py`, local lab runners) · `tests/` (S/P/C regression suite).
 
 | Doc | What it is |
 |---|---|
@@ -175,8 +186,8 @@ Repo map: `orchestrator/` (control plane) · `worker/` (job runner, controller, 
 | `docs/IMPLEMENTATION_STATUS.md` | Docs-claim ↔ code-truth ledger (update it with every landing) |
 | `docs/TRACKS.md` | Prod tracks A–E execution plan |
 | `docs/telemetry-contract.md` | T1–T4 worker telemetry schemas |
-| `docs/adr/` | 20 ADRs (policy, placement, trust, HA, V1 deletion…) |
-| `spot-arbitrage-architecture.json` (+ generated `.html` view) | Explorable runtime-architecture diagram spec |
+| `docs/adr/` | 20 ADRs (policy, placement, trust, HA, engine retirement…) |
+| `spot-arbitrage-architecture.json` | Runtime-architecture diagram source |
 
 Standing rules: no irreversible action without its gate green; every orchestration/persistence PR cites its S/P/C rows; the status ledger moves with the code, not on dates.
 
@@ -186,7 +197,7 @@ Standing rules: no irreversible action without its gate green; every orchestrati
 
 * **Tracks A–B:** live signal + durability — first real migration per region pair; Dynamo live-verify; crash matrix (RTO ≤ 2 min, RPO 0)
 * **Tracks C–D:** safety evidence + hardening — telemetry path, live drills (S07/S13/S17/S24), least-privilege roles, worker-controller trust cutover
-* **Track E:** operate + graduate — dashboards, playbooks, billing validation, 2-week soak, V1 deletion per ADR-024 (emulated green → AWS green → soak → delete; `registry_cli` JSON compat retained until records migrate)
+* **Track E:** operate + graduate — dashboards, playbooks, billing validation, 2-week soak, and production qualification
 * **Deferred by decision:** warm-standby pools (opt-in only), REST API, predictive pricing/ML, multi-cloud
 
-V1 (`Migrator`/`DecisionEngine`) is frozen behind `--engine v1` and covered by immutability pins in `tests/test_models_v2.py`. New work targets V2.
+V1 execution and compatibility have been removed (ADR-024 revised by explicit project-owner decision). `--engine`, the legacy registry CLI, JSON registry files, old job states, and executor aliases are unsupported. Production uses DynamoDB; V2 emulation uses an explicit in-memory registry and provisioner. Persisted records must satisfy the V2 contract; no automatic upgrade or V1 fallback is provided. Existing AWS data is not deleted by this code change.

@@ -20,7 +20,7 @@ Migration may introduce up to approximately **20% completion-time overhead**.
 
 ### Current workload scope
 
-V1/V2 initially targets **checkpointable workloads**, while keeping the architecture extensible to broader workload classes through workload adapters and estimation.
+V2 initially targets **checkpointable workloads**, while keeping the architecture extensible to broader workload classes through workload adapters and estimation.
 
 ### Recovery model
 
@@ -32,7 +32,9 @@ On Spot interruption, the system attempts to preserve progress and resume from a
 
 V2 assumes **at most one active Migration Coordinator is authorized to execute a given migration**.
 
-Leader election, leases, and full coordinator HA are deferred.
+A DynamoDB self-fencing lease limits coordinator command issuance. Full
+leader election and coordinator HA remain deferred (see
+`component-architecture-v2.md` §14 and ADR-020).
 
 ---
 
@@ -1079,7 +1081,7 @@ Explicitly deferred:
 
 - Exactly-once execution
 - Full coordinator HA
-- Leader election / leases
+- Full leader election and coordinator HA (the self-fencing lease is in scope)
 - Multi-coordinator ownership
 - Fleet-wide global optimization
 - Multi-cloud execution

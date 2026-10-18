@@ -18,11 +18,6 @@ COOLDOWN_SECONDS = 3 * 60 * 60  # 3 hours between migrations per job
 STUCK_JOB_THRESHOLD = 15 * 60    # 15 minutes - alert if job stuck in non-RUNNING state
 MIGRATION_POLL_INTERVAL = 60     # 60 seconds between orchestrator polls
 
-# Retry configuration (legacy single-value knobs; §10.8 step_retry.py +
-# config/v2_baseline.yaml `retry:` own the V2 budgets)
-DEFAULT_RETRIES = 3
-INITIAL_RETRY_DELAY = 2          # seconds
-
 # Cache TTLs
 PRICE_CACHE_TTL = 90             # 90 seconds (spot prices update ~5min)
 CONFIG_CACHE_TTL = 300           # 5 minutes for runtime config
@@ -33,8 +28,6 @@ DEFAULT_SPOT_PRICE_SAMPLES = 5   # Number of recent prices to fetch
 
 # Timeouts
 SSH_TIMEOUT_DEFAULT = 30         # seconds
-SSH_TIMEOUT_CRIU_DUMP = 300      # 5 minutes for checkpoint dump
-SSH_TIMEOUT_CRIU_RESTORE = 180   # 3 minutes for restore
 S3_TIMEOUT_DEFAULT = 300         # 5 minutes for S3 operations
 INSTANCE_PROVISION_TIMEOUT = 300 # 5 minutes for instance to be running
 

@@ -23,7 +23,7 @@ supersession wiring (S04/S15/S16), lease + §14.3 bootstrap report,
 1. `terraform -C infra/aws apply` (state tables, KMS key, hardened bucket).
 2. Bake + copy the worker AMI (Ubuntu 22.04, pinned CRIU/kernel,
    `criu_wrapper.sh`, deps) to every candidate region; fill
-   `config/runtime.yaml` (`target_ami_id`, `target_security_group_id`).
+   authoritative pool definitions in `config/pools.json` (AMI, security group, runtime digest, and region).
 3. Pass the KMS ARN back as `kms_key_arn` to scope the worker policy.
 4. Create DynamoDB table `spot_arbitrage_registry` — now managed by
    `infra/aws/dynamodb.tf` (do not hand-create).
@@ -40,8 +40,9 @@ python -m orchestrator.main --multi-job \
 The AWS path always verifies host keys and worker identity; CI asserts
 `emu_trust_mode()` defaults to false (`tests/test_worker.py`).
 
-## V1 removal gates (ADR-024)
+## Engine boundary (ADR-024)
 
-V1 stays frozen until: emulated green → deprecated; AWS green → V2
-default; production soak → delete migration code (keep `registry_cli`
-JSON compat until records migrate).
+V2 is the sole engine. V1 execution, JSON registry compatibility, legacy CLI,
+old state transitions, and fallback executor APIs have been removed. Production
+uses DynamoDB; the no-AWS gate uses explicit V2 in-memory test collaborators.
+This breaking change does not delete or upgrade existing AWS records.

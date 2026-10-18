@@ -3,7 +3,8 @@ from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Attr, Key
 from threading import Lock
 from datetime import datetime
-from storage.job_states import is_transition_allowed
+from storage.registry_contract import validate_job_record
+from storage.backend import encode, decode
 import time
 import logging
 
@@ -34,9 +35,9 @@ class DynamoRegistry:
       - Attributes: state, region, pid, public_ip, workload_type, version (N), last_updated (S), etc.
     """
 
-    def __init__(self, table_name: str, region_name: str | None = None):
+    def __init__(self, table_name: str, region_name: str | None = None, *, dynamodb_resource=None, endpoint_url=None):
         self.table_name = table_name
-        self.dynamodb = boto3.resource("dynamodb", region_name=region_name)
+        self.dynamodb = dynamodb_resource if dynamodb_resource is not None else boto3.resource("dynamodb", region_name=region_name, endpoint_url=endpoint_url)
         self.table = self.dynamodb.Table(table_name)
         self.lock = Lock()
 
@@ -44,13 +45,13 @@ class DynamoRegistry:
         """Get a job by ID with metrics tracking."""
         start = time.time()
         try:
-            resp = self.table.get_item(Key={"job_id": job_id})
+            resp = self.table.get_item(Key={"job_id": job_id}, ConsistentRead=True)
             if "Item" not in resp:
                 get_metrics().inc("dynamodb_get_notfound_total")
                 raise KeyError(f"job_id {job_id} not found")
             get_metrics().inc("dynamodb_get_success_total")
             get_metrics().observe("dynamodb_get_duration_seconds", time.time() - start)
-            return resp["Item"]
+            return validate_job_record(decode(resp["Item"]))
         except ClientError as e:
             get_metrics().inc("dynamodb_get_error_total")
             raise RuntimeError(f"Dynamo get failed: {e}")
@@ -66,11 +67,9 @@ class DynamoRegistry:
             "last_updated": datetime.utcnow().isoformat(),
             **attrs,
         }
-        # Explicit V2 identity defaults win over caller only when absent.
-        item.setdefault("execution_epoch", 0)
-        item.setdefault("active_migration_id", None)
+        validate_job_record(item)
         try:
-            self.table.put_item(Item=item, ConditionExpression="attribute_not_exists(job_id)")
+            self.table.put_item(Item=encode(item), ConditionExpression="attribute_not_exists(job_id)")
             get_metrics().inc("dynamodb_create_success_total")
             get_metrics().observe("dynamodb_create_duration_seconds", time.time() - start)
         except ClientError as e:
@@ -80,74 +79,7 @@ class DynamoRegistry:
             get_metrics().inc("dynamodb_create_error_total")
             raise RuntimeError(f"Dynamo create failed: {e}")
 
-    def _current_version(self, job_id: str):
-        try:
-            resp = self.table.get_item(Key={"job_id": job_id}, ProjectionExpression="version")
-            if "Item" not in resp:
-                raise KeyError(f"job_id {job_id} not found")
-            return resp["Item"].get("version")
-        except ClientError as e:
-            raise RuntimeError(f"Dynamo version check failed: {e}")
 
-    def update(self, job_id: str, state: str, expected_version: int | None = None, **attrs):
-        """
-        Update state and attributes with optimistic locking (version check).
-        If expected_version is None, it reads the current version first.
-        """
-        start = time.time()
-        with self.lock:
-            current_item = self.get(job_id)
-            current_state = current_item.get("state")
-            if not is_transition_allowed(current_state, state):
-                raise RuntimeError(
-                    f"Invalid state transition: {current_state} -> {state} for {job_id}"
-                )
-            current_version = expected_version
-            if current_version is None:
-                current_version = current_item.get("version")
-                if current_version is None:
-                    current_version = self._current_version(job_id)
-            new_version = (current_version or 0) + 1
-
-            names = {"#state": "state"}
-            values = {
-                ":state": state,
-                ":version": new_version,
-                ":last_updated": datetime.utcnow().isoformat(),
-            }
-            expr_parts = ["#state = :state", "version = :version", "last_updated = :last_updated"]
-
-            for k, v in attrs.items():
-                ph_name = f"#{k}"
-                ph_val = f":{k}"
-                names[ph_name] = k
-                values[ph_val] = v
-                expr_parts.append(f"{ph_name} = {ph_val}")
-
-            update_expr = "SET " + ", ".join(expr_parts)
-            if current_version is None:
-                condition = "attribute_not_exists(version)"
-                values[":expected"] = 0
-            else:
-                condition = "version = :expected"
-                values[":expected"] = current_version
-
-            try:
-                self.table.update_item(
-                    Key={"job_id": job_id},
-                    UpdateExpression=update_expr,
-                    ExpressionAttributeNames=names,
-                    ExpressionAttributeValues=values,
-                    ConditionExpression=condition,
-                )
-                get_metrics().inc("dynamodb_update_success_total")
-                get_metrics().observe("dynamodb_update_duration_seconds", time.time() - start)
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                    get_metrics().inc("dynamodb_update_conflict_total")
-                    raise RuntimeError(f"Optimistic lock failed for job_id {job_id}")
-                get_metrics().inc("dynamodb_update_error_total")
-                raise RuntimeError(f"Dynamo update failed: {e}")
 
     def transition(
         self,
@@ -163,7 +95,7 @@ class DynamoRegistry:
         """V2 sole mutation path: legal-transition + CAS(version, epoch).
 
         - Validates against the V2 job table (`storage/v2_transitions.py`);
-          legacy V1 states remain accepted for frozen `--engine v1` rows.
+          unsupported states and records are rejected.
         - Normal mutation: version++, epoch unchanged.
         - Ownership transfer: version++ AND epoch++ atomically.
         - MIGRATING entries enforce at most one active migration per job.
@@ -184,11 +116,7 @@ class DynamoRegistry:
                 # (public_ip/instance_id/pool) without a lifecycle move.
                 # Version still bumps, so concurrent stagings CAS-conflict.
                 v2_ok = True
-            try:
-                legacy_ok = is_transition_allowed(current_state, to_state)
-            except ValueError:
-                legacy_ok = False  # V1 table knows only V1 states; V2 states raise
-            if not (v2_ok or legacy_ok):
+            if not v2_ok:
                 raise RuntimeError(
                     f"Invalid state transition: {current_state} -> {to_state} for {job_id}"
                 )
@@ -221,6 +149,9 @@ class DynamoRegistry:
             elif active_migration_id is not None and to_state != "MIGRATING":
                 new_active = active_migration_id
 
+            validate_job_record({**current_item, **attrs, "state": to_state,
+                                 "version": new_version, "execution_epoch": new_epoch,
+                                 "active_migration_id": new_active})
             names = {"#state": "state"}
             values = {
                 ":state": to_state,
@@ -247,19 +178,15 @@ class DynamoRegistry:
                 expr_parts.append(f"{ph_name} = {ph_val}")
 
             update_expr = "SET " + ", ".join(expr_parts)
-            # Items predating V2 may lack execution_epoch: accept 0/None as match.
-            if current_epoch in (0, None) and "execution_epoch" not in current_item:
-                condition = "version = :expected AND attribute_not_exists(execution_epoch)"
-            else:
-                condition = "version = :expected AND execution_epoch = :expected_epoch"
-                values[":expected_epoch"] = current_epoch
+            condition = "version = :expected AND execution_epoch = :expected_epoch"
+            values[":expected_epoch"] = current_epoch
 
             try:
                 self.table.update_item(
                     Key={"job_id": job_id},
                     UpdateExpression=update_expr,
                     ExpressionAttributeNames=names,
-                    ExpressionAttributeValues=values,
+                    ExpressionAttributeValues=encode(values),
                     ConditionExpression=condition,
                 )
                 get_metrics().inc("dynamodb_update_success_total")
@@ -326,7 +253,7 @@ class DynamoRegistry:
             get_metrics().inc(f"dynamodb_{operation}_success_total")
             get_metrics().observe(f"dynamodb_{operation}_duration_seconds", time.time() - start)
             get_metrics().set_gauge(f"dynamodb_{operation}_items_returned", len(items))
-            return items
+            return [validate_job_record(decode(item)) for item in items]
         except ClientError as e:
             get_metrics().inc(f"dynamodb_{operation}_error_total")
             # If GSI doesn't exist, provide helpful error

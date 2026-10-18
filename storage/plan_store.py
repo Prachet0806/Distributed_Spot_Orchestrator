@@ -11,6 +11,7 @@ from copy import deepcopy
 from typing import Optional
 
 from storage.v2_transitions import is_v2_transition_allowed
+from storage.backend import Documents, encode, conditional_failure
 
 
 class PlanExistsError(KeyError):
@@ -25,7 +26,8 @@ class PlanStore:
     def __init__(self, table_name: str = "spot_arbitrage_plans", dynamodb_resource=None):
         self.table_name = table_name
         self.dynamodb = dynamodb_resource
-        self._plans: dict[str, dict] = {}
+        self._docs = Documents("plan_id", table_name, dynamodb_resource)
+        self._plans = self._docs.local
 
     # -- local backend --
     def put_plan(self, plan) -> dict:
@@ -50,7 +52,7 @@ class PlanStore:
         if self.dynamodb is not None:
             table = self.dynamodb.Table(self.table_name)
             table.put_item(
-                Item=doc,
+                Item=encode(doc),
                 ConditionExpression="attribute_not_exists(plan_id)",
             )
         self._plans[pid] = doc
@@ -73,7 +75,8 @@ class PlanStore:
         if pid in self._plans:
             raise PlanExistsError(f"plan {pid} already exists (immutable)")
         stored.setdefault("version", 0)
-        stored.setdefault("outcome", None)
+        if stored.get("outcome") is None:
+            stored.pop("outcome", None)
         for step in stored.get("steps", []) or []:
             if isinstance(step, dict):
                 step.setdefault("state", "PENDING")
@@ -81,7 +84,7 @@ class PlanStore:
         if self.dynamodb is not None:
             table = self.dynamodb.Table(self.table_name)
             table.put_item(
-                Item=deepcopy(stored),
+                Item=encode(stored),
                 ConditionExpression="attribute_not_exists(plan_id)",
             )
         self._plans[pid] = stored
@@ -96,43 +99,23 @@ class PlanStore:
         """
         if outcome not in self.PLAN_OUTCOMES:
             raise ValueError(f"unknown plan outcome {outcome!r}")
-        try:
-            doc = self._plans[plan_id]
-        except KeyError:
-            raise KeyError(f"plan {plan_id} not found")
-        if doc.get("outcome") in self.PLAN_OUTCOMES:
-            raise PlanStepConflictError(
-                f"plan {plan_id} outcome already {doc.get('outcome')}")
-        doc["outcome"] = outcome
-        doc["version"] = int(doc.get("version", 0)) + 1
-        if self.dynamodb is not None:
+        with self._docs.lock:
+            doc = self.get_plan(plan_id)
+            if doc.get("outcome") == outcome:
+                return doc
+            if doc.get("outcome") in self.PLAN_OUTCOMES:
+                raise PlanStepConflictError(f"plan {plan_id} outcome already {doc['outcome']}")
+            version = doc["version"]
+            doc.update(outcome=outcome, version=version + 1)
             try:
-                self.dynamodb.Table(self.table_name).update_item(
-                    Key={"plan_id": plan_id},
-                    UpdateExpression="SET #o = :o, version = version + :one",
-                    ConditionExpression="attribute_not_exists(#o)",
-                    ExpressionAttributeNames={"#o": "outcome"},
-                    ExpressionAttributeValues={":o": outcome, ":one": 1},
-                )
+                return self._docs.put(doc, expected_version=version)
             except Exception as exc:
-                if "ConditionalCheckFailedException" in str(exc):
-                    raise PlanStepConflictError(
-                        f"plan {plan_id} outcome already set") from exc
+                if conditional_failure(exc):
+                    raise PlanStepConflictError("concurrent plan completion") from exc
                 raise
-        return deepcopy(doc)
 
     def get_plan(self, plan_id: str) -> dict:
-        if self.dynamodb is not None:
-            table = self.dynamodb.Table(self.table_name)
-            resp = table.get_item(Key={"plan_id": plan_id})
-            if "Item" not in resp and plan_id not in self._plans:
-                raise KeyError(f"plan {plan_id} not found")
-            if "Item" in resp:
-                return deepcopy(resp["Item"])
-        try:
-            return deepcopy(self._plans[plan_id])
-        except KeyError:
-            raise KeyError(f"plan {plan_id} not found")
+        return self._docs.get(plan_id)
 
     def update_step_state(
         self,
@@ -167,7 +150,7 @@ class PlanStore:
                     UpdateExpression="SET steps = :steps, version = version + :one",
                     ConditionExpression="plan_hash = :h AND version = :v",
                     ExpressionAttributeValues={
-                        ":steps": deepcopy(doc["steps"]),
+                        ":steps": encode(doc["steps"]),
                         ":h": doc.get("plan_hash"),
                         ":v": expected_version,
                         ":one": 1,
@@ -191,7 +174,7 @@ class PlanStore:
     def list_active(self) -> list[dict]:
         terminal = {"SUCCEEDED", "FAILED", "SKIPPED"}
         out = []
-        for doc in self._plans.values():
+        for doc in self._docs.all():
             # Plan-level outcome (S16 seam) outranks step inference: a
             # marked plan is never in-flight, even with PENDING steps.
             if doc.get("outcome") in self.PLAN_OUTCOMES:
@@ -207,7 +190,7 @@ class PlanStore:
         for this job+attempt (pre-fence arbitrage eligible for emergency
         pre-emption). None when nothing qualifies. Read-only."""
         cands = [
-            doc for doc in self._plans.values()
+            doc for doc in self._docs.all()
             if doc.get("job_id") == job_id
             and doc.get("migration_id") == migration_id
             and doc.get("outcome") not in self.PLAN_OUTCOMES
@@ -217,3 +200,10 @@ class PlanStore:
             return None
         cands.sort(key=lambda d: d.get("created_at", ""))
         return deepcopy(cands[-1])
+
+    def save_execution_context(self, plan_id, context):
+        with self._docs.lock:
+            doc = self.get_plan(plan_id)
+            version = doc["version"]
+            doc.update(execution_context=context, version=version + 1)
+            return self._docs.put(doc, expected_version=version)

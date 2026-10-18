@@ -24,7 +24,7 @@
 13. Scaling Model
 14. HA / Failure Domains
 15. Cross-Region Architecture
-16. V1 → V2 Migration Architecture
+16. V2 Engine Boundary
 17. Implementation Dependency Graph
 18. Architecture Invariants
 ```
@@ -681,7 +681,7 @@ Rules:
 Interfaces are derived from C/Q/E semantics — no bare method calls crossing component boundaries for side effects.
 
 ```python
-class JobRegistry:            # Persistence / authority
+class DynamoRegistry:         # Persistence / authority
     def transition(self, req: TransitionRequest) -> TransitionResult: ...
     def get(self, job_id) -> JobView: ...                    # query
     def query_ownership(self, q: GetExecutionOwnershipQuery) -> ExecutionOwnershipResult: ...
@@ -1064,98 +1064,21 @@ One home-region key protects the checkpoint bucket. Cross-region decrypt is prin
 
 ---
 
-# 16. V1 → V2 Migration Architecture
+# 16. V2 Engine Boundary
 
-## 16.1 Engine Admission & Routing
+V2 is the sole admitted and executable engine. The owner requested immediate
+removal of V1 code and compatibility, superseding the former staged deletion
+and coexistence plan (ADR-014 and ADR-024 revised).
 
-`engine_version` is an **admission/routing decision, never an execution-semantics switch**. Once a migration attempt exists under an engine, that engine's protocols are exclusively authoritative for it.
-
-```text
-Workload submission
-        │
-        ▼
-   Admission Manager
-        │
-        ├── contract unsupported by V2  → engine_version = V1 (or REJECT per policy)
-        ├── V2-compatible               → engine_version = V2
-        ▼
-Job created in Registry with immutable engine_version
-```
-
-Rules:
-
-1. `engine_version` is set once at admission and is **immutable for the job and for every migration attempt** of that job.
-2. No runtime fallback: a failing V2 migration resolves through V2 terminal semantics (`FAILED` / `RECOVERY_REQUIRED` / `RESTART_REQUIRED`). Silent substitution with V1 mid-flight is prohibited — it would change execution semantics halfway through a migration.
-3. Routing selects which decision/planning/execution pipeline owns new migration attempts; it does not fork the substrate.
-
-## 16.2 Coexistence Isolation Boundary
-
-V1 may continue to exist **only behind the shared substrate**. Anything V1 does outside this table constitutes an alternate mutation path around the frozen invariants and is an architecture violation.
-
-| Substrate layer | Shared by V1+V2? | Constraint on V1 |
-|---|---|---|
-| Job Registry CAS (`transition()`) | **Shared — sole path** | V1 MUST request job/migration transitions through the same CAS API; direct writes prohibited |
-| Identity rules (`operation_id` ULID, reuse-on-retry) | Shared | V1 commands carry Coordinator-style operation IDs |
-| Event Ledger + dispatcher | Shared | V1 emits/consumes through the same dedup gate |
-| Checkpoint Metadata Store + durability model | Shared | V1 checkpoints obey `LOCAL→PERSISTING→DURABLE`; partial artifacts never DURABLE |
-| Mandatory audit events | Shared | V1 emits the same event set for its migrations |
-| Reconciliation gate | Shared | V1-owned jobs are equally subject to `RECONCILIATION_REQUIRED` blocking |
-| Fencing / epoch semantics | Shared conceptually | V1 fencing must produce equivalent evidence (epoch invalidation + verified termination) or its migrations are ineligible for cross-engine supersession |
-| Plan DAG / PlanStep state machine | **V2-only** | V1 retains its linear step model internally; not exposed as plans |
-| Recovery Policy / Placement engines | **V2-only** | V1 uses its legacy decision engine on V1-owned jobs only |
-
-Implementation shape: the V1 migrator is wrapped as a **legacy adapter** implementing the Command surface where feasible; where legacy internals cannot comply, the adapter restricts V1 to V1-owned jobs exclusively, and those jobs never enter V2 code paths.
-
-## 16.3 Ownership & Cross-Engine Supersession Bridge
-
-```text
-Job (engine_version = V1 | V2)
- └── active_migration_id → owned by exactly one engine at any moment
-```
-
-| Scenario | Verdict | Procedure |
-|---|---|---|
-| EMERGENCY trigger for a job whose current migration is **V1, pre-fencing** | **Permitted — V2 supersedes** | (1) V2 verifies pre-fence state AND source intact via shared Registry/audit evidence; (2) Registry CAS conditional transition marks the V1 migration `SUPERSEDED`, conditioned on expected version + pre-fence state; (3) V1 adapter observes supersession idempotently and executes FULL_ROLLBACK cleanup of any V1-provisioned target; (4) V2 creates M2 with `regime=EMERGENCY`. The bridge is admissible precisely because pre-fence V1 state maps cleanly onto V2's rollback-capable phase. |
-| Current migration is **V1, post-fencing** | **Prohibited** | forward recovery stays inside the owning engine; V2 may take over only after that migration reaches a terminal state and a fresh decision routes there |
-| Any V2 → V1 handoff | **Prohibited** | no fallback direction exists (§16.1 rule 2) |
-
-Bridge requirements: both engines must agree on `SUPERSEDED` semantics for the shared Registry record, and the V1 adapter must honor supersession notices idempotently (it may be crashed at any point of its cleanup).
-
-## 16.4 Cutover & Removal Criteria
-
-```text
-Phase 0  V2 shadow    : V2 runs decision/plan/validation read-only beside V1 executions;
-                        divergence reports only
-Phase 1  V2 canary    : engine_version=V2 admitted for selected workload classes
-Phase 2  V2 default   : new admissions default V2; V1 by explicit override
-Phase 3  V1 freeze    : no NEW V1 admissions; existing V1 jobs run to natural completion
-Phase 4  V1 removal   : zero V1-owned jobs ∧ ≥N days without V1 invocation
-                        ⇒ delete adapter + legacy pipeline
-```
-
-Exit criteria between phases are operational (success-rate parity, audit parity, reconciliation-finding rates), never calendar-based.
-
-## 16.5 Binding to ADR-024 deletion gates (normative)
-
-`docs/adr/ADR-024-v1-deletion.md` is the executable form of §16.4. Mapping:
-
-| §16.4 phase | ADR-024 gate | Meaning |
-|---|---|---|
-| Phase 0 V2 shadow | pre-emulated-green | V2 decides/plans read-only beside V1; divergence reports only |
-| Phase 1 V2 canary | — | `engine_version=V2` admitted for selected classes |
-| Phase 2 V2 default | AWS E2E green | new admissions default V2; V1 by explicit override |
-| Phase 3 V1 freeze | emulated green (already declared) | no new V1 admissions; `--engine v1` compat only |
-| Phase 4 V1 removal | soak gate | zero V1-owned jobs ∧ N days without V1 invocation ⇒ delete |
-
-Backlog (unbuilt, required before Phase 2): the **legacy adapter** (§16.2
-table), the **cross-engine supersession bridge** (§16.3 procedure), and the
-admission router (§16.1). Until they land, the only permitted coexistence is
-the current one: V1 frozen behind `--engine v1` on V1-owned jobs, V2 on V2
-jobs, no cross-engine supersession. Any V1 action outside the §16.2 shared
-substrate (Registry CAS, ledger dedup, durability model, audit events,
-reconciliation gate) is an architecture violation — today V1 bypasses the
-CAS path (`Migrator` direct writes), which is grandfathered exclusively
-until Phase 4 removal.
+- No engine-selection flag, legacy adapter, or cross-engine supersession exists.
+- Production registry access uses DynamoDB and the V2 CAS transition API.
+- Emulation uses a strict V2 in-memory registry and an explicit emulated executor.
+- Unsupported record shapes, old job lifecycle states, and engine identities
+  are rejected; no implicit upgrade or fallback is performed.
+- Checkpoint executors expose dump/persist/restore, not retired method aliases.
+- Telemetry names such as heartbeat/v1 identify current schema revisions;
+  they do not indicate a retained V1 execution engine.
+- This retirement does not certify the live AWS path or remove its pilot/soak gates.
 
 ---
 

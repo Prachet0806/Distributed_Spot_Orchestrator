@@ -1,6 +1,5 @@
 # orchestrator/models_v2.py — V2 domain contracts (Protocols #1, #3, #7–#11).
-"""Additive V2 domain layer. Does not replace legacy planner/policy types yet;
-new code should import from here. Legacy types remain frozen (ADR-024)."""
+"""V2 domain contracts for plans, execution records, and evidence."""
 from __future__ import annotations
 
 import hashlib
@@ -158,6 +157,7 @@ class MigrationPlanV2:
     supersedes_plan_id: Optional[str] = None
     steps: list[PlanStep] = field(default_factory=list)
     plan_hash: str = ""
+    execution_epoch: int = 0
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
         if not self.expires_at:
@@ -171,6 +171,9 @@ def canonical_plan_dict(plan: MigrationPlanV2) -> dict:
     return {
         "plan_id": plan.plan_id,
         "job_id": plan.job_id,
+        "execution_epoch": plan.execution_epoch,
+        "expires_at": plan.expires_at,
+        "absolute_deadline": plan.absolute_deadline,
         "migration_id": plan.migration_id,
         "regime": str(plan.regime),
         "source_pool_id": plan.source_pool_id,
@@ -192,6 +195,9 @@ def canonical_plan_dict(plan: MigrationPlanV2) -> dict:
                 "timeout_seconds": s.timeout_seconds,
                 "deadline_behavior": s.deadline_behavior,
                 "max_attempts": s.max_attempts,
+                "backoff_base_seconds": s.backoff_base_seconds,
+                "backoff_max_seconds": s.backoff_max_seconds,
+                "retryable_failure_codes": sorted(s.retryable_failure_codes),
                 "criticality": str(s.criticality),
                 "priority": s.priority,
                 "join_policy": s.join_policy,

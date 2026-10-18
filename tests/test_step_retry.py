@@ -3,6 +3,7 @@
 Vehicles: S04 (deadline→abort/replan), S15/S16 (replan/supersession),
 C-PLAN (hash/pins), C-ID (operation idempotency across retries).
 """
+from storage.audit_store import AuditStore
 import json
 import time
 from datetime import datetime, timedelta
@@ -55,7 +56,7 @@ def _plan(**kw):
 def _coord(sleeps, **kw):
     kw.setdefault("sleep_fn", sleeps.append)
     kw.setdefault("step_timeout_seconds", 30.0)
-    return MigrationCoordinator(
+    return MigrationCoordinator(audit_store=AuditStore(),
         registry=SimpleNamespace(get=lambda j: None,
                                  transition=lambda *a, **_k: None),
         provisioner=SimpleNamespace(), checkpoint_manager=SimpleNamespace(),
@@ -277,14 +278,14 @@ def test_reject_injection_points_prod_vs_harness():
 
 def test_execute_plan_rejects_injected_dag_before_side_effects(tmp_path):
     import json
-    from storage.job_registry import JobRegistry
+    from storage.memory_registry import MemoryRegistry
     path = tmp_path / "registry.json"
     path.write_text(json.dumps({"job-1": {
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    reg = JobRegistry(str(path))
-    coord = MigrationCoordinator(
+    reg = MemoryRegistry(json.loads(path.read_text()))
+    coord = MigrationCoordinator(audit_store=AuditStore(),
         registry=reg, provisioner=SimpleNamespace(),
         checkpoint_manager=SimpleNamespace(), transfer_manager=SimpleNamespace(),
         validator=SimpleNamespace(), cleanup_executor=SimpleNamespace())
@@ -346,10 +347,10 @@ def test_supersede_and_replan_marks_superseded_and_returns_successor():
     cleaned = []
 
     class _Cleanup:
-        def cleanup_migration(self, plan, operations, safety_critical_only=False):
+        def cleanup_migration(self, plan, operations, safety_critical_only=False, **kwargs):
             cleaned.append(safety_critical_only)
 
-    coord = MigrationCoordinator(
+    coord = MigrationCoordinator(audit_store=AuditStore(),
         registry=SimpleNamespace(get=lambda j: None,
                                  transition=lambda *a, **_k: None),
         provisioner=SimpleNamespace(), checkpoint_manager=SimpleNamespace(),
@@ -366,22 +367,22 @@ def test_supersede_and_replan_marks_superseded_and_returns_successor():
 # -- end-to-end: op-ID reuse across retries inside a real phase --
 def test_checkpoint_phase_retries_reuse_operation_id(tmp_path):
     import json
-    from storage.job_registry import JobRegistry
+    from storage.memory_registry import MemoryRegistry
     from orchestrator.checkpoint_manager import CheckpointManager
     path = tmp_path / "registry.json"
     path.write_text(json.dumps({"job-1": {
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    reg = JobRegistry(str(path))
+    reg = MemoryRegistry(json.loads(path.read_text()))
     calls, sleeps = [], []
 
-    def flaky_dump(job_id, pid, host, timeout=300.0):
+    def flaky_dump(job_id, pid, host, timeout=300.0, operation_id=None):
         calls.append(1)
         raise CodedError("CRIU_DUMP_TIMEOUT", "dump timed out",
                          transience="TRANSIENT")
 
-    coord = MigrationCoordinator(
+    coord = MigrationCoordinator(audit_store=AuditStore(),
         registry=reg, provisioner=SimpleNamespace(),
         checkpoint_manager=CheckpointManager(
             storage=SimpleNamespace(upload=lambda *a, **_k: None,

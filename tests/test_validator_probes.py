@@ -3,6 +3,8 @@
 Vehicles: C-VALID (L1-L4 verdicts), S19 (INCONCLUSIVE → Recovery Policy,
 never silent promote), I7/I15 (no stub-pass, no fabricated health).
 """
+from storage.audit_store import AuditStore
+from tests.support import emulated_validator
 import json
 from datetime import datetime, timezone, timedelta
 
@@ -12,12 +14,12 @@ from orchestrator.migration_planner import MigrationPlanner, MigrationState
 from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
 from orchestrator.checkpoint_manager import (
     CheckpointManager, CheckpointResult, RestoreResult)
-from orchestrator.provisioner import Provisioner
+from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.transfer_manager import TransferManager
 from orchestrator.validator import Validator, ValidationResult
 from orchestrator.workload_estimator import WorkloadEstimate
 from storage.checkpoint_store import CheckpointStore
-from storage.job_registry import JobRegistry
+from storage.memory_registry import MemoryRegistry
 
 NOW = datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -32,6 +34,9 @@ class _StubTransport:
         self.commands = []
 
     def run_command(self, command, timeout=60.0):
+        if command.startswith("ps -o stat=") and self.rc == 0:
+            self.commands.append(command)
+            return {"returncode": 0, "stdout": "T", "stderr": ""}
         self.commands.append(command)
         if self.err is not None:
             raise self.err
@@ -152,7 +157,7 @@ def test_healthy_probes_validate():
     store = {"m-1": _ctx()}
     ctx = probes.make_context_provider(store)
     t = _StubTransport(files={"heartbeat.json": _hb()}, rc=0)
-    v = Validator(infra_probe=probes.make_infra_probe(lambda h: t, ctx),
+    v = emulated_validator(infra_probe=probes.make_infra_probe(lambda h: t, ctx),
                   app_probe=probes.make_app_probe(lambda h: t, ctx,
                                                   clock=lambda: NOW))
     src, tgt = _snaps()
@@ -166,7 +171,7 @@ def test_stale_l2_is_inconclusive_not_invalid():
     store = {"m-1": _ctx()}
     ctx = probes.make_context_provider(store)
     t = _StubTransport(files={"heartbeat.json": _hb(age_seconds=10_000)}, rc=0)
-    v = Validator(infra_probe=probes.make_infra_probe(lambda h: t, ctx),
+    v = emulated_validator(infra_probe=probes.make_infra_probe(lambda h: t, ctx),
                   app_probe=probes.make_app_probe(lambda h: t, ctx,
                                                   clock=lambda: NOW))
     src, tgt = _snaps()
@@ -179,7 +184,7 @@ def test_dead_l1_is_invalid():
     store = {"m-1": _ctx()}
     ctx = probes.make_context_provider(store)
     t = _StubTransport(files={"heartbeat.json": _hb()}, rc=1)
-    v = Validator(infra_probe=probes.make_infra_probe(lambda h: t, ctx),
+    v = emulated_validator(infra_probe=probes.make_infra_probe(lambda h: t, ctx),
                   app_probe=probes.make_app_probe(lambda h: t, ctx,
                                                   clock=lambda: NOW))
     src, tgt = _snaps()
@@ -210,14 +215,14 @@ def _snap_fn(job_id, phase):
             "memory_utilization_delta": 0.5, "progress_delta": 0.5}
 
 
-def _dump(job_id, pid, host, timeout=300.0):
+def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
     return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
                             duration_seconds=0.01, digest="sha256:probe",
                             status="LOCAL", job_id=job_id, lineage_id=job_id)
 
 
-def _restore(checkpoint_id, host=None, timeout=300.0):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True,
+def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
+    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
                          duration_seconds=0.01, process_id=4242)
 
 
@@ -232,14 +237,14 @@ class _Storage:
 
 
 class _Cleanup:
-    def cleanup_migration(self, plan, operations, safety_critical_only=False):
+    def cleanup_migration(self, plan, operations, safety_critical_only=False, **kwargs):
         return ["partial_artifacts"]
 
 
 def _coordinator(reg, sink, validator, store):
     calls = []
-    return MigrationCoordinator(
-        registry=reg, provisioner=Provisioner(),
+    return MigrationCoordinator(audit_store=AuditStore(),
+        registry=reg, provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
             storage=_Storage(), dump_handler=_dump, restore_handler=_restore,
             checkpoint_store=store),
@@ -260,14 +265,14 @@ def test_coordinator_publishes_context_and_validates_with_probes(tmp_path):
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    reg = JobRegistry(str(path))
+    reg = MemoryRegistry(json.loads(path.read_text()))
     published = []
     store = CheckpointStore()
     transport = _StubTransport(files={"heartbeat.json": _hb()}, rc=0)
     # Sink feeds the live provider map (same shape as main.py wiring).
     live = {}
     provider = probes.make_context_provider(live)
-    validator = Validator(
+    validator = emulated_validator(
         infra_probe=probes.make_infra_probe(lambda h: transport, provider),
         app_probe=probes.make_app_probe(lambda h: transport, provider,
                                         clock=lambda: NOW))
@@ -280,6 +285,7 @@ def test_coordinator_publishes_context_and_validates_with_probes(tmp_path):
         target_pool_id="pool-t", workload_estimate=_est())
     plan.pid = 4242
     plan.source_host = "10.0.0.9"
+    plan.plan_hash = MigrationPlanner.compute_hash(plan)
     out = coord.execute_plan(plan)
     assert out.current_state == MigrationState.SUCCESS
     assert out.target_pid == 4242  # captured from the restore result
@@ -297,11 +303,11 @@ def test_postfence_invalid_with_real_validator_is_forward_only(tmp_path):
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    reg = JobRegistry(str(path))
+    reg = MemoryRegistry(json.loads(path.read_text()))
     live = {}
     provider = probes.make_context_provider(live)
     transport = _StubTransport(files={"heartbeat.json": _hb()}, rc=0)
-    validator = Validator(
+    validator = emulated_validator(
         infra_probe=probes.make_infra_probe(lambda h: transport, provider),
         app_probe=probes.make_app_probe(lambda h: transport, provider,
                                         clock=lambda: NOW))
@@ -322,6 +328,7 @@ def test_postfence_invalid_with_real_validator_is_forward_only(tmp_path):
         target_pool_id="pool-t", workload_estimate=_est())
     plan.pid = 4242
     plan.source_host = "10.0.0.9"
+    plan.plan_hash = MigrationPlanner.compute_hash(plan)
     out = coord.execute_plan(plan)
     assert out.current_state == MigrationState.FAILED
     job = reg.get("job-1")
@@ -341,10 +348,10 @@ def test_inconclusive_with_real_validator_never_silently_promotes(tmp_path):
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    reg = JobRegistry(str(path))
+    reg = MemoryRegistry(json.loads(path.read_text()))
     provider = probes.make_context_provider({})  # nothing published, ever
     transport = _StubTransport(files={"heartbeat.json": _hb()}, rc=0)
-    validator = Validator(
+    validator = emulated_validator(
         infra_probe=probes.make_infra_probe(lambda h: transport, provider),
         app_probe=probes.make_app_probe(lambda h: transport, provider,
                                         clock=lambda: NOW))
@@ -359,6 +366,7 @@ def test_inconclusive_with_real_validator_never_silently_promotes(tmp_path):
         target_pool_id="pool-t", workload_estimate=_est())
     plan.pid = 4242
     plan.source_host = "10.0.0.9"
+    plan.plan_hash = MigrationPlanner.compute_hash(plan)
     out = coord.execute_plan(plan)
     assert out.current_state == MigrationState.FAILED
     job = reg.get("job-1")

@@ -81,7 +81,3 @@ class TransferManager:
         if result is None:
             return {"operation_id": operation_id, "state": "UNKNOWN"}
         return {"operation_id": operation_id, "state": "SUCCEEDED"}
-
-    # -- legacy shims --
-    def transfer(self, migration_id: str) -> TransferResult:
-        return self.upload(migration_id)

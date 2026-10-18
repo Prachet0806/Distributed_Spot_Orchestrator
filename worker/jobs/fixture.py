@@ -7,6 +7,7 @@ approximately the same execution point. CPU-light by default; set
 `work_per_tick` for heavier profiles.
 """
 import json
+from datetime import datetime, timezone
 import os
 import tempfile
 import time
@@ -28,9 +29,6 @@ def run(total_ticks=2000, progress_path=None, stop_event=None,
     start_tick = state["tick"]
     for tick in range(start_tick, total_ticks):
         if stop_event is not None and stop_event.is_set():
-            _persist(progress_path, state)
-            return dict(state, interrupted=True)
-        if interrupt_flag_path and os.path.exists(interrupt_flag_path):
             _persist(progress_path, state)
             return dict(state, interrupted=True)
         acc = state["accumulator"]
@@ -56,7 +54,17 @@ def _persist(progress_path, state):
                                prefix=".progress-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(state, f)
+            payload = dict(state, schema="progress/v1", observed_at=datetime.now(timezone.utc).isoformat(),
+                           job_id=os.getenv("WORKLOAD_JOB_ID", "local-job"),
+                           execution_epoch=int(os.getenv("WORKLOAD_EXECUTION_EPOCH", "0")))
+            try:
+                with open(os.path.join(os.path.dirname(progress_path), "execution.json")) as identity_file:
+                    identity = json.load(identity_file)
+                for key in ("job_id", "execution_epoch"):
+                    payload[key] = identity[key]
+            except FileNotFoundError:
+                pass
+            json.dump(payload, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, progress_path)

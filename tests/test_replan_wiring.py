@@ -4,6 +4,8 @@ Vehicles: S15 (REPLAN → successor via supersedes_plan_id), S16
 (emergency supersedes pre-fence arbitrage), S04 (deadline exhausted
 pre-fence → abort/replan path), C-PLAN (hash/pins across links).
 """
+from storage.audit_store import AuditStore
+from tests.support import emulated_validator
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -15,11 +17,11 @@ from orchestrator.checkpoint_manager import (
 from orchestrator.migration_coordinator import MigrationCoordinator
 from orchestrator.migration_planner import MigrationPlanner, MigrationState
 from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
-from orchestrator.provisioner import Provisioner
+from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.transfer_manager import TransferManager
 from orchestrator.workload_estimator import WorkloadEstimate
 from storage.checkpoint_store import CheckpointStore
-from storage.job_registry import JobRegistry
+from storage.memory_registry import MemoryRegistry
 
 
 def _est(remaining=7200):
@@ -44,17 +46,17 @@ def _registry(tmp_path):
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    return JobRegistry(str(path))
+    return MemoryRegistry(json.loads(path.read_text()))
 
 
-def _dump(job_id, pid, host, timeout=300.0):
+def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
     return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
                             duration_seconds=0.01, digest="sha256:replan",
                             status="LOCAL", job_id=job_id, lineage_id=job_id)
 
 
-def _restore(checkpoint_id, host=None, timeout=300.0):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True,
+def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
+    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
                          duration_seconds=0.01, process_id=4242)
 
 
@@ -78,14 +80,14 @@ class _Cleanup:
     def __init__(self):
         self.calls = []
 
-    def cleanup_migration(self, plan, operations, safety_critical_only=False):
+    def cleanup_migration(self, plan, operations, safety_critical_only=False, **kwargs):
         self.calls.append(safety_critical_only)
 
 
 def _coordinator(reg, store=None):
     calls = []
-    return MigrationCoordinator(
-        registry=reg, provisioner=Provisioner(),
+    return MigrationCoordinator(audit_store=AuditStore(),
+        registry=reg, provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
             storage=_Storage(), dump_handler=_dump, restore_handler=_restore,
             checkpoint_store=store),
@@ -213,6 +215,7 @@ def test_s15_expired_plan_replans_to_success(tmp_path):
         migration_id="mig-s15")
     plan.pid = 4242
     plan.source_host = "10.0.0.9"
+    plan.plan_hash = MigrationPlanner.compute_hash(plan)
     plan.expires_at = datetime.utcnow() - timedelta(seconds=1)
     out = coord.execute_plan(plan)
     assert out.current_state == MigrationState.FAILED
@@ -230,6 +233,7 @@ def test_s15_expired_plan_replans_to_success(tmp_path):
     assert "replan:plan-expired#1" in successor.authorization_reference
     successor.pid = 4242
     successor.source_host = "10.0.0.9"
+    successor.plan_hash = MigrationPlanner.compute_hash(successor)
     out2 = coord.execute_plan(successor)
     assert out2.current_state == MigrationState.SUCCESS
     assert fence_calls == ["invalidate", "terminate", "verify"]
@@ -281,8 +285,8 @@ def test_s16_live_supersede_with_regime_override(tmp_path):
     from orchestrator.migration_coordinator import MigrationExecutionState
     reg = _registry(tmp_path)
     cleanup = _Cleanup()
-    coord = MigrationCoordinator(
-        registry=reg, provisioner=Provisioner(),
+    coord = MigrationCoordinator(audit_store=AuditStore(),
+        registry=reg, provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(storage=_Storage()),
         transfer_manager=TransferManager(storage=_Storage()),
         validator=_Validator(), cleanup_executor=cleanup)

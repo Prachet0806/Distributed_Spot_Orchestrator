@@ -67,54 +67,31 @@ class PlacementPolicy:
         hard_constraints: Dict = None,
         ranking_weights: Dict = None,
     ):
+        if version != "v3":
+            raise ValueError("Only placement policy v3 is supported")
         self.version = version
         self.hard_constraints = hard_constraints or {
             "reject_unknown": True,
             "require_ready": True,
         }
-        # v3 uses ADR-009 weights; legacy v2.1 file keys are translated.
+        # V2 placement uses the ADR-009 v3 weights.
         self.ranking_weights = ranking_weights or dict(PLACEMENT_V3_WEIGHTS)
 
     @classmethod
     def load_from_file(cls, path: str) -> "PlacementPolicy":
         with open(path) as f:
             data = yaml.safe_load(f)
-        version = data.get("version", "v2.1")
+        version = data["version"]
+        if version != "v3":
+            raise ValueError("Only placement policy v3 is supported")
         raw = data.get("ranking", {})
-        weights = cls._translate_weights(version, raw)
+        weights = raw
         return cls(
             version=version,
             hard_constraints=data.get("hard_constraints", {}),
             ranking_weights=weights,
         )
 
-    @staticmethod
-    def _translate_weights(version: str, raw: Dict) -> Dict:
-        """Map legacy v2.1 keys onto v3 semantics; v3 files pass through."""
-        if not raw:
-            return dict(PLACEMENT_V3_WEIGHTS)
-        if any(k in raw for k in PLACEMENT_V3_WEIGHTS):
-            merged = dict(PLACEMENT_V3_WEIGHTS)
-            merged.update({k: v for k, v in raw.items() if k in merged})
-            return merged
-        legacy_map = {
-            "interruption_risk": "reliability",
-            "expected_cost": "operational_cost",
-            "transfer_cost": "capacity",
-            "topology": "locality",
-            "historical_success": "readiness",
-        }
-        out = {k: 0.0 for k in PLACEMENT_V3_WEIGHTS}
-        for lk, lv in raw.items():
-            if lk in legacy_map:
-                out[legacy_map[lk]] = float(lv)
-        total = sum(out.values())
-        if total > 0:
-            out = {k: v / total for k, v in out.items()}
-        else:
-            out = dict(PLACEMENT_V3_WEIGHTS)
-        # compatibility keeps default unless explicitly set
-        return out
 
 
 @dataclass
@@ -135,7 +112,7 @@ class PlacementInput:
 
 class PlacementEngine:
     def __init__(self, policy: PlacementPolicy = None):
-        self.policy = policy or PlacementPolicy(version="v2.1")
+        self.policy = policy or PlacementPolicy(version="v3")
 
     def rank(
         self,

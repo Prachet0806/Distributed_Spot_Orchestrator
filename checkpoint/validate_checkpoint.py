@@ -18,7 +18,10 @@ def validate(path=CHECKPOINT_DIR):
     if not os.path.exists(path):
         raise RuntimeError(f"Checkpoint directory not found: {path}")
     
-    for f in REQUIRED_CHECKPOINT_FILES:
+    import glob
+    if not glob.glob(os.path.join(path, "core-*.img")):
+        raise RuntimeError("Missing required checkpoint core image")
+    for f in ["inventory.img"]:
         file_path = os.path.join(path, f)
         if not os.path.exists(file_path):
             raise RuntimeError(f"Missing required checkpoint file: {f}")

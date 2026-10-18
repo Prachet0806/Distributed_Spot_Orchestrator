@@ -2,9 +2,10 @@
 """Progress (`inside`, `iterations_done`) persists to `progress_path` as JSON
 (atomic replace + fsync) and resumes on restart, so CRIU restore or cold
 restart continues from approximately the same execution point instead of
-discarding work. Signature stays backward compatible with job_runner.
+discarding work. The runner uses the explicit batch-workload signature.
 """
 import json
+from datetime import datetime, timezone
 import os
 import random
 import tempfile
@@ -34,7 +35,17 @@ def _persist(progress_path, state):
                                prefix=".progress-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(state, f)
+            payload = dict(state, schema="progress/v1", observed_at=datetime.now(timezone.utc).isoformat(),
+                           job_id=os.getenv("WORKLOAD_JOB_ID", "local-job"),
+                           execution_epoch=int(os.getenv("WORKLOAD_EXECUTION_EPOCH", "0")))
+            try:
+                with open(os.path.join(os.path.dirname(progress_path), "execution.json")) as identity_file:
+                    identity = json.load(identity_file)
+                for key in ("job_id", "execution_epoch"):
+                    payload[key] = identity[key]
+            except FileNotFoundError:
+                pass
+            json.dump(payload, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, progress_path)
@@ -62,11 +73,6 @@ def run(iterations=10_000_000, stop_event=None, interrupt_flag_path=None,
         if stop_event is not None and stop_event.is_set():
             _persist(progress_path, {"inside": inside, "iterations_done": i})
             print("Spot interruption detected; progress persisted.")
-            return {"pi": None, "inside": inside, "iterations_done": i,
-                    "interrupted": True}
-        if interrupt_flag_path and os.path.exists(interrupt_flag_path):
-            _persist(progress_path, {"inside": inside, "iterations_done": i})
-            print("Spot interruption flag found; progress persisted.")
             return {"pi": None, "inside": inside, "iterations_done": i,
                     "interrupted": True}
         x, y = random.random(), random.random()

@@ -50,7 +50,7 @@ Protocols §29 criterion 12. Status: **done** (pytest, file cited),
 | I9 reconciliation gate | gate + refusal-to-decide tests | done |
 | I10 deadline vs fencing | code path exists | planned (S17) |
 | I11 one authority per datum | store ownership tests | done |
-| I12 engine immutability | `test_models_v2.py` pinning | done (router default v2 + frozen-V1 warning/surface pins; deletion diff reviewable) |
+| I12 engine immutability | `test_models_v2.py` pinning | done (sole-engine CLI, deleted import surfaces, strict records/states, and executor-alias rejection) |
 | I13 partial ≠ durable | S05 | done |
 | I14 audit-before-irreversible | `tests/test_audit_gate.py` (fail-closed fence gate, terminal audit) | done (emulated) |
 | I15 UNKNOWN ineligible | placement hard-filter tests | done |

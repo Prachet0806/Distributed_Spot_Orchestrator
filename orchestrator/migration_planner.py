@@ -60,6 +60,10 @@ class MigrationPlan:
     candidate_assessment_version: Optional[str] = None
     checkpoint_id: Optional[str] = None
     planner_version: str = "planner-v3"
+    pid: Optional[int] = None
+    source_host: str = ""
+    source_instance_id: str = ""
+    source_process_start: str = ""
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
         now = now or datetime.utcnow()
@@ -87,15 +91,13 @@ class MigrationPlanner:
 
     def __init__(
         self,
-        default_plan_ttl_hours: float = 1.0,  # legacy; prefer TTL constants below
-        emergency_plan_ttl_minutes: float = 10.0,  # legacy fallback
+        emergency_ttl_seconds: float = 600.0,
         safety_margin_seconds: float = 30.0,
         arbitrage_ttl_seconds: float = 600.0,
         proactive_ttl_seconds: float = 600.0,
         planner_version: str = "planner-v3",
     ):
-        self.default_plan_ttl_hours = default_plan_ttl_hours
-        self.emergency_plan_ttl_minutes = emergency_plan_ttl_minutes
+        self.emergency_ttl_seconds = emergency_ttl_seconds
         self.safety_margin_seconds = safety_margin_seconds
         self.arbitrage_ttl_seconds = arbitrage_ttl_seconds
         self.proactive_ttl_seconds = proactive_ttl_seconds
@@ -125,6 +127,7 @@ class MigrationPlanner:
         supersedes_plan_id: Optional[str] = None,
         config_versions: Optional[dict] = None,
         migration_id: Optional[str] = None,
+        source_identity: Optional[dict] = None,
     ) -> MigrationPlan:
         hit = self._issued.get(migration_id or "")
         if hit is not None and (hit.supersedes_plan_id or "") == (supersedes_plan_id or ""):
@@ -135,7 +138,7 @@ class MigrationPlanner:
 
         if regime == MigrationRegime.EMERGENCY:
             expires_at = absolute_deadline or (
-                created_at + timedelta(minutes=self.emergency_plan_ttl_minutes)
+                created_at + timedelta(seconds=self.emergency_ttl_seconds)
             )
         elif regime == MigrationRegime.PROACTIVE:
             expires_at = created_at + timedelta(seconds=self.proactive_ttl_seconds)
@@ -195,8 +198,34 @@ class MigrationPlanner:
             checkpoint_id=checkpoint_id,
             planner_version=self.planner_version,
         )
+        if source_identity:
+            plan.pid = source_identity.get("pid")
+            plan.source_host = source_identity.get("public_ip", "")
+            plan.source_instance_id = source_identity.get("instance_id", "")
+            plan.source_process_start = source_identity.get("process_start", "")
         plan.plan_hash = self.compute_hash(plan)
         self._issued[plan.migration_id] = plan
+        return plan
+
+    @staticmethod
+    def from_document(doc):
+        from orchestrator.recovery_feasibility import PlanStepDuration
+        from orchestrator.policy_engine import PolicyDecision, Decision
+        from dataclasses import fields
+        data = dict(doc)
+        for key in ("created_at", "expires_at", "absolute_deadline"):
+            if data.get(key):
+                data[key] = datetime.fromisoformat(data[key])
+        decision = dict(data["policy_decision"])
+        decision["decision"] = Decision(decision["decision"])
+        decision["regime"] = MigrationRegime(decision["regime"])
+        data["policy_decision"] = PolicyDecision(**decision)
+        data["regime"] = MigrationRegime(data["regime"])
+        data["steps"] = [PlanStepDuration(**step) for step in data["steps"]]
+        names = {f.name for f in fields(MigrationPlan)}
+        plan = MigrationPlan(**{k: v for k, v in data.items() if k in names})
+        if plan.plan_hash != MigrationPlanner.compute_hash(plan):
+            raise ValueError("persisted plan integrity check failed")
         return plan
 
     def create_successor_plan(
@@ -233,9 +262,14 @@ class MigrationPlanner:
         }
         params.update(overrides)
         successor = self.create_plan(**params)
+        successor.pid = old_plan.pid
+        successor.source_host = old_plan.source_host
+        successor.source_instance_id = old_plan.source_instance_id
+        successor.source_process_start = old_plan.source_process_start
         successor.authorization_reference = (
             f"{successor.authorization_reference}|replan:{reason}"
         )
+        successor.plan_hash = self.compute_hash(successor)
         return successor
 
     @staticmethod
@@ -247,6 +281,14 @@ class MigrationPlanner:
         canonical = {
             "plan_id": plan.plan_id,
             "job_id": plan.job_id,
+            "execution_epoch": plan.execution_epoch,
+            "expires_at": plan.expires_at.isoformat(),
+            "absolute_deadline": plan.absolute_deadline.isoformat() if plan.absolute_deadline else None,
+            "deadline_seconds": plan.deadline_seconds,
+            "fencing_authorized": plan.fencing_authorized,
+            "cleanup_rules": plan.cleanup_rules,
+            "source_identity": {"pid": plan.pid, "host": plan.source_host,
+                                "instance_id": plan.source_instance_id, "process_start": plan.source_process_start},
             "migration_id": plan.migration_id,
             "regime": plan.regime.value,
             "source_pool_id": plan.source_pool_id,

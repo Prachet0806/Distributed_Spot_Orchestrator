@@ -76,8 +76,7 @@ class Validator:
     L1 alive is never enough alone; epoch + lineage are verified
     independently of process health; L4 bitwise applies only when the
     workload contract opts into `strict_determinism`. Evidence comes from
-    injected probes — without probes L1/L2 report pass-through details
-    stamped `probe: stub-v1` so audits show the weakness.
+    injected probes — absent probes yield INCONCLUSIVE evidence.
     """
 
     def __init__(
@@ -87,12 +86,10 @@ class Validator:
         infra_probe: Optional[Callable[..., dict]] = None,
         app_probe: Optional[Callable[..., dict]] = None,
     ):
-        self.default_tolerance = default_tolerance or {
-            "cpu_utilization_delta": 0.10,
-            "memory_utilization_delta": 0.15,
-            "progress_delta": 0.05,
-        }
-        self.contract_version = (default_tolerance or {}).get("version", "tolerance-v1")
+        self.default_tolerance = default_tolerance or DEFAULT_TOLERANCE_CONTRACT
+        if not isinstance(self.default_tolerance.get("metrics"), dict):
+            raise ValueError("V2 tolerance contracts require a metrics mapping")
+        self.contract_version = self.default_tolerance["version"]
         self.strict_mode = strict_mode
         self.infra_probe = infra_probe
         self.app_probe = app_probe
@@ -181,11 +178,8 @@ class Validator:
             except Exception as e:
                 details, passed = {"error": str(e)}, False
         else:
-            details = {"target_reachable": True, "process_running": True,
-                       "resources_accessible": True,
-                       "probe": "stub-v1",
-                       "note": "no infra probe configured; configure for production"}
-            passed = True
+            details = {"inconclusive": True, "error": "No infrastructure probe configured"}
+            passed = False
 
         return ValidationCheck(
             name="infrastructure_health",
@@ -204,10 +198,8 @@ class Validator:
             except Exception as e:
                 details, passed = {"error": str(e)}, False
         else:
-            details = {"workload_responding": True, "health_endpoint_ok": True,
-                       "logs_clean": True, "probe": "stub-v1",
-                       "note": "no app probe configured; configure for production"}
-            passed = True
+            details = {"inconclusive": True, "error": "No application probe configured"}
+            passed = False
 
         return ValidationCheck(
             name="application_health",
@@ -225,7 +217,7 @@ class Validator:
     ) -> ValidationCheck:
         started = datetime.utcnow()
         tol = tolerance or self.default_tolerance
-        # Support versioned contract shape {metrics: {name: {...}}} and legacy flat shape.
+        # Only versioned V2 contracts are accepted.
         flat: dict = {}
         if isinstance(tol, dict) and isinstance(tol.get("metrics"), dict):
             for name, spec in tol["metrics"].items():
@@ -233,8 +225,8 @@ class Validator:
                     flat[name] = spec["value"]
                 else:
                     flat[name] = spec
-        elif isinstance(tol, dict):
-            flat = {k: v for k, v in tol.items() if not k.startswith("_") and k != "version"}
+        else:
+            raise ValueError("V2 tolerance contracts require a metrics mapping")
         details = {"comparisons": {}, "contract_version": tol.get("version", "") if isinstance(tol, dict) else ""}
         passed = True
 
@@ -268,6 +260,10 @@ class Validator:
                     if not within:
                         passed = False
 
+        missing = [key for key in flat if key not in details["comparisons"]]
+        if missing or not details["comparisons"]:
+            passed = False
+            details.update(inconclusive=True, missing_metrics=missing)
         return ValidationCheck(
             name="state_equivalence",
             level=ValidationLevel.L3_TOLERANCE_BOUNDED,

@@ -98,7 +98,7 @@ get_operation_status
 
 # ------------------------------------------------------------------
 # H. Reconciliation taxonomy + finding/remediation schema (Protocols #11;
-#    legacy aliases kept for compat, taxonomy members for findings)
+#    V2 taxonomy members for findings)
 # ------------------------------------------------------------------
 MANUAL
 TARGET_UNREACHABLE
@@ -108,7 +108,6 @@ MIGRATION_DANGLING
 TARGET_UNOWNED
 ORPHAN_CHECKPOINT
 NO_ACTION
-ReconnectionAction
 evidence_refs
 request_id
 action_type

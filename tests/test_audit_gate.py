@@ -3,6 +3,7 @@
 Vehicles: I14 (audit-before-irreversible), C-E2E-adjacent terminal audit,
 mandatory FENCE_STARTED/FENCE_CONFIRMED/MIGRATION_* events.
 """
+from tests.support import emulated_validator
 import json
 from datetime import datetime
 
@@ -12,10 +13,10 @@ from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
 from orchestrator.workload_estimator import WorkloadEstimate
 from orchestrator.checkpoint_manager import (
     CheckpointManager, CheckpointResult, RestoreResult)
-from orchestrator.provisioner import Provisioner
+from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.transfer_manager import TransferManager
 from storage.audit_store import AuditStore
-from storage.job_registry import JobRegistry
+from storage.memory_registry import MemoryRegistry
 
 
 def _est():
@@ -40,17 +41,17 @@ def _registry(tmp_path):
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    return JobRegistry(str(path))
+    return MemoryRegistry(json.loads(path.read_text()))
 
 
-def _dump(job_id, pid, host, timeout=300.0):
+def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
     return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
                             duration_seconds=0.01, digest="sha256:audit",
                             status="LOCAL", job_id=job_id, lineage_id=job_id)
 
 
-def _restore(checkpoint_id, host=None, timeout=300.0):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True,
+def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
+    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
                          duration_seconds=0.01, process_id=4242)
 
 
@@ -74,7 +75,7 @@ class _Validator:
 
 
 class _Cleanup:
-    def cleanup_migration(self, plan, operations, safety_critical_only=False):
+    def cleanup_migration(self, plan, operations, safety_critical_only=False, **kwargs):
         return ["partial_artifacts"]
 
 
@@ -82,7 +83,7 @@ def _coordinator(reg, audit_store, validator=None):
     calls = []
     return MigrationCoordinator(
         registry=reg,
-        provisioner=Provisioner(),
+        provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
             storage=_Storage(), dump_handler=_dump, restore_handler=_restore),
         transfer_manager=TransferManager(storage=_Storage()),
@@ -145,8 +146,8 @@ def test_terminal_failure_is_audited(tmp_path):
     assert audit.list_by_job("job-1")[-1]["reason"]
 
 
-def test_no_audit_store_preserves_legacy_behavior(tmp_path):
+def test_no_audit_store_refuses_fencing(tmp_path):
     reg = _registry(tmp_path)
     coord, _ = _coordinator(reg, None)
     out = coord.execute_plan(_plan())
-    assert out.current_state == MigrationState.SUCCESS
+    assert out.current_state == MigrationState.FAILED

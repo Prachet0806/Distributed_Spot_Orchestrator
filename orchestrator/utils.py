@@ -1,59 +1,11 @@
 # orchestrator/utils.py
-import time
 import logging
 import subprocess
 import os
-from typing import Optional, Callable, Any
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
 
-def retry(
-    fn: Callable[[], Any],
-    retries: int = 3,
-    initial_delay: float = 2,
-    max_delay: float = 60,
-    backoff_factor: float = 2,
-    jitter: bool = True
-) -> Any:
-    """
-    Retry a function with exponential backoff.
-    
-    Args:
-        fn: Function to retry
-        retries: Maximum number of retries
-        initial_delay: Initial delay in seconds
-        max_delay: Maximum delay in seconds
-        backoff_factor: Exponential backoff multiplier
-        jitter: Add random jitter to prevent thundering herd
-        
-    Returns:
-        Result of fn()
-        
-    Raises:
-        Last exception if all retries fail
-    """
-    import random
-    
-    for i in range(retries):
-        try:
-            return fn()
-        except Exception as e:
-            if i == retries - 1:
-                logging.error(f"All {retries} retries failed: {e}")
-                raise
-            
-            # Calculate delay with exponential backoff
-            delay = min(initial_delay * (backoff_factor ** i), max_delay)
-            
-            # Add jitter (±25% randomization)
-            if jitter:
-                jitter_range = delay * 0.25
-                delay = delay + random.uniform(-jitter_range, jitter_range)
-            
-            logging.warning(
-                f"Retry {i+1}/{retries} failed: {e}. Retrying in {delay:.1f}s"
-            )
-            time.sleep(delay)
 
 
 class SSHClient:

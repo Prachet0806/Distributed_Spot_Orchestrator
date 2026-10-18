@@ -1,4 +1,6 @@
 """Phase 6c: emulated V2 end-to-end — observe→decide→plan→execute→audit."""
+from storage.audit_store import AuditStore
+from tests.support import emulated_validator
 import json
 from datetime import datetime
 
@@ -21,25 +23,25 @@ from orchestrator.policy_engine import (
 from orchestrator.migration_planner import MigrationPlanner, MigrationState
 from orchestrator.migration_coordinator import MigrationCoordinator
 from orchestrator.checkpoint_manager import CheckpointManager, CheckpointResult, RestoreResult
-from orchestrator.provisioner import Provisioner
+from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.transfer_manager import TransferManager
 from orchestrator.validator import Validator
 from orchestrator.reconciliation_manager import ReconciliationManager, ReconciliationTrigger
 from orchestrator.event_ledger import EventLedger
-from storage.job_registry import JobRegistry
+from storage.memory_registry import MemoryRegistry
 from storage.plan_store import PlanStore
 from storage.checkpoint_store import CheckpointStore
 from storage.history_store import HistoryStore
 
 
-def _dump(job_id, pid, host, timeout=300.0):
+def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
     return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
                             duration_seconds=0.01, digest="sha256:e2e",
                             status="LOCAL", job_id=job_id, lineage_id=job_id)
 
 
-def _restore(checkpoint_id, host=None, timeout=300.0):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True,
+def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
+    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
                          duration_seconds=0.01, process_id=4242)
 
 
@@ -55,7 +57,7 @@ class _Storage:
 
 
 class _Cleanup:
-    def cleanup_migration(self, plan, operations, safety_critical_only=False):
+    def cleanup_migration(self, plan, operations, safety_critical_only=False, **kwargs):
         return ["partial_artifacts"]
 
 
@@ -68,7 +70,7 @@ def test_emulated_arbitrage_migration_end_to_end(tmp_path):
         "execution_epoch": 0, "active_migration_id": None,
         "workload_type": "long", "progress": 0.5,
         "cpu_utilization": 0.5, "memory_utilization": 0.5}}))
-    registry = JobRegistry(str(reg_path))
+    registry = MemoryRegistry(json.loads(reg_path.read_text()))
     job = registry.get("job-1")
 
     # -- observe / estimate (real) --
@@ -133,6 +135,7 @@ def test_emulated_arbitrage_migration_end_to_end(tmp_path):
         stay_analysis=stay, candidate_analysis=candidate)
     plan.pid = job["pid"]
     plan.source_host = job["public_ip"]
+    plan.plan_hash = MigrationPlanner.compute_hash(plan)
     assert plan.plan_hash and plan.fencing_authorized
 
     # -- durable audit trail: ledger + history (estimated vs actual split) --
@@ -146,13 +149,13 @@ def test_emulated_arbitrage_migration_end_to_end(tmp_path):
     # -- execute (real coordinator/validator/stores, emulated transport) --
     plan_store, checkpoint_store = PlanStore(), CheckpointStore()
     fence_calls = []
-    coord = MigrationCoordinator(
-        registry=registry, provisioner=Provisioner(),
+    coord = MigrationCoordinator(audit_store=AuditStore(),
+        registry=registry, provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
             storage=_Storage(), dump_handler=_dump, restore_handler=_restore,
             checkpoint_store=checkpoint_store),
         transfer_manager=TransferManager(storage=_Storage()),
-        validator=Validator(), cleanup_executor=_Cleanup(),
+        validator=emulated_validator(), cleanup_executor=_Cleanup(),
         plan_store=plan_store, checkpoint_store=checkpoint_store,
         fence_invalidate=lambda p: fence_calls.append("invalidate"),
         fence_terminate=lambda p: fence_calls.append("terminate"),
@@ -161,6 +164,8 @@ def test_emulated_arbitrage_migration_end_to_end(tmp_path):
             "progress": 0.5, "cpu_utilization_delta": 0.5,
             "memory_utilization_delta": 0.5, "progress_delta": 0.5},
     )
+    from orchestrator.main import _admit_plan_to_store
+    _admit_plan_to_store(plan_store, plan)
     out = coord.execute_plan(plan)
     assert out.current_state == MigrationState.SUCCESS
     assert fence_calls == ["invalidate", "terminate", "verify"]

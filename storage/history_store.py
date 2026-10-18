@@ -4,13 +4,15 @@ PK `migration_id`, GSI `job_id`. Estimated vs actual stay distinct."""
 from __future__ import annotations
 
 from copy import deepcopy
+from storage.backend import Documents, encode, decode
 
 
 class HistoryStore:
     def __init__(self, table_name: str = "spot_arbitrage_migration_history", dynamodb_resource=None):
         self.table_name = table_name
         self.dynamodb = dynamodb_resource
-        self._records: dict[str, dict] = {}
+        self._docs = Documents("migration_id", table_name, dynamodb_resource)
+        self._records = self._docs.local
 
     def insert(self, record: dict) -> dict:
         mid = record.get("migration_id")
@@ -20,12 +22,12 @@ class HistoryStore:
             raise KeyError(f"history {mid} already inserted")
         doc = deepcopy(record)
         doc["_enriched"] = False
-        self._records[mid] = doc
-        return deepcopy(doc)
+        doc["version"] = 0
+        return self._docs.put(doc, create=True)
 
     def enrich(self, migration_id: str, patch: dict) -> dict:
         try:
-            doc = self._records[migration_id]
+            doc = self.get(migration_id)
         except KeyError:
             raise KeyError(f"history {migration_id} not found")
         if doc.get("_enriched"):
@@ -35,31 +37,15 @@ class HistoryStore:
                 raise RuntimeError(f"estimated field {k} immutable; write actual_* instead")
             doc[k] = deepcopy(v)
         doc["_enriched"] = True
-        return deepcopy(doc)
+        version = doc.get("version", 0)
+        doc["version"] = version + 1
+        return self._docs.put(doc, expected_version=version)
 
     def get(self, migration_id: str) -> dict:
-        try:
-            return deepcopy(self._records[migration_id])
-        except KeyError:
-            raise KeyError(f"history {migration_id} not found")
+        return self._docs.get(migration_id)
 
     def list_by_job(self, job_id: str) -> list[dict]:
-        rows = [deepcopy(r) for r in self._records.values() if r.get("job_id") == job_id]
-        if self.dynamodb is not None:
-            # Cross-process read: scan the durable table for this job.
-            # Best-effort; local rows win on migration_id conflict.
-            try:
-                table = self.dynamodb.Table(self.table_name)
-                resp = table.scan(
-                    FilterExpression="job_id = :j",
-                    ExpressionAttributeValues={":j": job_id},
-                )
-                for item in resp.get("Items", []):
-                    if item.get("migration_id") not in self._records:
-                        rows.append(deepcopy(item))
-            except Exception:
-                pass
-        return rows
+        return [r for r in self._docs.all() if r.get("job_id") == job_id]
 
     def save(self, record) -> dict:
         """Upsert adapter for MigrationHistory (which calls storage.save).
@@ -100,10 +86,11 @@ class HistoryStore:
         mid = doc.get("migration_id")
         if not mid:
             raise ValueError("history record requires migration_id")
-        self._records[mid] = deepcopy(doc)
-        if self.dynamodb is not None:
+        with self._docs.lock:
             try:
-                self.dynamodb.Table(self.table_name).put_item(Item=deepcopy(doc))
-            except Exception:
-                pass
-        return deepcopy(doc)
+                current = self.get(mid)
+            except KeyError:
+                current = None
+            version = current.get("version", 0) if current else None
+            doc["version"] = version + 1 if version is not None else 0
+            return self._docs.put(doc, create=current is None, expected_version=version)

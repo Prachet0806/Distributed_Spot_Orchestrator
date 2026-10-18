@@ -1,10 +1,7 @@
-from dataclasses import dataclass, field
+"""Pool-authoritative AWS provisioning and explicit V2 emulation."""
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Any
-import logging
 import uuid
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -14,181 +11,149 @@ class ProvisionResult:
     public_dns: str
     status: str
     operation_id: str = ""
-    provisioned_at: Any = None
+    provisioned_at: object = None
+    region: str = ""
 
 
 class Provisioner:
-    """Acquires/releases target compute.
+    """AWS executor. Incomplete pool definitions fail without emulation."""
 
-    Real path: `provision_instance()` with `ClientToken=operation_id`
-    (Protocols #20). Without an `ec2_client_factory`/AWS config the legacy
-    in-memory stub answers (tests, `--engine v1` compat); the real path is
-    used whenever region+AMI+SG+key are configured.
-    """
-
-    def __init__(
-        self,
-        ec2_client_factory: Any = None,
-        region: Optional[str] = None,
-        ami_id: Optional[str] = None,
-        security_group_id: Optional[str] = None,
-        key_name: Optional[str] = None,
-        instance_type: Optional[str] = None,
-        max_spot_price: Optional[str] = None,
-    ):
-        self.ec2_client_factory = ec2_client_factory
-        self.region = region
-        self.ami_id = ami_id
-        self.security_group_id = security_group_id
+    def __init__(self, key_name=None, max_spot_price=None, *, operation_store=None, regions=(), ec2_factory=None):
         self.key_name = key_name
-        self.instance_type = instance_type
         self.max_spot_price = max_spot_price
-        self._provisioned_instances: dict[str, ProvisionResult] = {}
-        self._operations: dict[str, str] = {}  # operation_id -> instance_id
+        self._operations = {}
+        self._regions = {}
+        self.operation_store = operation_store
+        self.regions = tuple(regions)
+        self.ec2_factory = ec2_factory
+        if operation_store is not None:
+            for doc in operation_store._docs.all():
+                result = doc.get("result") or {}
+                if isinstance(result, dict) and result.get("instance_id") and result.get("region"):
+                    self._regions[result["instance_id"]] = result["region"]
 
-    def _real_configured(self) -> bool:
-        return bool(self.region and self.ami_id and self.security_group_id
-                    and self.key_name and self.instance_type)
-
-    def provision_with_operation(
-        self,
-        candidate_id: str,
-        operation_id: Optional[str] = None,
-        timeout: int = 300,
-        tags: Optional[dict] = None,
-    ) -> ProvisionResult:
-        operation_id = operation_id or f"{int(datetime.utcnow().timestamp()*1000):013d}{uuid.uuid4().hex[:13]}"
-        if operation_id in self._operations:
-            # Idempotent replay: same operation returns the same instance.
-            instance_id = self._operations[operation_id]
-            for result in self._provisioned_instances.values():
-                if result.instance_id == instance_id:
-                    logger.info("Provision replay %s -> %s", operation_id[:8], instance_id)
-                    return result
-        if self._real_configured():
-            from orchestrator.instance_manager import provision_instance
-            instance_id, public_ip, public_dns = provision_instance(
-                region=self.region,
-                ami_id=self.ami_id,
-                security_group_id=self.security_group_id,
-                key_name=self.key_name,
-                instance_type=self.instance_type,
-                max_spot_price=self.max_spot_price,
-                timeout=timeout,
-                idempotency_token=operation_id,
-                tags=tags,
-            )
-            result = ProvisionResult(
-                instance_id=instance_id, public_ip=public_ip,
-                public_dns=public_dns, status="running",
-                operation_id=operation_id, provisioned_at=datetime.utcnow(),
-            )
-        else:
-            result = self.provision(candidate_id)
-            result.operation_id = operation_id
-        self._operations[operation_id] = result.instance_id
-        return result
-
-    def provision_from_pool(
-        self,
-        definition: dict,
-        operation_id: Optional[str] = None,
-        timeout: int = 300,
-        tags: Optional[dict] = None,
-    ) -> ProvisionResult:
-        """Candidate-authoritative provisioning (PA-8, invariant 2).
-
-        The pool definition supplies region/AMI/SG/key/instance-type. When
-        the definition lacks AWS fields the global constructor config is
-        used as a warned fallback (legacy runtime.yaml path) — never
-        silently. Emulated pools (provider != "aws" or no AWS fields and
-        no global config) use the in-memory stub.
-        """
+    def provision_from_pool(self, definition, operation_id=None, timeout=300, tags=None):
         from storage.pool_registry import validate_pool_definition
-        definition = dict(definition or {})
-        errors = validate_pool_definition(definition, strict_aws=False)
-        pool_id = definition.get("pool_id", "unknown-pool")
-        region = definition.get("region") or self.region
-        ami_id = definition.get("ami_id") or self.ami_id
-        sg = definition.get("security_group_id") or self.security_group_id
-        key = self.key_name
-        itype = definition.get("instance_type") or self.instance_type
-        if errors or not all([region, ami_id, sg, key, itype]):
-            if any([self.region, self.ami_id, self.security_group_id]):
-                logger.warning(
-                    "Pool %s definition incomplete (%s); falling back to "
-                    "global provisioner config (legacy path)",
-                    pool_id, "; ".join(errors) or "missing AWS fields")
-            return self.provision_with_operation(
-                pool_id, operation_id=operation_id, timeout=timeout, tags=tags)
-        if self.ec2_client_factory is not None or (
-                region and ami_id and sg and key and itype):
-            from orchestrator.instance_manager import provision_instance
-            operation_id = operation_id or (
-                f"{int(datetime.utcnow().timestamp() * 1000):013d}{uuid.uuid4().hex[:13]}")
-            if operation_id in self._operations:
-                instance_id = self._operations[operation_id]
-                for result in self._provisioned_instances.values():
-                    if result.instance_id == instance_id:
-                        logger.info("Provision replay %s -> %s",
-                                    operation_id[:8], instance_id)
-                        return result
-            instance_id, public_ip, public_dns = provision_instance(
-                region=region, ami_id=ami_id, security_group_id=sg,
-                key_name=key, instance_type=itype,
-                max_spot_price=self.max_spot_price, timeout=timeout,
-                idempotency_token=operation_id, tags=tags,
-            )
-            result = ProvisionResult(
-                instance_id=instance_id, public_ip=public_ip,
-                public_dns=public_dns, status="running",
-                operation_id=operation_id, provisioned_at=datetime.utcnow(),
-            )
-            self._operations[operation_id] = result.instance_id
-            return result
-        return self.provision_with_operation(
-            pool_id, operation_id=operation_id, timeout=timeout, tags=tags)
-
-    def get_operation_status(self, operation_id: str) -> dict:
-        """Resolve UNKNOWN outcomes against actual state (never blind retry)."""
-        instance_id = self._operations.get(operation_id)
-        if instance_id is None:
-            return {"operation_id": operation_id, "state": "UNKNOWN"}
-        state = self.get_instance_state(instance_id)
-        if state == "running":
-            return {"operation_id": operation_id, "state": "SUCCEEDED",
-                    "instance_id": instance_id}
-        if state in ("terminated", "shutting-down", "stopping", "stopped"):
-            return {"operation_id": operation_id, "state": "FAILED",
-                    "instance_id": instance_id}
-        return {"operation_id": operation_id, "state": "UNKNOWN",
-                "instance_id": instance_id}
-
-    def provision(self, candidate_id: str, **kwargs) -> ProvisionResult:
-        logger.info(f"Provisioning candidate {candidate_id}")
-        instance_id = f"i-{candidate_id[-12:]}"
-        result = ProvisionResult(
-            instance_id=instance_id,
-            public_ip=f"10.0.{hash(candidate_id) % 255}.{hash(candidate_id) // 255 % 255}",
-            public_dns=f"ec2-{instance_id}.compute-1.amazonaws.com",
-            status="running",
-        )
-        self._provisioned_instances[candidate_id] = result
+        from orchestrator.instance_manager import provision_instance
+        errors = validate_pool_definition(definition)
+        if definition.get("provider", "aws") != "aws":
+            errors.append("AWS provisioner requires provider=aws")
+        if not self.key_name:
+            errors.append("SSH key name is required")
+        if errors:
+            raise ValueError("Invalid target pool: " + "; ".join(errors))
+        operation_id = operation_id or uuid.uuid4().hex
+        if operation_id in self._operations:
+            return self._operations[operation_id]
+        if self.operation_store is not None:
+            journal = self.operation_store.begin(f"provider:{operation_id}",
+                {"external_operation_id": operation_id, "definition": definition, "tags": tags or {}})
+            if journal["state"] == "SUCCEEDED":
+                data = dict(journal["result"])
+                result = ProvisionResult(**data)
+                self._operations[operation_id] = result
+                self._regions[result.instance_id] = result.region
+                return result
+        tags = {**(tags or {}), "operation_id": operation_id, "managed_by": "spot-arbitrage-v2"}
+        from orchestrator.worker_bootstrap import control_userdata
+        user_data = control_userdata(int(tags.get("execution_epoch", 0)))
+        iid, ip, dns = provision_instance(
+            region=definition["region"], ami_id=definition["ami_id"],
+            security_group_id=definition["security_group_id"],
+            key_name=self.key_name, instance_type=definition["instance_type"],
+            max_spot_price=self.max_spot_price, timeout=timeout,
+            idempotency_token=operation_id, tags=tags, iam_profile=definition.get("iam_profile"),
+            subnet_id=definition.get("subnet_id"), user_data=user_data)
+        result = ProvisionResult(iid, ip, dns, "running", operation_id, datetime.utcnow(), definition["region"])
+        if self.operation_store is not None:
+            self.operation_store.finish(journal["operation_id"], "SUCCEEDED", result=result)
+        self._operations[operation_id] = result
+        self._regions[iid] = definition["region"]
         return result
 
-    def terminate(self, instance_id: str) -> bool:
-        logger.info(f"Terminating instance {instance_id}")
-        for cid, result in self._provisioned_instances.items():
-            if result.instance_id == instance_id:
-                del self._provisioned_instances[cid]
-                return True
-        return False
+    def get_operation_status(self, operation_id):
+        result = self._operations.get(operation_id)
+        if result is None:
+            for region in self.regions:
+                ec2 = self._client(region)
+                response = ec2.describe_instances(Filters=[
+                    {"Name": "tag:operation_id", "Values": [operation_id]},
+                    {"Name": "tag:managed_by", "Values": ["spot-arbitrage-v2"]}])
+                instances = [instance for reservation in response.get("Reservations", [])
+                             for instance in reservation.get("Instances", [])]
+                if len(instances) > 1:
+                    return {"operation_id": operation_id, "state": "UNKNOWN", "reason": "multiple instances"}
+                if instances:
+                    instance = instances[0]
+                    self._regions[instance["InstanceId"]] = region
+                    if instance["State"]["Name"] == "running" and instance.get("PublicIpAddress"):
+                        result = ProvisionResult(instance["InstanceId"], instance["PublicIpAddress"],
+                            instance.get("PublicDnsName", ""), "running", operation_id, None, region)
+                        self._operations[operation_id] = result
+                        break
+            if result is None:
+                return {"operation_id": operation_id, "state": "UNKNOWN"}
+        state = self.get_instance_state(result.instance_id)
+        return {"operation_id": operation_id,
+                "state": "SUCCEEDED" if state == "running" else
+                "FAILED" if state in {"terminated", "shutting-down", "stopped", "stopping"}
+                else "UNKNOWN", "instance_id": result.instance_id,
+                "result": result}
 
-    def get_instance_state(self, instance_id: str) -> str:
-        for result in self._provisioned_instances.values():
-            if result.instance_id == instance_id:
-                return result.status
-        return "unknown"
+    def _client(self, region):
+        import boto3
+        return self.ec2_factory(region) if self.ec2_factory else boto3.client("ec2", region_name=region)
 
-    def is_ready(self, candidate_id: str) -> bool:
-        return candidate_id in self._provisioned_instances
+    def get_instance_state(self, instance_id):
+        region = self._regions.get(instance_id)
+        if region is None:
+            return "unknown"
+        response = self._client(region).describe_instances(
+            InstanceIds=[instance_id])
+        return response["Reservations"][0]["Instances"][0]["State"]["Name"]
+
+    def terminate(self, instance_id):
+        import boto3
+        region = self._regions.get(instance_id)
+        if region is None:
+            raise ValueError(f"Unknown instance ownership: {instance_id}")
+        self._client(region).terminate_instances(InstanceIds=[instance_id])
+        return True
+
+
+class EmulatedProvisioner:
+    """Explicit in-process executor for emulated tests; never constructed on AWS paths."""
+
+    def __init__(self):
+        self._operations = {}
+        self._instances = {}
+
+    def provision_with_operation(self, pool_id, operation_id=None, timeout=300, tags=None):
+        operation_id = operation_id or uuid.uuid4().hex
+        if operation_id in self._operations:
+            return self._operations[operation_id]
+        result = self._launch(pool_id, operation_id)
+        self._operations[operation_id] = result
+        self._instances[result.instance_id] = result
+        return result
+
+    def _launch(self, pool_id, operation_id):
+        return ProvisionResult("i-" + uuid.uuid4().hex[:17], "127.0.0.1",
+                               "localhost", "running", operation_id, datetime.utcnow())
+
+    def provision_from_pool(self, definition, operation_id=None, timeout=300, tags=None):
+        return self.provision_with_operation(definition["pool_id"], operation_id, timeout, tags)
+
+    def get_operation_status(self, operation_id):
+        result = self._operations.get(operation_id)
+        if result is None:
+            return {"operation_id": operation_id, "state": "UNKNOWN"}
+        return {"operation_id": operation_id,
+                "state": "SUCCEEDED" if result.instance_id in self._instances else "FAILED",
+                "instance_id": result.instance_id, "result": result}
+
+    def terminate(self, instance_id):
+        return self._instances.pop(instance_id, None) is not None
+
+    def get_instance_state(self, instance_id):
+        return "running" if instance_id in self._instances else "terminated"

@@ -1,5 +1,5 @@
-# scripts/spotctl.py — thin user CLI (Phase A shim, baseline-locked).
-"""Single entry point for the user workflow. v1 is a thin shim over the
+# scripts/spotctl.py — V2 admission and observation CLI.
+"""Single entry point for the user workflow. The CLI uses the
 existing registry/history mechanisms — no PID/IP/AMI/Dynamo knowledge
 required on the normal path:
 
@@ -11,7 +11,7 @@ required on the normal path:
 The normal `run` path NEVER accepts --public-ip/--pid/--ami (invariant
 1+2): it admits a PENDING job carrying a workload contract. PID/host
 discovery (PA-6/9), pool-backed provisioning (PA-7/8) and telemetry
-READINESS replace the shim internals progressively without changing
+READINESS replace the runtime internals progressively without changing
 this UX.
 """
 import argparse
@@ -33,26 +33,20 @@ def _parse_memory_mb(raw):
 
 
 def _registry(args):
-    if args.backend == "dynamo":
-        if not args.table or not args.region:
-            raise SystemExit("Dynamo backend requires --table and --region")
-        from storage.dynamo_registry import DynamoRegistry
-        return DynamoRegistry(args.table, region_name=args.region)
-    from storage.job_registry import JobRegistry
-    return JobRegistry(args.json_path)
+    from orchestrator.config_loader import load_runtime_config
+    from storage.dynamo_registry import DynamoRegistry
+    cfg = load_runtime_config()
+    return DynamoRegistry(args.table or cfg["dynamodb_table"],
+                          region_name=args.region or cfg["dynamodb_region"])
 
 
 def _history_store(args):
-    dynamodb_resource = None
-    if args.backend == "dynamo":
-        try:
-            import boto3
-            dynamodb_resource = boto3.resource("dynamodb", region_name=args.region)
-        except Exception as exc:
-            raise SystemExit(f"DynamoDB resource init failed: {exc}")
+    import boto3
+    from orchestrator.config_loader import load_runtime_config
     from storage.history_store import HistoryStore
-    return HistoryStore(
-        table_name=args.history_table, dynamodb_resource=dynamodb_resource)
+    cfg = load_runtime_config()
+    return HistoryStore(table_name=args.history_table, dynamodb_resource=boto3.resource(
+        "dynamodb", region_name=args.region or cfg["dynamodb_region"]))
 
 
 def cmd_run(args):
@@ -72,9 +66,8 @@ def cmd_run(args):
     result = manager.admit(contract, reg, job_id=args.job_id)
     if result.verdict == "REJECTED":
         raise SystemExit(f"admission rejected: {result.reason}")
-    print(f"admitted {result.job_id} ({result.verdict}; contract v1; worker provisioning: shim-v1 manual)")
-    print(f"status:  python scripts/spotctl.py status --name {result.job_id} --backend {args.backend}"
-          + (f" --table {args.table} --region {args.region}" if args.backend == "dynamo" else f" --json-path {args.json_path}"))
+    print(f"admitted {result.job_id} ({result.verdict}; awaiting worker provisioning)")
+    print(f"status: python scripts/spotctl.py status --name {result.job_id}")
     return result.job_id
 
 
@@ -190,11 +183,9 @@ def cmd_runtime_publish(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="spotctl", description="Spot arbitrage user CLI (thin shim v1)")
-    ap.add_argument("--backend", choices=["dynamo", "json"], default="json")
+    ap = argparse.ArgumentParser(prog="spotctl", description="Spot arbitrage V2 CLI")
     ap.add_argument("--table", default=None, help="DynamoDB registry table")
     ap.add_argument("--region", default=None, help="DynamoDB region")
-    ap.add_argument("--json-path", default="storage/job_registry.json")
     ap.add_argument("--history-table", default="spot_arbitrage_migration_history")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

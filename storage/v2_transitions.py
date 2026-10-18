@@ -1,5 +1,5 @@
 # storage/v2_transitions.py — V2 four-domain transition tables (Protocols §0.4/§0.6).
-"""Additive. V1 `job_states.ALLOWED_TRANSITIONS` stays frozen for legacy path."""
+"""Authoritative lifecycle transitions for the sole V2 engine."""
 
 JOB_TRANSITIONS: dict[str, set[str]] = {
     # PENDING is the admission staging state (spotctl run / JobAdmissionManager).

@@ -29,7 +29,6 @@ class MigrationRegime(str, Enum):
 @dataclass
 class ArbitragePolicyConfig:
     min_savings_margin: float = 0.10
-    cooldown_hours: float = 0.25  # deprecated alias; prefer cooldown_seconds (ADR-006: 900s)
     cooldown_seconds: float = 900.0
     min_favorable_observations: int = 3
     max_completion_overhead_ratio: float = 0.20
@@ -48,9 +47,6 @@ class ArbitragePolicyConfig:
                 "long": 0.12,
                 "stateful": 0.40,
             }
-        # Back-compat: explicit cooldown_hours wins if non-default was passed.
-        if self.cooldown_hours != 0.25:
-            self.cooldown_seconds = self.cooldown_hours * 3600.0
 
     @property
     def effective_cooldown_seconds(self) -> float:
@@ -340,13 +336,7 @@ class ProactivePolicy:
 
 
 class RecoveryPolicy:
-    """V2 recovery strategy selector.
-
-    `decide_recovery()` is the normative entry point returning a
-    models_v2.RecoveryDecision (ADR-008). Legacy `decide()` is kept as a
-    thin shim mapping to PolicyDecision(RECOVER/ABANDON) for `--engine v1`
-    compat until main.py migrates to the Coordinator path.
-    """
+    """V2 recovery strategy selector returning the normative RecoveryDecision."""
 
     def __init__(self, config: RecoveryPolicyConfig = None):
         self.config = config or RecoveryPolicyConfig()
@@ -450,53 +440,6 @@ class RecoveryPolicy:
             policy_version=policy_version,
         )
 
-    def decide(
-        self,
-        recovery_feasibility: RecoveryFeasibility,
-        recovery_cost: RecoveryCostAnalysis,
-        workload_estimate: WorkloadEstimate,
-        compat_assessment: CompatibilityAssessment,
-        ready_assessment: ReadinessAssessment,
-        checkpoint_durable: bool,
-    ) -> PolicyDecision:
-        if recovery_feasibility.status.value == "FEASIBLE":
-            if recovery_feasibility.feasibility_confidence >= self.config.min_feasibility_confidence:
-                return PolicyDecision(
-                    decision=Decision.RECOVER,
-                    regime=MigrationRegime.EMERGENCY,
-                    reason="feasible_recovery",
-                    target_candidate_id=compat_assessment.pool_id,
-                    confidence=recovery_feasibility.feasibility_confidence,
-                    metadata={
-                        "critical_path_seconds": recovery_feasibility.critical_path_seconds,
-                        "safety_margin_seconds": recovery_feasibility.safety_margin_seconds,
-                        "remaining_budget_seconds": recovery_feasibility.remaining_budget_seconds,
-                    },
-                )
-
-        if recovery_feasibility.status.value == "INSUFFICIENT_EVIDENCE":
-            if self.config.allow_cold_restart:
-                return PolicyDecision(
-                    decision=Decision.RECOVER,
-                    regime=MigrationRegime.EMERGENCY,
-                    reason="cold_restart_fallback",
-                    target_candidate_id=compat_assessment.pool_id,
-                    confidence=0.3,
-                    metadata={"fallback": "cold_restart"},
-                )
-
-        return PolicyDecision(
-            decision=Decision.ABANDON,
-            regime=MigrationRegime.EMERGENCY,
-            reason="recovery_infeasible",
-            target_candidate_id=None,
-            confidence=0.9,
-            metadata={
-                "checkpoint_durable": checkpoint_durable,
-                "feasibility_status": recovery_feasibility.status.value,
-                "infeasible_reason": recovery_feasibility.infeasible_reason,
-            },
-        )
 
 
 class PolicyEngine:
@@ -539,13 +482,25 @@ class PolicyEngine:
                     confidence=0.0,
                     metadata={},
                 )
-            return self.recovery.decide(
-                recovery_feasibility,
-                None,
-                workload_estimate,
-                compat_assessments[0] if compat_assessments else None,
-                ready_assessments[0] if ready_assessments else None,
-                checkpoint_durable,
+            recovery = self.recovery.decide_recovery(
+                job_id=workload_estimate.job_id,
+                migration_id=job_context.get("migration_id", ""),
+                execution_epoch=workload_estimate.execution_epoch,
+                recovery_feasibility=recovery_feasibility,
+                compat_assessment=compat_assessments[0] if compat_assessments else None,
+                ready_assessment=ready_assessments[0] if ready_assessments else None,
+                checkpoint_durable=checkpoint_durable,
+                reconciliation_context=job_context.get("reconciliation_context", "NONE"),
+            )
+            executable = recovery.decision.value in {
+                "RETRY_RESTORE", "FORWARD_RECOVERY", "COLD_RESTART"}
+            return PolicyDecision(
+                decision=Decision.RECOVER if executable else Decision.ABANDON,
+                regime=regime, reason=recovery.reason_code,
+                target_candidate_id=compat_assessments[0].pool_id
+                if executable and compat_assessments else None,
+                confidence=recovery_feasibility.feasibility_confidence,
+                metadata={"recovery_decision": recovery.decision.value},
             )
 
         if regime == MigrationRegime.PROACTIVE:

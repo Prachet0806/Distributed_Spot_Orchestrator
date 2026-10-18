@@ -1,4 +1,5 @@
 import json
+from worker.atomic_io import write_json
 import os
 import time
 import urllib.error
@@ -28,14 +29,17 @@ def _get_spot_instance_action(token=None, timeout=1.0):
         return resp.read().decode("utf-8")
 
 
-def _write_interrupt_flag(flag_path):
+def _write_interrupt_flag(flag_path, action=None):
     os.makedirs(os.path.dirname(flag_path), exist_ok=True)
     payload = {
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "source": "imds",
     }
-    with open(flag_path, "w") as f:
-        json.dump(payload, f)
+    if action:
+        parsed = json.loads(action) if isinstance(action, str) else action
+        payload["action"] = parsed.get("action")
+        payload["effective_at"] = parsed.get("time")
+    write_json(flag_path, payload)
 
 
 def monitor_spot_interruption(flag_path, poll_interval=SPOT_INTERRUPT_POLL_INTERVAL, stop_event=None, logger=print):
@@ -54,10 +58,8 @@ def monitor_spot_interruption(flag_path, poll_interval=SPOT_INTERRUPT_POLL_INTER
 
             action = _get_spot_instance_action(token=token)
             if action:
-                _write_interrupt_flag(flag_path)
+                _write_interrupt_flag(flag_path, action)
                 logger("Spot interruption notice detected; flag written.")
-                if stop_event is not None:
-                    stop_event.set()
                 return True
         except urllib.error.HTTPError as exc:
             # 404 means no interruption scheduled
@@ -71,3 +73,12 @@ def monitor_spot_interruption(flag_path, poll_interval=SPOT_INTERRUPT_POLL_INTER
             token = None
 
         time.sleep(poll_interval)
+
+
+def main():
+    from worker.constants import SPOT_INTERRUPT_FLAG
+    monitor_spot_interruption(SPOT_INTERRUPT_FLAG)
+
+
+if __name__ == "__main__":
+    main()

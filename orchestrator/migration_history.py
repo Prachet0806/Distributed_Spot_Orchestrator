@@ -8,60 +8,29 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Step-result schema version. v1 stores structured result dicts;
-# v0 rows (legacy) hold stringified results and are read tolerantly.
 RESULT_SCHEMA_VERSION = 1
 
 
-def _normalize_step_result(result: Any) -> tuple[Any, int, bool]:
-    """Normalize a step result for storage.
-
-    Returns (stored_result, schema_version, legacy_flag). Dicts pass
-    through; objects with __dict__ become dicts; scalars are wrapped as
-    {"value": ...} so downstream readers always see a mapping or None.
-    Strings that parse as JSON objects are revived (legacy tolerance).
-    """
+def _normalize_step_result(result: Any) -> tuple[Any, int]:
+    """Accept structured V2 results; stringified historical results are rejected."""
     if result is None:
-        return None, RESULT_SCHEMA_VERSION, False
+        return None, RESULT_SCHEMA_VERSION
     if isinstance(result, dict):
-        return deepcopy(result), RESULT_SCHEMA_VERSION, False
-    if isinstance(result, str):
-        import json
-        try:
-            parsed = json.loads(result)
-            if isinstance(parsed, dict):
-                return parsed, RESULT_SCHEMA_VERSION, True
-        except (ValueError, TypeError):
-            pass
-        return {"legacy": True, "value": result}, RESULT_SCHEMA_VERSION, True
+        return deepcopy(result), RESULT_SCHEMA_VERSION
     if hasattr(result, "__dict__"):
-        try:
-            return deepcopy(dict(vars(result))), RESULT_SCHEMA_VERSION, False
-        except (TypeError, ValueError):
-            pass
-    return {"value": result}, RESULT_SCHEMA_VERSION, False
+        return deepcopy(vars(result)), RESULT_SCHEMA_VERSION
+    raise TypeError("Step results must be structured mappings or result objects")
 
 
 def _step_result_dict(step: dict) -> dict:
-    """Tolerant reader: step['result'] as a dict ({} when unusable)."""
-    res = (step or {}).get("result")
-    if isinstance(res, dict):
-        return res
-    if isinstance(res, str):
-        import json
-        try:
-            parsed = json.loads(res)
-            if isinstance(parsed, dict):
-                return parsed
-        except (ValueError, TypeError):
-            pass
-    return {}
-
-
-def _is_legacy_step(step: dict) -> bool:
-    if (step or {}).get("result_schema", RESULT_SCHEMA_VERSION) < RESULT_SCHEMA_VERSION:
-        return True
-    return bool(_step_result_dict(step).get("legacy"))
+    if step.get("result_schema", RESULT_SCHEMA_VERSION) != RESULT_SCHEMA_VERSION:
+        raise ValueError("Unsupported step-result schema")
+    result = step.get("result")
+    if result is None:
+        return {}
+    if not isinstance(result, dict):
+        raise TypeError("Step results must be structured mappings")
+    return result
 
 
 class MigrationOutcome(str, Enum):
@@ -108,8 +77,8 @@ class MigrationHistory:
             execution_epoch=plan.execution_epoch,
             regime=plan.regime.value,
             outcome=MigrationOutcome.FAILED,
-            source_candidate_id=plan.source_candidate_id,
-            target_candidate_id=plan.target_candidate_id,
+            source_candidate_id=plan.source_pool_id,
+            target_candidate_id=plan.target_pool_id,
             started_at=datetime.utcnow(),
             policy_decision={
                 "decision": policy_decision.decision.value,
@@ -139,13 +108,12 @@ class MigrationHistory:
     def record_step(self, migration_id: str, step_name: str, status: str, result: Any = None, error: str = None, duration: float = 0):
         record = self._get(migration_id)
         if record:
-            stored, schema, legacy = _normalize_step_result(result)
+            stored, schema = _normalize_step_result(result)
             record.steps.append({
                 "step": step_name,
                 "status": status,
                 "result": stored,
                 "result_schema": schema,
-                "legacy_result": legacy,
                 "error": error,
                 "duration_seconds": duration,
                 "timestamp": datetime.utcnow().isoformat(),
@@ -156,7 +124,7 @@ class MigrationHistory:
     def record_completion(self, migration_id: str, outcome: MigrationOutcome, failure_reason: str = None):
         record = self._get(migration_id)
         if record:
-            record.outcome = outcome
+            record.outcome = MigrationOutcome(outcome)
             record.completed_at = datetime.utcnow()
             record.total_duration_seconds = (record.completed_at - record.started_at).total_seconds()
             record.failure_reason = failure_reason
@@ -199,7 +167,6 @@ class MigrationHistory:
                 "actual_restore_duration": next((s for s in r.steps if s["step"] == "restoring"), {}).get("duration_seconds"),
                 "outcome": r.outcome.value,
                 "regime": r.regime,
-                "legacy_result": _is_legacy_step(ckpt),
             })
         return out
 

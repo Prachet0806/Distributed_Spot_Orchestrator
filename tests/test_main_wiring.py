@@ -10,6 +10,7 @@ Guards the three 0%-coverage bugs plus follow-ups:
    feasibility, detection_lag, emergency target remap.
 7. PA-8: coordinator provisions from the pool definition when available.
 """
+from storage.audit_store import AuditStore
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -127,13 +128,6 @@ def test_first_tick_builds_pools():
 def test_emergency_feasibility_no_typeerror():
     """Emergency call site passes real plan_steps (Bug #2, Option B)."""
     engine = RecoveryFeasibilityEngine()
-    # Legacy 4-arg call still must not raise TypeError (Option A compat).
-    legacy = engine.evaluate(_est(), _compat(), _ready(), 120.0)
-    assert legacy.status in (FeasibilityStatus.FEASIBLE,
-                             FeasibilityStatus.INFEASIBLE,
-                             FeasibilityStatus.INSUFFICIENT_EVIDENCE)
-    assert legacy.critical_path_seconds == 0.0
-
     # Option B: real step estimates carry a nonzero critical path.
     steps = build_emergency_plan_steps(_est())
     assert len(steps) == 10
@@ -161,7 +155,7 @@ def _fake_plan(mid="mig-1"):
     return SimpleNamespace(
         migration_id=mid, job_id="j1", execution_epoch=0,
         regime=SimpleNamespace(value="EMERGENCY"),
-        source_candidate_id="pool-a", target_candidate_id="pool-b",
+        source_pool_id="pool-a", target_pool_id="pool-b",
         steps=[],
     )
 
@@ -260,19 +254,20 @@ def test_pool_definitions_persisted():
     assert "_persisted_pools" in src
 
 
-def test_history_structured_results_and_legacy_tolerance():
-    """Invariant 7 (part): structured results preserved, legacy tolerated."""
+def test_history_structured_results_reject_old_shapes():
+    """Structured V2 results are preserved; stringified records are rejected."""
     from orchestrator.migration_history import (
         MigrationHistory, _normalize_step_result, _step_result_dict,
     )
-    stored, schema, legacy = _normalize_step_result({"size_bytes": 123})
-    assert stored == {"size_bytes": 123} and not legacy
+    stored, schema = _normalize_step_result({"size_bytes": 123})
+    assert stored == {"size_bytes": 123}
     assert _step_result_dict({"result": stored}) == {"size_bytes": 123}
 
-    # Legacy string row stays readable.
-    assert _step_result_dict({"result": "CheckpointResult(x)"}) == {}
-    revived, _, was_legacy = _normalize_step_result('{"size_bytes": 5}')
-    assert revived == {"size_bytes": 5} and was_legacy
+    import pytest
+    with pytest.raises(TypeError):
+        _step_result_dict({"result": "CheckpointResult(x)"})
+    with pytest.raises(TypeError):
+        _normalize_step_result('{"size_bytes": 5}')
 
     h = MigrationHistory()
     mid = h.record_start(_fake_plan(), _fake_decision(), None, None)
@@ -283,7 +278,6 @@ def test_history_structured_results_and_legacy_tolerance():
     fb = h.get_feedback_for_estimator("j1")[0]
     assert fb["actual_checkpoint_size"] == 10 * 1024 ** 2
     assert fb["actual_checkpoint_duration"] == 31.4
-    assert fb["legacy_result"] is False
 
 
 def test_checkpoint_durability_lookup_never_infers():
@@ -344,16 +338,16 @@ def test_emergency_target_remapped_to_region_key():
 
 
 class _DualPathProvisioner:
-    """Fake exposing both legacy and pool-definition provision paths."""
+    """Fake exposing V2 direct and pool-definition provision paths."""
 
     def __init__(self):
         self.via_pool = []
-        self.via_legacy = []
+        self.via_direct = []
 
     def provision_with_operation(self, candidate_id, operation_id=None, tags=None):
         from orchestrator.provisioner import ProvisionResult
-        self.via_legacy.append((candidate_id, operation_id))
-        return ProvisionResult(instance_id="i-legacy", public_ip="1.1.1.1",
+        self.via_direct.append((candidate_id, operation_id))
+        return ProvisionResult(instance_id="i-direct", public_ip="1.1.1.1",
                                public_dns="h", status="running",
                                operation_id=operation_id or "")
 
@@ -367,7 +361,7 @@ class _DualPathProvisioner:
 
 def _provisioning_coordinator(provisioner, provider):
     from orchestrator.migration_coordinator import MigrationCoordinator
-    return MigrationCoordinator(
+    return MigrationCoordinator(audit_store=AuditStore(),
         registry=SimpleNamespace(get=lambda jid: {}, transition=lambda *a, **k: {}),
         provisioner=provisioner,
         checkpoint_manager=SimpleNamespace(),
@@ -407,29 +401,20 @@ def test_coordinator_prefers_pool_definition():
     coord._execute_provisioning()
     assert len(prov.via_pool) == 1
     assert prov.via_pool[0][0]["ami_id"] == "ami-xyz"
-    assert prov.via_legacy == []
+    assert prov.via_direct == []
     assert coord._execution_state.target_instance_id == "i-pool"
 
 
-def test_coordinator_falls_back_to_legacy_path():
-    """PA-8: no definition (or no provider) keeps the legacy path working."""
-    from orchestrator.migration_coordinator import MigrationExecutionState
-    # No definition resolvable -> legacy.
+def test_coordinator_refuses_missing_pool_definition():
+    """A configured pool provider cannot silently fall back to another path."""
+    import pytest
+    from orchestrator.migration_coordinator import MigrationExecutionState, MigrationFailed
     prov = _DualPathProvisioner()
     coord = _provisioning_coordinator(prov, provider=lambda target: None)
-    coord._execution_state = MigrationExecutionState(
-        plan=_provisioning_plan("us-west-2"))
-    coord._execute_provisioning()
-    assert prov.via_pool == []
-    assert len(prov.via_legacy) == 1
-    # No provider at all (all existing callers) -> legacy.
-    prov2 = _DualPathProvisioner()
-    coord2 = _provisioning_coordinator(prov2, provider=None)
-    coord2._execution_state = MigrationExecutionState(
-        plan=_provisioning_plan("us-west-2"))
-    coord2._execute_provisioning()
-    assert prov2.via_pool == []
-    assert len(prov2.via_legacy) == 1
+    coord._execution_state = MigrationExecutionState(plan=_provisioning_plan("us-west-2"))
+    with pytest.raises(MigrationFailed, match="authoritative target pool"):
+        coord._execute_provisioning()
+    assert not prov.via_pool and not prov.via_direct
 
 
 def test_wired_coordinator_passes_pool_provider():
@@ -489,7 +474,7 @@ class _PendingRegistry:
 class _PendingProvisioner:
     def __init__(self, ip="10.9.9.9", iid="i-adm-1"):
         self.definitions = []
-        self.legacy = []
+        self.direct = []
         self.ip, self.iid = ip, iid
 
     def provision_from_pool(self, definition, operation_id=None, tags=None):
@@ -501,7 +486,7 @@ class _PendingProvisioner:
 
     def provision_with_operation(self, candidate_id, operation_id=None, tags=None):
         from orchestrator.provisioner import ProvisionResult
-        self.legacy.append(candidate_id)
+        self.direct.append(candidate_id)
         return ProvisionResult(instance_id=self.iid, public_ip=self.ip,
                                public_dns="h", status="running",
                                operation_id=operation_id or "")
@@ -529,7 +514,8 @@ def _pending_deps(job, **over):
     for r in ("us-east-1", "us-west-2"):
         store.put_pool(f"pool-{r}-t3.micro", {
             "pool_id": f"pool-{r}-t3.micro", "provider": "aws",
-            "region": r, "ami_id": f"ami-{r}", "lifecycle": "ACTIVE"}, version=1)
+            "region": r, "ami_id": f"ami-{r}", "lifecycle": "ACTIVE",
+            "runtime_artifact_digest": "sha256:" + "a" * 64}, version=1)
     kw = dict(
         prices={"us-east-1": {"price": 0.01}, "us-west-2": {"price": 0.02}},
         instance_type="t3.micro", pool_store=store,
@@ -554,7 +540,17 @@ def test_pending_provisions_without_user_facts():
     assert row["provisioned_instance_id"] == "i-adm-1"
     assert row["pid"] is None  # never invented
     assert len(prov.definitions) == 1  # pool definition, not global config
-    assert prov.legacy == []
+    assert prov.direct == []
+
+
+def test_pending_refuses_missing_authoritative_pool_digest():
+    from storage.pool_registry import PoolRegistryStore
+
+    handler, reg, prov, kw = _pending_deps(_pending_job())
+    kw["pool_store"] = PoolRegistryStore()
+    handler(reg.get("adm-1"), "adm-1", "us-east-1", **kw)
+    assert reg.get("adm-1")["admission_status"] == "NO_ELIGIBLE_POOL"
+    assert prov.definitions == []
 
 
 def _heartbeat_transport(pid=4242, age_s=5.0):
@@ -584,7 +580,7 @@ def test_pending_promotes_on_fresh_heartbeat():
     assert row["state"] == "RUNNING"
     assert row["pid"] == 4242
     assert row["instance_id"] == "i-adm-1"
-    assert prov.definitions == [] and prov.legacy == []  # no re-provision
+    assert prov.definitions == [] and prov.direct == []  # no re-provision
 
 
 def test_pending_stale_never_promotes():
@@ -623,12 +619,12 @@ def test_pending_handler_never_raises():
 
 
 def test_pending_lifecycle_in_real_registry(tmp_path):
-    """PENDING rows move in the real JSON backend (no stranded states)."""
-    from storage.job_registry import JobRegistry
+    """PENDING rows move through the strict V2 emulation backend."""
+    from storage.memory_registry import MemoryRegistry
     from orchestrator.admission import JobAdmissionManager, WorkloadContract
     p = tmp_path / "registry.json"
     p.write_text(_json.dumps({}))
-    reg = JobRegistry(str(p))
+    reg = MemoryRegistry(_json.loads(p.read_text()))
     res = JobAdmissionManager(default_regions=["us-east-1"]).admit(
         WorkloadContract(name="e2e-adm", script="job.py",
                          regions=("us-east-1",)), reg, job_id="e2e-adm")
@@ -667,7 +663,7 @@ def _wiring_plan(job_id="j1", regime="ARBITRAGE", target="us-west-2"):
 def test_plan_admission_and_outcome_hygiene():
     """S16 seam: admitted plans are visible; marked plans leave the active set."""
     from orchestrator.main import _admit_plan_to_store, _mark_plan_outcome
-    from storage.plan_store import PlanStore, PlanExistsError
+    from storage.plan_store import PlanStore
     import pytest
     store = PlanStore()
     plan = _wiring_plan()

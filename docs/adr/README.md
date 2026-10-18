@@ -10,7 +10,7 @@
 | 011 | TTLs: arbitrage/proactive 600s, emergency = remaining deadline; op 300s, step 60s, UNKNOWN 30s; step_deadline=min(expiry,deadline,timeout) |
 | 012 | Retry: op 3x exp(2s→30s, ±25% jitter); max 2 replans, 3 recoveries; same op_id = retry; UNKNOWN → query → reconcile |
 | 013 | Retention: latest 3 DURABLE + latest VALIDATED; max age 24h; GC grace 6h; never delete referenced; multipart via transfer cleanup |
-| 014 | engine_version V1\|V2 pinned at admission, immutable; no mid-job upgrade |
+| 014 | V2 is the sole executable engine; unsupported records rejected |
 | 015 | Audit gating: ownership/admission/plan-activation/durability/fencing/termination/terminal/recovery sync; telemetry async |
 | 016 | Hub-and-spoke home-region S3 + SSE-KMS (+MRK); 64MiB parts; manifest.json + manifest.sha256 |
 | 017 | Concurrency: global 3, per-pool 2, per-job 1; READY→all, DEGRADED→emergency-only, NOT_READY/UNKNOWN→none |
@@ -20,6 +20,8 @@
 | 021 | Moto for API units; DynamoDB-Local for CAS/Ledger; real Linux kernel/VM for CRIU/worker; moto is not full integration |
 | 022 | Overhead = (migrated-baseline)/baseline; P95 ≤20% over SHORT/MEDIUM/LONG/STATEFUL × CPU/IO × ckpt-size × same/cross matrix |
 | 023 | Prometheus /metrics canonical; CloudWatch for infra/AWS-native only; no CloudWatch-agent gate on correctness |
-| 024 | V1 3-gate deletion: emulated-green→deprecated; AWS-green→V2-default; soak→delete code; JSON CLI compat last |
+| 024 | V1 execution and compatibility removed immediately by owner request; live qualification gates retained |
 
-Each file `ADR-0xx-*.md` holds context + consequences. Config values live in `config/v2_baseline.yaml`.
+Each file `ADR-0xx-*.md` holds context + consequences. Behavioral baseline
+values live in `config/v2_baseline.yaml`; placement ranking values live in
+`config/placement_policy.yaml`.

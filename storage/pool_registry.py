@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any
+from storage.backend import Documents, conditional_failure
 
 # Required keys for a candidate-authoritative definition. ami_id and
 # security_group_id may be empty ONLY for emulated/local pools; any real
@@ -79,23 +80,22 @@ class PoolRegistryStore:
     def __init__(self, table_name: str = "spot_arbitrage_candidate_pools", dynamodb_resource=None):
         self.table_name = table_name
         self.dynamodb = dynamodb_resource
-        self._pools: dict[str, dict] = {}
+        self._docs = Documents("pool_id", table_name, dynamodb_resource)
+        self._pools = self._docs.local
 
     def put_pool(self, pool_id: str, definition: dict, version: int) -> dict:
-        cur = self._pools.get(pool_id)
-        if cur is not None and version <= int(cur.get("version", 0)):
-            raise RuntimeError(f"pool {pool_id} version must increase")
-        doc = {"pool_id": pool_id, "version": version,
-               "definition": deepcopy(definition)}
-        self._pools[pool_id] = doc
-        if self.dynamodb is not None:
-            self.dynamodb.Table(self.table_name).put_item(
-                Item=deepcopy(doc),
-                ConditionExpression="attribute_not_exists(pool_id)")
-        return deepcopy(doc)
+        with self._docs.lock:
+            try:
+                cur = self.get_pool(pool_id)
+            except KeyError:
+                cur = None
+            if cur is not None and version <= int(cur["version"]):
+                if version == cur["version"] and definition == cur["definition"]:
+                    return cur
+                raise RuntimeError(f"pool {pool_id} version must increase")
+            doc = {"pool_id": pool_id, "version": version, "definition": deepcopy(definition)}
+            return self._docs.put(doc, create=cur is None,
+                                  expected_version=cur["version"] if cur else None)
 
     def get_pool(self, pool_id: str) -> dict:
-        try:
-            return deepcopy(self._pools[pool_id])
-        except KeyError:
-            raise KeyError(f"pool {pool_id} not found")
+        return self._docs.get(pool_id)

@@ -3,6 +3,8 @@
 Every executor × UNKNOWN must resolve via probe or escalate without blind
 retry. Throttle-class failures back off inside budgets and deadlines.
 """
+from storage.audit_store import AuditStore
+from tests.support import emulated_validator
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,11 +16,11 @@ from orchestrator.checkpoint_manager import (
 from orchestrator.migration_coordinator import MigrationCoordinator, MigrationState
 from orchestrator.migration_planner import MigrationPlanner
 from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
-from orchestrator.provisioner import Provisioner
+from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.step_retry import CodedError
 from orchestrator.transfer_manager import TransferManager
 from orchestrator.workload_estimator import WorkloadEstimate
-from storage.job_registry import JobRegistry
+from storage.memory_registry import MemoryRegistry
 
 
 def _est():
@@ -43,17 +45,17 @@ def _registry(tmp_path):
         "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
         "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
         "execution_epoch": 0, "active_migration_id": None}}))
-    return JobRegistry(str(path))
+    return MemoryRegistry(json.loads(path.read_text()))
 
 
-def _dump(job_id, pid, host, timeout=300.0):
+def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
     return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
                             duration_seconds=0.01, digest="sha256:res",
                             status="LOCAL", job_id=job_id, lineage_id=job_id)
 
 
-def _restore(checkpoint_id, host=None, timeout=300.0):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True,
+def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
+    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
                          duration_seconds=0.01, process_id=4242)
 
 
@@ -80,7 +82,7 @@ class _Validator:
 
 
 class _Cleanup:
-    def cleanup_migration(self, plan, operations, safety_critical_only=False):
+    def cleanup_migration(self, plan, operations, safety_critical_only=False, **kwargs):
         return []
 
 
@@ -119,6 +121,7 @@ def _plan(**kw):
     plan = MigrationPlanner().create_plan(**params)
     plan.pid = 4242
     plan.source_host = "10.0.0.9"
+    plan.plan_hash = MigrationPlanner.compute_hash(plan)
     return plan
 
 
@@ -126,9 +129,9 @@ def _coordinator(reg, provisioner=None, dump=None, restore=None,
                  validator=None, transfer_storage=None, **kw):
     calls = []
     kw.setdefault("step_timeout_seconds", 30.0)
-    return MigrationCoordinator(
+    return MigrationCoordinator(audit_store=AuditStore(),
         registry=reg,
-        provisioner=provisioner or Provisioner(),
+        provisioner=provisioner or EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
             storage=_Storage(), dump_handler=dump or _dump,
             restore_handler=restore or _restore),
@@ -138,7 +141,7 @@ def _coordinator(reg, provisioner=None, dump=None, restore=None,
         fence_invalidate=lambda p: calls.append("invalidate"),
         fence_terminate=lambda p: calls.append("terminate"),
         fence_verify=lambda p: calls.append("verify") or True,
-        snapshot_provider=lambda jid, phase: {"progress": 0.5},
+        snapshot_provider=lambda jid, phase: {"cpu_utilization_delta": .5, "memory_utilization_delta": .5, "progress_delta": .5},
         **kw), calls
 
 
@@ -221,7 +224,7 @@ def test_s23_transfer_unknown_with_dead_probe(tmp_path):
 def test_s23_restore_unknown_with_dead_probe(tmp_path):
     reg = _registry(tmp_path)
 
-    def _slow_restore(checkpoint_id, host=None, timeout=300.0):
+    def _slow_restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
         time.sleep(2.0)
         raise AssertionError("unreachable")
 
@@ -260,7 +263,7 @@ def test_s22_capacity_unavailable_retries_with_backoff_then_fails(tmp_path):
         raise CodedError("CAPACITY_UNAVAILABLE", "throttled",
                          transience="TRANSIENT")
 
-    class _ThrottleProv(Provisioner):
+    class _ThrottleProv(EmulatedProvisioner):
         def provision_with_operation(self, pool_id, operation_id=None,
                                      tags=None):
             return _throttled(pool_id, operation_id, tags)
@@ -297,7 +300,7 @@ def test_s22_backoff_yielding_to_emergency_deadline(tmp_path):
             reason="t", target_candidate_id="pool-t", confidence=0.9,
             metadata={}),
         absolute_deadline=datetime.now(timezone.utc) + timedelta(seconds=600))
-    coord = MigrationCoordinator(
+    coord = MigrationCoordinator(audit_store=AuditStore(),
         registry=SimpleNamespace(get=lambda j: None,
                                  transition=lambda *a, **_k: None),
         provisioner=SimpleNamespace(), checkpoint_manager=SimpleNamespace(),

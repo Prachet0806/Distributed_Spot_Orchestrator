@@ -139,22 +139,7 @@ class JobAdmissionManager:
             return AdmissionResult(jid, "REJECTED", f"registry read failed: {exc}",
                                    contract.to_dict())
         try:
-            if hasattr(registry, "create"):
-                registry.create(jid, **row)
-            else:  # JSON backend without create(): insert directly.
-                import json
-                with open(registry.path) as f:
-                    data = json.load(f)
-                if jid in data:
-                    return AdmissionResult(jid, "REJECTED",
-                                           f"job {jid} already exists",
-                                           contract.to_dict())
-                row["job_id"] = jid
-                row["version"] = 0
-                row["execution_epoch"] = 0
-                data[jid] = row
-                with open(registry.path, "w") as f:
-                    json.dump(data, f, indent=2)
+            registry.create(jid, **row)
         except Exception as exc:
             return AdmissionResult(jid, "REJECTED", f"registry write failed: {exc}",
                                    contract.to_dict())

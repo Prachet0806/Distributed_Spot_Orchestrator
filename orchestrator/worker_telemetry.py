@@ -80,7 +80,7 @@ def parse_heartbeat(obj: Dict[str, Any]) -> Dict[str, Any]:
         "execution_epoch": int(doc["execution_epoch"]),
         "pid": int(doc["pid"]),
         "observed_at": _parse_time(
-            doc.get("observed_at", doc.get("at")), "heartbeat/v1"),
+            doc.get("observed_at"), "heartbeat/v1"),
         "workload": doc.get("workload") or {},
     }
 
@@ -96,8 +96,7 @@ def parse_progress(obj: Dict[str, Any]) -> Dict[str, Any]:
         "job_id": obj.get("job_id"),
         "execution_epoch": obj.get("execution_epoch"),
         "observed_at": _parse_time(
-            obj.get("observed_at", obj.get("at",
-                                           datetime.now(timezone.utc).isoformat())),
+            obj.get("observed_at"),
             "progress/v1"),
         "progress": obj.get("progress"),
         "checkpoint_size_bytes": obj.get("checkpoint_size_bytes"),
@@ -159,7 +158,7 @@ def _age_seconds(observed_at: datetime, now: datetime) -> float:
 
 def _observed_at_of(report: Dict[str, Any], stream: str) -> datetime:
     """Accept parsed (datetime) or raw (ISO string) reports from any caller."""
-    return _parse_time(report.get("observed_at", report.get("at")), stream)
+    return _parse_time(report.get("observed_at"), stream)
 
 
 def heartbeat_liveness(report: Optional[Dict[str, Any]],
@@ -170,7 +169,7 @@ def heartbeat_liveness(report: Optional[Dict[str, Any]],
         return {"liveness": "MISSING", "age_seconds": None,
                 "readiness": "UNKNOWN"}
     age = _age_seconds(_observed_at_of(report, "heartbeat"), now)
-    if age <= HEARTBEAT_STALE_SECONDS:
+    if -5 <= age <= HEARTBEAT_STALE_SECONDS:
         return {"liveness": "FRESH", "age_seconds": age, "readiness": "READY",
                 "execution_epoch": report.get("execution_epoch"),
                 "pid": report.get("pid")}
@@ -189,7 +188,7 @@ def progress_quality(report: Optional[Dict[str, Any]],
     except TelemetryError:
         return {"quality": "MISSING", "age_seconds": None,
                 "confidence": "LOW", "usable": True}
-    if age <= PROGRESS_STALE_SECONDS:
+    if -5 <= age <= PROGRESS_STALE_SECONDS:
         return {"quality": "FRESH", "age_seconds": age,
                 "confidence": "AS_REPORTED", "usable": True}
     return {"quality": "STALE", "age_seconds": age,
@@ -204,7 +203,7 @@ def preflight_freshness(report: Optional[Dict[str, Any]],
     if report is None:
         return {"fresh": False, "reprobe": True, "ready_hint": "UNKNOWN"}
     age = _age_seconds(_observed_at_of(report, "preflight"), now)
-    if age <= ttl_seconds:
+    if -5 <= age <= ttl_seconds:
         return {"fresh": True, "reprobe": False, "age_seconds": age,
                 "ready_hint": "READY" if report.get("passed") else "NOT_READY"}
     return {"fresh": False, "reprobe": True, "age_seconds": age,
@@ -265,7 +264,7 @@ class WorkerTelemetryReader:
             return None
 
     def run_preflight(self, pool_id: str, instance_id: str = "",
-                      wrapper_path: str = "/opt/job_workspace/criu_wrapper.sh"
+                      wrapper_path: str = "/opt/spot-worker-control/checkpoint/criu_wrapper.sh"
                       ) -> Optional[Dict[str, Any]]:
         try:
             res = self.transport.run_command(

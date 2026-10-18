@@ -1,9 +1,7 @@
 import os
 import argparse
 import subprocess
-import sys
 import paramiko
-from scp import SCPClient
 
 
 def pin_host_key(ip, known_hosts_path, port=22):
@@ -71,7 +69,7 @@ def create_ssh_client(ip, key_path, user="ubuntu", known_hosts_path=None,
 
 def deploy(ip, key_path, project_root, known_hosts_path=None,
            pin=False, allow_tofu=False):
-    print(f"🚀 Deploying code to Worker: {ip}")
+    print(f"🔎 Verifying pinned worker image: {ip}")
 
     if pin:
         if not known_hosts_path:
@@ -86,41 +84,40 @@ def deploy(ip, key_path, project_root, known_hosts_path=None,
 
     ssh = create_ssh_client(ip, key_path, known_hosts_path=known_hosts_path,
                             allow_tofu=allow_tofu)
-    scp = SCPClient(ssh.get_transport())
+    try:
+        digest = verify_worker_control(ssh)
+    finally:
+        ssh.close()
+    print(f"✅ Worker control image verified: {digest}")
+    return digest
 
-    remote_base = "/opt/job_workspace"
 
-    # Upload critical folders
-    for folder in ["worker", "storage", "checkpoint"]:
-        local_path = os.path.join(project_root, folder)
-        print(f"   📂 Copying {folder}...")
-        scp.put(local_path, recursive=True, remote_path=remote_base)
-
-    # Upload shared root modules (job_runner inserts remote_base into
-    # sys.path and imports these; without them the worker crashes on boot).
-    # NOTE: remote paths are POSIX even when deploying from Windows.
-    for module in ["common_constants.py"]:
-        local_path = os.path.join(project_root, module)
-        if os.path.exists(local_path):
-            print(f"   📄 Copying {module}...")
-            scp.put(local_path, remote_path=f"{remote_base}/{module}")
-
-    # Fix permissions & install deps
-    print("   🔧 Setting permissions and installing deps...")
-    ssh.exec_command(f"sudo chown -R ubuntu:ubuntu {remote_base}")
-    # Use python3 -m pip to avoid PATH issues on some AMIs
-    ssh.exec_command(f"python3 -m pip install boto3 requests paramiko scp")
-
-    scp.close()
-    ssh.close()
-    print("✅ Deployment Complete.")
+def verify_worker_control(ssh):
+    """Refuse deployment to a worker without a pinned, root-owned controller."""
+    root = "/opt/spot-worker-control"
+    for path in (root, root + "/control_entry.py",
+                 root + "/checkpoint/criu_wrapper.sh"):
+        _, stdout, stderr = ssh.exec_command(f"stat -c '%u %a' {path}")
+        if stdout.channel.recv_exit_status() != 0:
+            raise RuntimeError(f"worker control path missing: {path}: {stderr.read().decode()}")
+        parts = stdout.read().decode().strip().split()
+        if len(parts) != 2 or parts[0] != "0" or int(parts[1], 8) & 0o022:
+            raise RuntimeError(f"worker control path is writable or not root-owned: {path}")
+    _, stdout, stderr = ssh.exec_command(
+        f"sudo -n python3 -I {root}/control_entry.py --self-check")
+    if stdout.channel.recv_exit_status() != 0:
+        raise RuntimeError("worker control integrity check failed: " + stderr.read().decode())
+    digest = stdout.read().decode().strip()
+    if not digest.startswith("sha256:") or len(digest) != 71:
+        raise RuntimeError("worker control returned an invalid digest")
+    return digest
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", required=True, help="Public IP of the worker")
     parser.add_argument("--key", required=True, help="Path to SSH private key")
-    parser.add_argument("--root", default=".", help="Project root directory")
+    parser.add_argument("--root", default=".", help="Kept for CLI continuity; image contents are immutable")
     parser.add_argument("--known-hosts", default=None,
                         help="Pinned known_hosts file for this deployment")
     parser.add_argument("--pin", action="store_true",

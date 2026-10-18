@@ -123,7 +123,7 @@ def test_plan_step_dynamo_cas_conditions_on_hash_and_version():
     table = _FakeTable()
     store = PlanStore(dynamodb_resource=_FakeDynamo(
         spot_arbitrage_plans=table))
-    store._plans["p1"] = {
+    table.items["p1"] = {
         "plan_id": "p1", "plan_hash": "h1", "version": 3,
         "steps": [{"step_id": "a", "type": "CHECKPOINT", "state": "RUNNING"}]}
     with pytest.raises(PlanStepConflictError):

@@ -9,8 +9,6 @@ from .constants import (
     MAX_PRICE_HISTORY,
     DEFAULT_SPOT_PRICE_SAMPLES,
     SSH_TIMEOUT_DEFAULT,
-    SSH_TIMEOUT_CRIU_DUMP,
-    SSH_TIMEOUT_CRIU_RESTORE,
     S3_TIMEOUT_DEFAULT,
     INSTANCE_PROVISION_TIMEOUT,
     HEALTH_CHECK_PORT,
@@ -68,8 +66,6 @@ from .models_v2 import (
     canonical_plan_dict, compute_plan_hash, new_ulid_like, to_dict,
 )
 from .watcher import SpotPriceWatcher
-from .decision_engine import DecisionEngine, Decision as LegacyDecision
-from .migrator import Migrator
 from .instance_manager import provision_instance
 from .utils import SSHClient
 from .config_loader import load_runtime_config
@@ -85,8 +81,6 @@ __all__ = [
     "MAX_PRICE_HISTORY",
     "DEFAULT_SPOT_PRICE_SAMPLES",
     "SSH_TIMEOUT_DEFAULT",
-    "SSH_TIMEOUT_CRIU_DUMP",
-    "SSH_TIMEOUT_CRIU_RESTORE",
     "S3_TIMEOUT_DEFAULT",
     "INSTANCE_PROVISION_TIMEOUT",
     "HEALTH_CHECK_PORT",
@@ -231,9 +225,6 @@ __all__ = [
     "StateTransition",
     "StateMutationAuthority",
     "SpotPriceWatcher",
-    "DecisionEngine",
-    "LegacyDecision",
-    "Migrator",
     "provision_instance",
     "SSHClient",
     "load_runtime_config",

@@ -64,7 +64,7 @@ def test_heartbeat_payload_contract_shape(monkeypatch):
     assert parsed["instance_id"] == "i-xyz"
     assert parsed["execution_epoch"] == 3
     assert parsed["pid"] > 0
-    assert payload["pid"] == parsed["pid"] and "at" in payload  # back-compat
+    assert payload["pid"] == parsed["pid"] and "observed_at" in payload
 
 
 def test_heartbeat_rejects_bad_schema():
@@ -120,7 +120,7 @@ def test_preflight_kv_parse_and_ready_hint():
     assert verdict == {"fresh": True, "reprobe": False,
                        "age_seconds": pytest.approx(0, abs=5),
                        "ready_hint": "READY"}
-    bad = parse_preflight_kv("passed=false\n", pool_id="pool-a")
+    bad = parse_preflight_kv("passed=false\n", pool_id="pool-a", observed_at=NOW)
     assert preflight_freshness(bad, now=NOW)["ready_hint"] == "NOT_READY"
     old = dict(rep, observed_at=NOW - timedelta(seconds=PREFLIGHT_TTL_SECONDS + 1))
     aged = preflight_freshness(old, now=NOW)
@@ -150,7 +150,7 @@ def test_refusal_to_finding_mapping():
 # -- reader over transport (best-effort, never raises) --
 def test_reader_round_trip_and_loss_is_none():
     files = {"heartbeat.json": json.dumps(_hb()),
-             "progress.json": json.dumps({"progress": 0.25})}
+             "progress.json": json.dumps({"progress": 0.25, "observed_at": NOW.isoformat()})}
     reader = WorkerTelemetryReader(_StubTransport(files), workspace_root="/w",
                                    clock=lambda: NOW)
     hb = reader.read_heartbeat()

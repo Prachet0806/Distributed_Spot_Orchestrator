@@ -16,7 +16,6 @@ REQUIRED_CONFIG_KEYS = [
     "source_region",
     "instance_type",
     "ssh_key_name",
-    "target_region",
     "registry_backend",
     "dynamodb_table",
 ]
@@ -27,6 +26,8 @@ def _validate_config(result):
     missing = [k for k in REQUIRED_CONFIG_KEYS if not result.get(k)]
     if missing:
         raise SystemExit(f"Missing required config keys: {', '.join(missing)}")
+    if result.get("registry_backend") != "dynamo":
+        raise SystemExit("V2 requires registry_backend=dynamo")
     return result
 
 
@@ -76,37 +77,28 @@ def load_runtime_config(force_reload=False):
     
     # Env vars take precedence
     checkpoint_bucket = os.getenv("CHECKPOINT_BUCKET") or cfg.get("checkpoint_bucket")
+    checkpoint_kms_key_arn = os.getenv("CHECKPOINT_KMS_KEY_ARN") or cfg.get("checkpoint_kms_key_arn")
     source_region = os.getenv("SOURCE_REGION") or cfg.get("source_region")
     instance_type = os.getenv("INSTANCE_TYPE") or cfg.get("instance_type")
     ssh_key_name = os.getenv("SSH_KEY_NAME") or cfg.get("ssh_key_name")
-    target_region = os.getenv("TARGET_REGION") or cfg.get("target_region")
-    target_ami_id = os.getenv("TARGET_AMI_ID") or cfg.get("target_ami_id")
-    target_security_group_id = os.getenv("TARGET_SECURITY_GROUP_ID") or cfg.get("target_security_group_id")
+    ssh_private_key_path = os.getenv("SSH_PRIVATE_KEY_PATH") or cfg.get("ssh_private_key_path")
+    ssh_known_hosts_path = os.getenv("SSH_KNOWN_HOSTS_PATH") or cfg.get("ssh_known_hosts_path")
     max_spot_price = os.getenv("MAX_SPOT_PRICE") or cfg.get("max_spot_price")
     registry_backend = os.getenv("REGISTRY_BACKEND") or cfg.get("registry_backend")
     dynamodb_table = os.getenv("DYNAMO_TABLE") or cfg.get("dynamodb_table")
     dynamodb_region = os.getenv("DYNAMO_REGION") or cfg.get("dynamodb_region") or source_region
-    optimization_mode = os.getenv("OPTIMIZATION_MODE") or cfg.get("optimization_mode")
-    auto_provision = os.getenv("AUTO_PROVISION")
-    if auto_provision is None:
-        auto_provision = cfg.get("auto_provision")
-    else:
-        auto_provision = str(auto_provision).lower() in ("1", "true", "yes")
-
     result = {
         "checkpoint_bucket": checkpoint_bucket,
+        "checkpoint_kms_key_arn": checkpoint_kms_key_arn,
         "source_region": source_region,
         "instance_type": instance_type,
         "ssh_key_name": ssh_key_name,
-        "target_region": target_region,
-        "target_ami_id": target_ami_id,
-        "target_security_group_id": target_security_group_id,
+        "ssh_private_key_path": ssh_private_key_path,
+        "ssh_known_hosts_path": ssh_known_hosts_path,
         "max_spot_price": max_spot_price,
         "registry_backend": registry_backend,
         "dynamodb_table": dynamodb_table,
         "dynamodb_region": dynamodb_region,
-        "auto_provision": auto_provision,
-        "optimization_mode": optimization_mode,
         "raw": cfg,
     }
     

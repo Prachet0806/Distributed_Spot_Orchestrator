@@ -1,5 +1,6 @@
 """Phase A tests: admission, spotctl shim, pool definitions, provisioning,
 telemetry-driven readiness (invariants 1-4, 8)."""
+import sys
 import json
 import tempfile
 from pathlib import Path
@@ -54,11 +55,11 @@ def test_admission_never_takes_pid_ip_ami():
 
 
 def test_admit_pending_row_json_backend():
-    from storage.job_registry import JobRegistry
+    from storage.memory_registry import MemoryRegistry
     with tempfile.TemporaryDirectory() as td:
         p = str(Path(td) / "reg.json")
         Path(p).write_text("{}")
-        reg = JobRegistry(p)
+        reg = MemoryRegistry()
         m = JobAdmissionManager()
         res = m.admit(_contract(), reg, job_id="j-pending")
         assert res.verdict == "ADMITTED"
@@ -73,13 +74,14 @@ def test_admit_pending_row_json_backend():
 def test_requirements_from_contract():
     req = _requirements_for_job({"workload_contract": _contract(cpu=8).to_dict()})
     assert req.min_cpu == 8 and req.min_memory_mb == 16384
-    legacy = _requirements_for_job({})
-    assert legacy.min_cpu == 1 and legacy.min_memory_mb == 1024
+    import pytest
+    with pytest.raises(ValueError, match="workload contract"):
+        _requirements_for_job({})
 
 
-def test_telemetry_capacity_missing_is_synthetic():
+def test_telemetry_capacity_missing_is_unknown():
     conf, artifact, synthetic = _telemetry_capacity_for_job({})
-    assert (conf, artifact, synthetic) == (0.8, True, True)
+    assert (conf, artifact, synthetic) == (0.0, False, False)
 
 
 def test_telemetry_stale_degrades_invariant4():
@@ -121,37 +123,39 @@ def test_definition_from_pool():
     assert validate_pool_definition(d, strict_aws=False) == []
 
 
-def test_provision_from_pool_falls_back():
+def test_aws_provisioning_rejects_incomplete_pool():
+    import pytest
     from orchestrator.provisioner import Provisioner
-    prov = Provisioner()  # no global config: emulated stub path
-    res = prov.provision_from_pool({"pool_id": "p", "region": "r",
-                                    "instance_type": "t"})
-    assert res.status == "running" and res.operation_id
+    with pytest.raises(ValueError, match="Invalid target pool"):
+        Provisioner(key_name="key").provision_from_pool(
+            {"pool_id": "p", "region": "r", "instance_type": "t"})
 
 
-def test_spotctl_run_status_history_cost_json():
+
+def test_spotctl_run_status_history_cost_v2(monkeypatch):
     from scripts import spotctl
-    with tempfile.TemporaryDirectory() as td:
-        jp = str(Path(td) / "reg.json")
-        Path(jp).write_text("{}")
-        base = ["--backend", "json", "--json-path", jp]
-        spotctl.main(base + ["run", "--name", "risk-sim",
-                             "--script", "./m.py", "--cpu", "4",
-                             "--memory", "16GiB", "--regions", "us-east-1"])
-        data = json.loads(Path(jp).read_text())
-        jid = next(iter(data))
-        assert data[jid]["state"] == "PENDING"
-        assert "public_ip" not in str(spotctl.main)  # shim takes no such flag
-        spotctl.main(base + ["status", "--name", jid])
-        spotctl.main(base + ["history", "--name", jid])
-        spotctl.main(base + ["cost", "--name", jid])
+    from storage.memory_registry import MemoryRegistry
+    from storage.history_store import HistoryStore
+    reg = MemoryRegistry()
+    monkeypatch.setattr(spotctl, "_registry", lambda args: reg)
+    monkeypatch.setattr(spotctl, "_history_store", lambda args: HistoryStore())
+    spotctl.main(["run", "--name", "risk-sim", "--job-id", "j1",
+                  "--script", "./m.py", "--cpu", "4", "--memory", "16GiB",
+                  "--regions", "us-east-1"])
+    row = reg.get("j1")
+    assert row["state"] == "PENDING" and row["pid"] is None
+    assert row["workload_contract"]["resources"]["cpu"] == 4
+    spotctl.main(["status", "--name", "j1"])
+    spotctl.main(["history", "--name", "j1"])
+    spotctl.main(["cost", "--name", "j1"])
+
 
 
 def test_spotctl_run_accepts_no_pid_ip_ami_flags():
     """Invariant 1+2 at the CLI surface: forbidden flags don't exist."""
     import subprocess
     out = subprocess.run(
-        ["python", "scripts/spotctl.py", "run", "--help"],
+        [sys.executable, "scripts/spotctl.py", "run", "--help"],
         capture_output=True, text=True, cwd=".")
     help_text = out.stdout.lower()
     assert "--public-ip" not in help_text
@@ -165,7 +169,7 @@ def test_warm_rescue_off_by_default_invariant8():
     assert "--warm-rescue" not in src or "default" in src.lower()
     import subprocess
     out = subprocess.run(
-        ["python", "-m", "orchestrator.main", "--help"],
+        [sys.executable, "-m", "orchestrator.main", "--help"],
         capture_output=True, text=True, cwd=".")
     assert "warm" not in out.stdout.lower()
 

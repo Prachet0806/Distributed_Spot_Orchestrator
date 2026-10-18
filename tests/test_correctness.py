@@ -1,4 +1,5 @@
 """Phase 4: validator L1-L4 verdicts + reconciliation lifecycle/gate/remediation."""
+from tests.support import emulated_validator
 from datetime import datetime
 
 import pytest
@@ -6,7 +7,7 @@ import pytest
 from orchestrator.validator import Validator, ValidationResult, ValidationLevel
 from orchestrator.reconciliation_manager import (
     ReconciliationManager, ReconciliationTrigger, MismatchType,
-    ReconciliationAction, ReconnectionAction, FindingStatus,
+    ReconciliationAction, FindingStatus,
 )
 
 
@@ -20,18 +21,18 @@ def _snaps():
 
 def test_valid_restore_passes_l1_l2_l3_and_v2_verdict():
     src, tgt = _snaps()
-    rep = Validator().validate("m1", "j1", 2, src, tgt, expected_epoch=2,
+    rep = emulated_validator().validate("m1", "j1", 2, src, tgt, expected_epoch=2,
                                checkpoint_lineage={"lineage_valid": True})
     assert rep.overall_result == ValidationResult.PASSED
     assert rep.epoch_match and rep.lineage_valid
     assert rep.to_v2_verdict() == ValidationResult.VALID.value
-    v2 = Validator().to_v2_report(rep)
+    v2 = emulated_validator().to_v2_report(rep)
     assert str(v2.result.value) == "VALID"
     assert v2.level_reached.value == "L3"
 
 
 def test_missing_snapshots_are_inconclusive_not_invalid():
-    rep = Validator().validate("m1", "j1", 1)
+    rep = emulated_validator().validate("m1", "j1", 1)
     assert rep.overall_result == ValidationResult.PARTIAL
     assert rep.to_v2_verdict() == ValidationResult.INCONCLUSIVE.value
 
@@ -39,14 +40,14 @@ def test_missing_snapshots_are_inconclusive_not_invalid():
 def test_tolerance_breach_is_invalid():
     src, tgt = _snaps()
     tgt["cpu_utilization_delta"] = 5.0
-    rep = Validator().validate("m1", "j1", 1, src, tgt)
+    rep = emulated_validator().validate("m1", "j1", 1, src, tgt)
     assert rep.overall_result == ValidationResult.FAILED
     assert rep.to_v2_verdict() == ValidationResult.INVALID.value
 
 
 def test_epoch_mismatch_fails_despite_healthy_process():
     src, tgt = _snaps()
-    rep = Validator().validate("m1", "j1", 3, src, tgt, expected_epoch=2)
+    rep = emulated_validator().validate("m1", "j1", 3, src, tgt, expected_epoch=2)
     assert rep.epoch_match is False
     assert rep.overall_result == ValidationResult.FAILED
     assert rep.to_v2_verdict() == ValidationResult.INVALID.value
@@ -54,23 +55,23 @@ def test_epoch_mismatch_fails_despite_healthy_process():
 
 def test_lineage_invalid_fails():
     src, tgt = _snaps()
-    rep = Validator().validate("m1", "j1", 1, src, tgt,
+    rep = emulated_validator().validate("m1", "j1", 1, src, tgt,
                                checkpoint_lineage={"lineage_valid": False})
     assert rep.lineage_valid is False
     assert rep.overall_result == ValidationResult.FAILED
 
 
 def test_strict_l4_opt_in_only():
-    snap = {"a": 1, "b": [1, 2]}
-    other = {"a": 1, "b": [1, 3]}
+    snap = {**_snaps()[0], "a": 1, "b": [1, 2]}
+    other = {**_snaps()[0], "a": 1, "b": [1, 3]}
     # Default: L4 not evaluated.
-    rep = Validator().validate("m1", "j1", 1, snap, dict(snap))
+    rep = emulated_validator().validate("m1", "j1", 1, snap, dict(snap))
     assert not [c for c in rep.checks if c.level == ValidationLevel.L4_STRICT]
     # Opt-in equal → pass; unequal → fail.
-    assert Validator().validate(
+    assert emulated_validator().validate(
         "m1", "j1", 1, snap, dict(snap),
         strict_determinism=True).overall_result == ValidationResult.PASSED
-    assert Validator().validate(
+    assert emulated_validator().validate(
         "m1", "j1", 1, snap, other,
         strict_determinism=True).overall_result == ValidationResult.FAILED
 
@@ -82,19 +83,19 @@ def test_versioned_tolerance_contract_shape():
                 "metrics": {"cpu_utilization_delta": {"tolerance_type": "RELATIVE", "value": 0.5},
                             "memory_utilization_delta": {"tolerance_type": "RELATIVE", "value": 0.5},
                             "progress_delta": {"tolerance_type": "RELATIVE", "value": 0.5}}}
-    rep = Validator().validate("m1", "j1", 1, src, tgt, tolerance_override=contract)
+    rep = emulated_validator().validate("m1", "j1", 1, src, tgt, tolerance_override=contract)
     assert rep.contract_version == "tol-7"
     assert rep.overall_result == ValidationResult.PASSED
 
 
 def test_failing_probe_fails_l1():
-    v = Validator(infra_probe=lambda **kw: {"passed": False, "target_reachable": False})
+    v = emulated_validator(infra_probe=lambda **kw: {"passed": False, "target_reachable": False})
     rep = v.validate("m1", "j1", 1, *_snaps())
     assert rep.overall_result == ValidationResult.FAILED
 
     def _boom(**kw):
         raise RuntimeError("probe exploded")
-    rep2 = Validator(app_probe=_boom).validate("m1", "j1", 1, *_snaps())
+    rep2 = emulated_validator(app_probe=_boom).validate("m1", "j1", 1, *_snaps())
     assert rep2.overall_result == ValidationResult.FAILED
 
 
@@ -138,11 +139,10 @@ def _job(job_id="j1", state="RUNNING", epoch=0, active=None, inst="i-1"):
             "active_migration_id": active, "instance_id": inst}
 
 
-def test_taxonomy_and_legacy_alias():
+def test_v2_taxonomy():
     assert MismatchType.SPLIT_BRAIN.value == "SPLIT_BRAIN"
     assert MismatchType.SOURCE_STILL_ALIVE_AFTER_FENCE.value
     assert MismatchType.DANGLING_MIGRATION_REFERENCE.value
-    assert ReconnectionAction is ReconciliationAction  # NameError source removed
 
 
 def test_finding_lifecycle_and_illegal_rejected():

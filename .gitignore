@@ -28,13 +28,12 @@ orchestrator.log
 .terraform/
 *.tfstate
 *.tfstate.*
-.terraform.lock.hcl
 terraform.tfvars
 *.tfvars.backup
 
 # AWS
-.aws/
-aws/
+./.aws/
+/.aws/
 awscliv2.zip
 
 # OS
@@ -47,3 +46,7 @@ storage/job_registry.json
 /tmp/
 ami-stage/
 
+
+.venv-linux/
+.local-lab/
+lab-results/

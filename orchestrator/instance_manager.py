@@ -16,7 +16,7 @@ def provision_instance(
     profile: str | None = None,
     timeout: int = 300,
     idempotency_token: str | None = None,
-    tags: dict | None = None,
+    tags: dict | None = None, iam_profile=None, subnet_id=None, user_data=None,
 ):
     """
     Provision a spot instance and return (instance_id, public_ip, public_dns).
@@ -81,7 +81,14 @@ def provision_instance(
             },
         },
         "ClientToken": idempotency_token,  # Idempotent provisioning
+        "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
     }
+    if user_data:
+        launch_spec["UserData"] = user_data
+    if iam_profile:
+        launch_spec["IamInstanceProfile"] = {"Arn": iam_profile} if iam_profile.startswith("arn:") else {"Name": iam_profile}
+    if subnet_id:
+        launch_spec["SubnetId"] = subnet_id
     if tag_spec:
         launch_spec["TagSpecifications"] = tag_spec
     if max_spot_price:

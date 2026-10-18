@@ -175,7 +175,7 @@ def test_recovery_cold_restart_when_allowed():
     assert d.replan_required is True
 
 
-def test_engine_emergency_shim_still_returns_policy_decision():
+def test_engine_emergency_uses_v2_recovery_strategy():
     eng = PolicyEngine()
     stay, cands = _analyses()
     d = eng.decide(MigrationRegime.EMERGENCY, stay, cands, _est(7200),

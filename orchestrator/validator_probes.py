@@ -1,5 +1,5 @@
 # orchestrator/validator_probes.py — production L1/L2 probes (Track C2).
-"""Transport-backed validator probes replacing the `stub-v1` pass-throughs.
+"""Transport-backed validator probes requiring explicit execution evidence.
 
 Both probes are pure over injected collaborators (no AWS calls) and work
 with any `WorkerTransport` (`EmulatedWorkerTransport` locally,
@@ -105,6 +105,15 @@ def make_app_probe(
         if not ctx or not ctx.get("target_host"):
             return {"passed": False, "inconclusive": True,
                     "error": "no-execution-context", "probe": PROBE_VERSION}
+        if ctx.get("target_contained"):
+            host, pid = ctx.get("target_host"), ctx.get("target_pid")
+            try:
+                result = transport_factory(host).run_command(f"ps -o stat= -p {int(pid)}", timeout=timeout)
+                stopped = result.get("returncode") == 0 and result.get("stdout", "").strip().startswith(("T", "t"))
+                return {"passed": stopped, "workload_contained": stopped, "probe": PROBE_VERSION,
+                        "inconclusive": not stopped}
+            except Exception as exc:
+                return {"passed": False, "inconclusive": True, "error": str(exc)}
         try:
             reader = WorkerTelemetryReader(
                 transport_factory(ctx["target_host"]),
