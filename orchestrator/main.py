@@ -1851,6 +1851,8 @@ def main():
         """Coordinator bound to real stores, transports, and fence hooks."""
         from orchestrator.criu_handlers import (
             make_dump_handler_for,
+            make_dump_status_provider_for,
+            make_persist_status_provider_for,
             make_restore_handler_for,
             make_restore_status_provider_for,
         )
@@ -1865,14 +1867,31 @@ def main():
                 job = {}
             return job.get("public_ip"), job.get("pid")
 
+        _dump_status = make_dump_status_provider_for(_transport_for, operation_store)
+        _persist_status = make_persist_status_provider_for(
+            s3, checkpoint_store, operation_store
+        )
+        _restore_status = make_restore_status_provider_for(
+            _transport_for, operation_store, plan_store
+        )
+
+        def _checkpoint_status(operation_id):
+            try:
+                step = operation_store.get(operation_id)["request"]["step_name"]
+            except (KeyError, TypeError):
+                return {"state": "UNKNOWN"}
+            return {
+                "checkpointing": _dump_status,
+                "persisting": _persist_status,
+                "restoring": _restore_status,
+            }.get(step, lambda _: {"state": "UNKNOWN"})(operation_id)
+
         checkpoint = CheckpointManager(
             storage=s3,
             dump_handler=make_dump_handler_for(_transport_for),
             restore_handler=make_restore_handler_for(_transport_for),
             checkpoint_store=checkpoint_store,
-            status_provider=make_restore_status_provider_for(
-                _transport_for, operation_store, plan_store
-            ),
+            status_provider=_checkpoint_status,
         )
         provisioner_cfg = provisioner
         import json
@@ -2067,26 +2086,30 @@ def main():
         _lease_store, owner=f"cpr-{_socket.gethostname()}-{os.getpid()}"
     )
     _coordinator = _wired_coordinator()
-    _status_probe_targets = (
-        operation_store,
-        _coordinator.provisioner,
-        _coordinator.checkpoint_manager,
-        _coordinator.transfer_manager,
-    )
-
     def _resolve_operation_status(op_id):
-        for _ex in _status_probe_targets:
-            _probe = getattr(_ex, "get_operation_status", None)
-            if not callable(_probe):
-                continue
-            try:
-                _rep = _probe(op_id)
-            except Exception:
-                continue
-            _outcome, _, _ = MigrationCoordinator._probe_outcome(_rep)
-            if _outcome != "UNKNOWN":
-                return _outcome
-        return "UNKNOWN"
+        try:
+            operation = operation_store.get(op_id)
+            step = operation["request"]["step_name"]
+            if operation["state"] in {"SUCCEEDED", "FAILED"}:
+                return operation["state"]
+            if step in {"checkpointing", "persisting", "restoring"}:
+                report = _coordinator.checkpoint_manager.get_operation_status(op_id)
+            elif step == "provisioning":
+                report = _coordinator.provisioner.get_operation_status(op_id)
+            elif step == "transferring":
+                plan = plan_store.get_plan(operation["request"]["plan_id"])
+                context = plan.get("execution_context") or {}
+                report = _coordinator.checkpoint_data_path.get_operation_status(
+                    op_id,
+                    checkpoint_id=context.get("checkpoint_id"),
+                    host=context.get("target_host"),
+                )
+            else:
+                return "UNKNOWN"
+            return MigrationCoordinator._probe_outcome(report)[0]
+        except Exception as exc:
+            log.warning("operation status unresolved for %s: %s", op_id, exc)
+            return "UNKNOWN"
 
     _boot_report = (
         _bootstrap_mod.bootstrap_recovery(

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import shlex
 import tempfile
 import time
@@ -175,35 +176,63 @@ class CheckpointDataPath:
         self.checkpoint_store, self.workspace = checkpoint_store, workspace
 
     def download_to_worker(self, checkpoint_id, host, operation_id=None):
+        if not operation_id or not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", operation_id):
+            raise ValueError("target transfer requires a safe durable operation ID")
         doc = self.checkpoint_store.get(checkpoint_id)
+        transport = self.transport_for(host)
+        current = self._control(
+            transport, "status", checkpoint_id, operation_id, doc["checksum"]
+        )
+        if current.get("state") == "SUCCEEDED":
+            return current["result"] | {"checkpoint_id": checkpoint_id}
+        prepared = self._control(
+            transport, "prepare", checkpoint_id, operation_id, doc["checksum"]
+        )
+        if prepared.get("state") == "SUCCEEDED":
+            return prepared["result"] | {"checkpoint_id": checkpoint_id}
         with tempfile.TemporaryDirectory(prefix="checkpoint-stage-") as temp:
             local = Path(temp) / "images"
             manifest = self.storage.download(
                 checkpoint_id, dst=str(local), expected_checksum=doc["checksum"]
             )
-            transport = self.transport_for(host)
             parent = self.workspace + "/checkpoints"
-            result = transport.run_command(
-                f"mkdir -p {shlex.quote(parent)}", timeout=30
-            )
-            if result["returncode"] != 0:
-                raise RuntimeError("target checkpoint staging failed")
-            transport.send_directory(local, parent + "/" + checkpoint_id)
+            staging = parent + f"/.{checkpoint_id}.{operation_id}.staging"
+            transport.send_directory(local, staging)
             manifest_file = Path(temp) / "manifest.json"
             manifest_file.write_text(json.dumps(manifest))
-            remote_manifest = parent + "/" + checkpoint_id + "/manifest.json"
+            remote_manifest = staging + "/manifest.json"
             transport.send_file(manifest_file, remote_manifest)
-            check = transport.run_command(
-                f"cd {shlex.quote(self.workspace)} && python3 -I "
-                f"/opt/spot-worker-control/control_entry.py verify-artifact "
-                f"--directory {shlex.quote(parent + '/' + checkpoint_id)} --manifest {shlex.quote(remote_manifest)} "
-                f"--operation-id {shlex.quote(operation_id or checkpoint_id)}",
-                timeout=60,
+            committed = self._control(
+                transport, "commit", checkpoint_id, operation_id, doc["checksum"]
             )
-            if check["returncode"] != 0:
-                raise RuntimeError("target artifact integrity verification failed")
-        return {
-            "checkpoint_id": checkpoint_id,
-            "bytes_transferred": doc["size_bytes"],
-            "status": "COMPLETED",
-        }
+        if committed.get("state") != "SUCCEEDED":
+            raise RuntimeError("target checkpoint transfer was not committed")
+        return committed["result"] | {"checkpoint_id": checkpoint_id}
+
+    def get_operation_status(self, operation_id, *, checkpoint_id=None, host=None):
+        if not checkpoint_id or not host:
+            return {"operation_id": operation_id, "state": "UNKNOWN"}
+        try:
+            doc = self.checkpoint_store.get(checkpoint_id)
+            return self._control(
+                self.transport_for(host),
+                "status",
+                checkpoint_id,
+                operation_id,
+                doc["checksum"],
+            )
+        except Exception:
+            return {"operation_id": operation_id, "state": "UNKNOWN"}
+
+    def _control(self, transport, action, checkpoint_id, operation_id, checksum):
+        command = (
+            "python3 -I /opt/spot-worker-control/control_entry.py verify-artifact "
+            f"{action} --workspace {shlex.quote(self.workspace)} "
+            f"--checkpoint-id {shlex.quote(checkpoint_id)} "
+            f"--operation-id {shlex.quote(operation_id)} "
+            f"--checksum {shlex.quote(checksum)}"
+        )
+        response = transport.run_command(command, timeout=60)
+        if response["returncode"] != 0:
+            raise RuntimeError("target checkpoint transfer control failed")
+        return json.loads(response["stdout"])

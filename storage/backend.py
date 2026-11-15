@@ -76,6 +76,28 @@ class Documents:
                     return decode(rows)
                 kwargs["ExclusiveStartKey"] = cursor
 
+    def query_index(self, index_name, attribute, value):
+        """Read one partition of a GSI; never fall back to a table scan."""
+        with self.lock:
+            if self.table is None:
+                return decode(
+                    [row for row in self.local.values() if row.get(attribute) == value]
+                )
+            from boto3.dynamodb.conditions import Key
+
+            rows = []
+            kwargs = {
+                "IndexName": index_name,
+                "KeyConditionExpression": Key(attribute).eq(value),
+            }
+            while True:
+                page = self.table.query(**kwargs)
+                rows.extend(page.get("Items", []))
+                cursor = page.get("LastEvaluatedKey")
+                if not cursor:
+                    return decode(rows)
+                kwargs["ExclusiveStartKey"] = cursor
+
     def put(self, doc, *, create=False, expected_version=None):
         identity = doc[self.key]
         with self.lock:

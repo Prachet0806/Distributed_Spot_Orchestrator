@@ -51,20 +51,28 @@ class CheckpointStore:
     def get(self, checkpoint_id: str) -> dict:
         return self._docs.get(checkpoint_id)
 
-    def update(self, checkpoint_id: str, **patch) -> dict:
-        with self._docs.lock:
+    def _mutate(self, checkpoint_id: str, change) -> dict:
+        for _ in range(10):
             doc = self.get(checkpoint_id)
-            if {
-                "checkpoint_id",
-                "lineage_id",
-                "execution_epoch",
-                "version",
-            } & patch.keys():
-                raise ValueError("checkpoint identity is immutable")
             version = doc.get("version", 0)
-            doc.update(deepcopy(patch))
+            change(doc)
             doc["version"] = version + 1
-            return self._docs.put(doc, expected_version=version)
+            try:
+                return self._docs.put(doc, expected_version=version)
+            except Exception as exc:
+                if not conditional_failure(exc) and str(exc) != "concurrent record update":
+                    raise
+        raise RuntimeError("checkpoint concurrent update retry limit exceeded")
+
+    def update(self, checkpoint_id: str, **patch) -> dict:
+        if {
+            "checkpoint_id",
+            "lineage_id",
+            "execution_epoch",
+            "version",
+        } & patch.keys():
+            raise ValueError("checkpoint identity is immutable")
+        return self._mutate(checkpoint_id, lambda doc: doc.update(deepcopy(patch)))
 
     def any_durable(self, lineage_id: str) -> bool:
         """True when any DURABLE/VALIDATED checkpoint exists for a lineage."""
@@ -80,7 +88,7 @@ class CheckpointStore:
         try:
             cands = [
                 d
-                for d in self._docs.all()
+                for d in self._docs.query_index("LineageIndex", "lineage_id", lineage_id)
                 if d.get("lineage_id") == lineage_id
                 and d.get("durability") in ("DURABLE", "VALIDATED")
             ]
@@ -92,25 +100,54 @@ class CheckpointStore:
         return deepcopy(cands[-1])
 
     def set_durability(self, checkpoint_id: str, to_state: str) -> dict:
-        doc = self.get(checkpoint_id)
-        cur = doc.get("durability", "LOCAL")
-        if _DURABILITY_ORDER.get(to_state, -1) < _DURABILITY_ORDER.get(cur, 0):
-            raise RuntimeError(f"durability is monotonic: {cur} -> {to_state} refused")
         if to_state not in _DURABILITY_ORDER:
             raise ValueError(f"unknown durability {to_state}")
-        doc["durability"] = to_state
-        return self.update(checkpoint_id, durability=to_state)
+        def change(doc):
+            cur = doc.get("durability", "LOCAL")
+            if _DURABILITY_ORDER[to_state] < _DURABILITY_ORDER.get(cur, 0):
+                raise RuntimeError(f"durability is monotonic: {cur} -> {to_state} refused")
+            doc["durability"] = to_state
+        return self._mutate(checkpoint_id, change)
+
+    def publish_durable(
+        self, checkpoint_id: str, *, checksum: str, size_bytes: int,
+        artifact_location: str,
+    ) -> dict:
+        """Commit artifact identity and durability in one versioned write."""
+        if not checksum or not artifact_location or int(size_bytes) < 0:
+            raise ValueError("durable checkpoint requires artifact metadata")
+
+        def change(doc):
+            if doc.get("durability") in {"DURABLE", "VALIDATED"} and doc.get(
+                "checksum"
+            ) != checksum:
+                raise RuntimeError("durable checkpoint artifact identity conflict")
+            doc.update(
+                durability=(
+                    "VALIDATED" if doc.get("durability") == "VALIDATED" else "DURABLE"
+                ),
+                checksum=checksum,
+                size_bytes=int(size_bytes),
+                artifact_location=artifact_location,
+                integrity_verified=True,
+            )
+
+        return self._mutate(checkpoint_id, change)
 
     def lock(self, checkpoint_id: str, migration_id: str) -> dict:
-        doc = self.get(checkpoint_id)
-        if migration_id not in doc.get("locks", []):
-            doc["locks"].append(migration_id)
-        return self.update(checkpoint_id, locks=doc["locks"])
+        def change(doc):
+            locks = doc.setdefault("locks", [])
+            if migration_id not in locks:
+                locks.append(migration_id)
+        return self._mutate(checkpoint_id, change)
 
     def unlock(self, checkpoint_id: str, migration_id: str) -> dict:
-        doc = self.get(checkpoint_id)
-        doc["locks"] = [m for m in doc.get("locks", []) if m != migration_id]
-        return self.update(checkpoint_id, locks=doc["locks"])
+        return self._mutate(
+            checkpoint_id,
+            lambda doc: doc.update(
+                locks=[m for m in doc.get("locks", []) if m != migration_id]
+            ),
+        )
 
     def gc_candidates(
         self,

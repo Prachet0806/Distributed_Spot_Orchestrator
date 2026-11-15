@@ -560,6 +560,18 @@ def test_transfer_triple_execute_single_upload():
     assert mgr.storage.downloaded == ["job-1"]
 
 
+def test_transfer_reports_manifest_archive_bytes():
+    class MeasuredStorage(_Storage):
+        def manifest(self, job_id):
+            return {
+                "artifact": {"key": f"{job_id}.tar.gz", "size_bytes": 8192}
+            }
+
+    manager = TransferManager(storage=MeasuredStorage())
+    assert manager.upload("job-1").bytes_transferred == 8192
+    assert manager.download("job-1").bytes_transferred == 8192
+
+
 def test_persist_durable_is_noop_replay():
     """I7 executor-side: re-persist of DURABLE uploads bytes once."""
     mgr = CheckpointManager(storage=_Storage(), dump_handler=_dump)

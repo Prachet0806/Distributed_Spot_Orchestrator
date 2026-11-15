@@ -18,6 +18,33 @@ WRAPPER_PATH = "/opt/spot-worker-control/checkpoint/criu_wrapper.sh"
 logger = logging.getLogger(__name__)
 
 
+def _collect_dump(transport, job_id, checkpoint_id, images_dir, started):
+    local_root = Path(tempfile.mkdtemp(prefix="checkpoint-images-"))
+    local = local_root / "images"
+    transport.fetch_directory(images_dir, str(local))
+    import hashlib
+
+    digest = hashlib.sha256()
+    size = 0
+    for image in sorted(local.rglob("*")):
+        if image.is_file():
+            data = image.read_bytes()
+            digest.update(str(image.relative_to(local)).encode())
+            digest.update(data)
+            size += len(data)
+    return CheckpointResult(
+        checkpoint_id=checkpoint_id,
+        size_bytes=size,
+        duration_seconds=time.monotonic() - started,
+        digest=digest.hexdigest(),
+        status="LOCAL",
+        job_id=job_id,
+        lineage_id=job_id,
+        local_path=str(local),
+        snapshot=_checkpoint_snapshot(local),
+    )
+
+
 def make_dump_handler(
     transport,
     wrapper_path: str = WRAPPER_PATH,
@@ -36,7 +63,9 @@ def make_dump_handler(
         try:
             res = transport.run_command(cmd, timeout=timeout)
         except Exception as exc:
-            raise RuntimeError(f"dump transport failed for {job_id}: {exc}")
+            raise ConnectionError(
+                f"dump transport outcome uncertain for {job_id}"
+            ) from exc
         rc = int(res.get("returncode", 1))
         if rc == 2:
             raise TimeoutError(f"dump timed out for {job_id}: {res.get('stderr', '')}")
@@ -48,30 +77,7 @@ def make_dump_handler(
             raise RuntimeError(
                 f"CRIU_DUMP_FAILED for {job_id}: {res.get('stderr', '')}"
             )
-        local_root = Path(tempfile.mkdtemp(prefix="checkpoint-images-"))
-        local = local_root / "images"
-        transport.fetch_directory(images_dir, str(local))
-        import hashlib
-
-        digest = hashlib.sha256()
-        size = 0
-        for image in sorted(local.rglob("*")):
-            if image.is_file():
-                data = image.read_bytes()
-                digest.update(str(image.relative_to(local)).encode())
-                digest.update(data)
-                size += len(data)
-        return CheckpointResult(
-            checkpoint_id=checkpoint_id,
-            size_bytes=size,
-            duration_seconds=time.monotonic() - started,
-            digest=digest.hexdigest(),
-            status="LOCAL",
-            job_id=job_id,
-            lineage_id=job_id,
-            local_path=str(local),
-            snapshot=_checkpoint_snapshot(local),
-        )
+        return _collect_dump(transport, job_id, checkpoint_id, images_dir, started)
 
     return _dump
 
@@ -274,11 +280,97 @@ def make_restore_status_provider_for(
             response = transport_factory(host).run_command(command, timeout=30)
             if response["returncode"] != 0:
                 return {"state": "UNKNOWN"}
-            return json.loads(response["stdout"])
+            receipt = json.loads(response["stdout"])
+            if receipt.get("state") == "SUCCEEDED":
+                result = receipt.get("result") or {}
+                receipt["result"] = RestoreResult(
+                    checkpoint_id=checkpoint_id,
+                    success=True,
+                    duration_seconds=0.0,
+                    process_id=result.get("process_id"),
+                    process_start=result.get("process_start", ""),
+                    contained=bool(result.get("contained")),
+                )
+            return receipt
         except Exception as exc:
             logger.warning(
                 "restore status probe uncertain for %s: %s", operation_id, exc
             )
+            return {"state": "UNKNOWN"}
+
+    return _status
+
+
+def make_dump_status_provider_for(
+    transport_factory, operation_store, workspace_root="/opt/job_workspace"
+):
+    """A root-created completion marker binds a dump to its operation ID."""
+
+    def _status(operation_id):
+        try:
+            operation = operation_store.get(operation_id)
+            request = operation["request"]
+            if request.get("step_name") != "checkpointing":
+                return {"state": "UNKNOWN"}
+            host = request.get("source_host")
+            if not host:
+                return {"state": "UNKNOWN"}
+            checkpoint_id = "chk-" + operation_id
+            images_dir = f"{workspace_root}/checkpoints/{checkpoint_id}"
+            transport = transport_factory(host)
+            response = transport.run_command(
+                f"sudo -n test -f {shlex.quote(images_dir + '/dump.complete')}",
+                timeout=30,
+            )
+            if response["returncode"] != 0:
+                return {"state": "UNKNOWN"}
+            result = _collect_dump(
+                transport,
+                request["job_id"],
+                checkpoint_id,
+                images_dir,
+                time.monotonic(),
+            )
+            return {"state": "SUCCEEDED", "result": result}
+        except Exception as exc:
+            logger.warning("dump status uncertain for %s: %s", operation_id, exc)
+            return {"state": "UNKNOWN"}
+
+    return _status
+
+
+def make_persist_status_provider_for(storage, checkpoint_store, operation_store):
+    """Resolve manifest-last S3 publication without repeating the upload."""
+
+    def _status(operation_id):
+        try:
+            operation = operation_store.get(operation_id)
+            request = operation["request"]
+            if request.get("step_name") != "persisting":
+                return {"state": "UNKNOWN"}
+            # The checkpoint ID comes from the preceding dump operation,
+            # which is keyed by plan ID and has its own durable journal.
+            dump = operation_store._docs.get(f"{request['plan_id']}:checkpointing")
+            checkpoint_id = "chk-" + dump["operation_id"]
+            doc = checkpoint_store.get(checkpoint_id)
+            manifest = storage.manifest(checkpoint_id)
+            artifact = manifest["artifact"]
+            if doc.get("checksum") not in {artifact["sha256"], ""} and doc.get(
+                "durability"
+            ) in {"DURABLE", "VALIDATED"}:
+                return {"state": "UNKNOWN"}
+            checkpoint_store.publish_durable(
+                checkpoint_id,
+                checksum=artifact["sha256"],
+                size_bytes=int(artifact["size_bytes"]),
+                artifact_location=f"s3://{storage.bucket}/{artifact['key']}",
+            )
+            return {
+                "state": "SUCCEEDED",
+                "result": {"checkpoint_id": checkpoint_id, "status": "DURABLE"},
+            }
+        except Exception as exc:
+            logger.warning("persist status uncertain for %s: %s", operation_id, exc)
             return {"state": "UNKNOWN"}
 
     return _status

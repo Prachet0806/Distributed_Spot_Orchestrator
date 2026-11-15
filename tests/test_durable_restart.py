@@ -34,10 +34,29 @@ def resource(monkeypatch):
             "spot_arbitrage_control_plane_lease": "lease_id",
         }
         for name, key in tables.items():
+            secondary = (
+                ("lineage_id", "LineageIndex")
+                if name == "spot_arbitrage_checkpoints" else
+                ("operation_id", "OperationIdIndex")
+                if name == "spot_arbitrage_operations" else None
+            )
+            if name in {"spot_arbitrage_migration_history", "spot_arbitrage_audit"}:
+                secondary = ("job_id", "JobIndex")
+            definitions = [{"AttributeName": key, "AttributeType": "S"}]
+            indexes = []
+            if secondary:
+                attribute, index_name = secondary
+                definitions.append({"AttributeName": attribute, "AttributeType": "S"})
+                indexes.append({
+                    "IndexName": index_name,
+                    "KeySchema": [{"AttributeName": attribute, "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                })
             ddb.create_table(
                 TableName=name,
                 KeySchema=[{"AttributeName": key, "KeyType": "HASH"}],
-                AttributeDefinitions=[{"AttributeName": key, "AttributeType": "S"}],
+                AttributeDefinitions=definitions,
+                **({"GlobalSecondaryIndexes": indexes} if indexes else {}),
                 BillingMode="PAY_PER_REQUEST",
             )
         yield ddb
@@ -82,6 +101,27 @@ def test_checkpoint_restart_metadata_and_locks(resource):
     assert a.get("c")["locks"] == []
 
 
+def test_checkpoint_locks_retry_interleaved_store_writers(resource):
+    a = CheckpointStore(dynamodb_resource=resource)
+    b = CheckpointStore(dynamodb_resource=resource)
+    a.put({"checkpoint_id": "race", "lineage_id": "j", "execution_epoch": 0})
+    original_put = b._docs.put
+    interrupted = False
+
+    def interleaved_put(doc, **kwargs):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            a.lock("race", "migration-a")
+        return original_put(doc, **kwargs)
+
+    b._docs.put = interleaved_put
+    b.lock("race", "migration-b")
+    assert set(a.get("race")["locks"]) == {"migration-a", "migration-b"}
+    b.unlock("race", "migration-a")
+    assert a.get("race")["locks"] == ["migration-b"]
+
+
 def test_history_audit_config_and_pool_restart(resource):
     HistoryStore(dynamodb_resource=resource).insert(
         {"migration_id": "m", "job_id": "j", "estimated_cost": 1.5}
@@ -109,6 +149,8 @@ def test_operation_restart_and_request_binding(resource):
     a = OperationStore(dynamodb_resource=resource)
     issued = a.begin("p:provision", {"target": "pool"})
     b = OperationStore(dynamodb_resource=resource)
+    b._docs.all = Mock(side_effect=AssertionError("operation lookup scanned table"))
+    assert b.get(issued["operation_id"])["operation_key"] == "p:provision"
     assert (
         b.begin("p:provision", {"target": "pool"})["operation_id"]
         == issued["operation_id"]

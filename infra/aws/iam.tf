@@ -1,5 +1,21 @@
 # Least-privilege IAM policies for Spot Arbitrage Cluster
 
+locals {
+  worker_regions = length(var.allowed_worker_regions) > 0 ? var.allowed_worker_regions : [var.target_region]
+  launch_dependencies = flatten([
+    for region in local.worker_regions : [
+      "arn:aws:ec2:${region}::image/*",
+      "arn:aws:ec2:${region}:*:subnet/*",
+      "arn:aws:ec2:${region}:*:network-interface/*",
+      "arn:aws:ec2:${region}:*:security-group/*",
+      "arn:aws:ec2:${region}:*:key-pair/*",
+      "arn:aws:ec2:${region}:*:volume/*",
+      "arn:aws:ec2:${region}:*:spot-instances-request/*"
+    ]
+  ])
+  worker_instances = [for region in local.worker_regions : "arn:aws:ec2:${region}:*:instance/*"]
+}
+
 # Worker Role - Minimal permissions for checkpoint operations only
 resource "aws_iam_role" "spot_worker_role" {
   name = "spot-arbitrage-worker-role"
@@ -42,7 +58,7 @@ resource "aws_iam_policy" "worker_s3_checkpoint_policy" {
       {
         Sid      = "CheckpointObjectRead"
         Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:GetObjectVersion", "s3:DeleteObject"]
+        Action   = ["s3:GetObject", "s3:GetObjectVersion"]
         Resource = "${aws_s3_bucket.checkpoints.arn}/*"
       },
       {
@@ -155,22 +171,42 @@ resource "aws_iam_policy" "orchestrator_ec2_policy" {
         Resource = "*"
       },
       {
-        Sid    = "SpotInstanceLaunch"
-        Effect = "Allow"
-        Action = [
-          "ec2:RunInstances",
-          "ec2:CreateTags"
-        ]
-        Resource = "*"
+        Sid      = "SpotInstanceLaunchDependencies"
+        Effect   = "Allow"
+        Action   = ["ec2:RunInstances"]
+        Resource = local.launch_dependencies
       },
       {
-        Sid    = "WorkerDescribeAndTerminate"
-        Effect = "Allow"
-        Action = [
-          "ec2:TerminateInstances",
-          "ec2:DescribeInstances",
-          "ec2:DescribeInstanceStatus"
-        ]
+        Sid      = "SpotInstanceLaunchManagedInstance"
+        Effect   = "Allow"
+        Action   = ["ec2:RunInstances"]
+        Resource = local.worker_instances
+        Condition = {
+          StringEquals = { "aws:RequestTag/managed_by" = "spot-arbitrage-v2" }
+        }
+      },
+      {
+        Sid      = "TagManagedWorkerAtLaunch"
+        Effect   = "Allow"
+        Action   = ["ec2:CreateTags"]
+        Resource = local.worker_instances
+        Condition = {
+          StringEquals = { "ec2:CreateAction" = "RunInstances" }
+        }
+      },
+      {
+        Sid      = "TerminateManagedWorkers"
+        Effect   = "Allow"
+        Action   = ["ec2:TerminateInstances"]
+        Resource = local.worker_instances
+        Condition = {
+          StringEquals = { "ec2:ResourceTag/managed_by" = "spot-arbitrage-v2" }
+        }
+      },
+      {
+        Sid      = "WorkerDescribe"
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
         Resource = "*"
       },
       {
@@ -248,7 +284,8 @@ resource "aws_iam_policy" "orchestrator_dynamodb_policy" {
           "${aws_dynamodb_table.job_registry.arn}/index/*",
           "${aws_dynamodb_table.checkpoints.arn}/index/*",
           "${aws_dynamodb_table.audit.arn}/index/*",
-          "${aws_dynamodb_table.migration_history.arn}/index/*"
+          "${aws_dynamodb_table.migration_history.arn}/index/*",
+          "${aws_dynamodb_table.operations.arn}/index/*"
         ]
       }
     ]

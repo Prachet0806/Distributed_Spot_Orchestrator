@@ -1,6 +1,7 @@
 import concurrent.futures
 import logging
 import time
+from threading import RLock
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -201,6 +202,7 @@ class MigrationCoordinator:
         self._execution_state: MigrationExecutionState | None = None
         self._state_machine = self._build_state_machine()
         self._start_mono = 0.0
+        self._operation_lock = RLock()
 
     def _build_state_machine(self) -> dict:
         return {
@@ -459,14 +461,12 @@ class MigrationCoordinator:
         def _checkpoint_branch():
             try:
                 self._execute_checkpointing()
-                self._transition_to(MigrationState.PERSISTING, on_state_change)
                 self._execute_persisting()
             except Exception as e:  # noqa: BLE001 — collected for join
                 branch_errors["checkpoint"] = e
 
         def _provision_branch():
             try:
-                self._transition_to(MigrationState.PROVISIONING, on_state_change)
                 self._execute_provisioning()
             except Exception as e:  # noqa: BLE001 — collected for join
                 branch_errors["provision"] = e
@@ -483,6 +483,12 @@ class MigrationCoordinator:
             finally:
                 first = next(iter(branch_errors.values()))
                 raise MigrationFailed(f"Emergency preparation branch failed: {first}")
+        # External work runs concurrently, but lifecycle state and callbacks
+        # have one owner. Persist the joined context before transfer.
+        self._transition_to(MigrationState.PERSISTING, on_state_change)
+        self._transition_to(MigrationState.PROVISIONING, on_state_change)
+        if self.plan_store is not None:
+            self._save_execution_context()
 
     def _execute_checkpointing(self):
         state = self._execution_state
@@ -639,7 +645,17 @@ class MigrationCoordinator:
         op_id = self._start_operation("transferring")
         try:
             transfer = self.transfer_manager
-            probe = getattr(transfer, "get_operation_status", None)
+            probe = (
+                (
+                    lambda operation_id: self.checkpoint_data_path.get_operation_status(
+                        operation_id,
+                        checkpoint_id=state.checkpoint_id,
+                        host=state.target_host,
+                    )
+                )
+                if self.checkpoint_data_path is not None
+                else getattr(transfer, "get_operation_status", None)
+            )
 
             result = self._run_operation_with_retry(
                 step_type="TRANSFER",
@@ -1230,6 +1246,12 @@ class MigrationCoordinator:
                     f"operation {op_id or '?'} timed out after {eff:.0f}s"
                 ) from e
             return self._resolve_unknown(probe, op_id, eff, e)
+        except (ConnectionError, OSError) as e:
+            if probe is None:
+                raise OperationUnknownError(
+                    f"operation {op_id or '?'} transport outcome uncertain"
+                ) from e
+            return self._resolve_unknown(probe, op_id, 0, e)
         finally:
             # Transport enforces command timeouts; a late result remains UNKNOWN.
             pool.shutdown(wait=False, cancel_futures=True)
@@ -1447,54 +1469,60 @@ class MigrationCoordinator:
                 raise OperationUnknownError(
                     f"{step_name} has an existing {journal['state']} operation; reconcile before retry"
                 )
-        self._execution_state.operations.append(
-            OperationRecord(
-                operation_id=op_id,
-                step_name=step_name,
-                started_at=datetime.utcnow(),
+        with self._operation_lock:
+            self._execution_state.operations.append(
+                OperationRecord(
+                    operation_id=op_id,
+                    step_name=step_name,
+                    started_at=datetime.utcnow(),
+                )
             )
-        )
         return op_id
 
     def _complete_operation(self, operation_id: str, result: Any):
         if self.operation_store is not None:
             self.operation_store.finish(operation_id, "SUCCEEDED", result=result)
-        for op in self._execution_state.operations:
-            if op.operation_id == operation_id:
-                op.completed_at = datetime.utcnow()
-                op.status = "SUCCEEDED"
-                op.result = result
-                break
-        if self.plan_store is not None:
-            state = self._execution_state
-            context = {
-                key: getattr(state, key)
-                for key in (
-                    "checkpoint_id",
-                    "target_instance_id",
-                    "target_host",
-                    "target_region",
-                    "target_pid",
-                    "target_process_start",
-                    "source_snapshot",
-                    "provisioned",
-                    "fencing_confirmed",
-                    "expected_epoch",
-                )
-            }
-            self.plan_store.save_execution_context(state.plan.plan_id, context)
+        with self._operation_lock:
+            for op in self._execution_state.operations:
+                if op.operation_id == operation_id:
+                    op.completed_at = datetime.utcnow()
+                    op.status = "SUCCEEDED"
+                    op.result = result
+                    break
+            if self.plan_store is not None:
+                self._save_execution_context()
+
+    def _save_execution_context(self):
+        state = self._execution_state
+        context = {
+            key: getattr(state, key)
+            for key in (
+                "checkpoint_id",
+                "target_instance_id",
+                "target_host",
+                "target_region",
+                "target_pid",
+                "target_process_start",
+                "source_snapshot",
+                "provisioned",
+                "fencing_confirmed",
+                "expected_epoch",
+            )
+        }
+        self.plan_store.save_execution_context(state.plan.plan_id, context)
 
     def _fail_operation(self, operation_id: str, error: str, unknown: bool = False):
         if self.operation_store is not None:
             self.operation_store.finish(
                 operation_id, "UNKNOWN" if unknown else "FAILED", error=error
             )
-        for op in self._execution_state.operations:
-            if op.operation_id == operation_id:
-                op.completed_at = datetime.utcnow()
-                op.status = "UNKNOWN" if unknown else "FAILED"
-                op.error = error
-                break
+        with self._operation_lock:
+            for op in self._execution_state.operations:
+                if op.operation_id == operation_id:
+                    op.completed_at = datetime.utcnow()
+                    op.status = "UNKNOWN" if unknown else "FAILED"
+                    op.error = error
+                    break
 
     # -- registry bridge --
     def _get_job(self, job_id: str) -> dict | None:

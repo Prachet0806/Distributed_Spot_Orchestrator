@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TransferResult:
     migration_id: str
-    bytes_transferred: int
+    bytes_transferred: int | None
     duration_seconds: float
     status: str
 
@@ -48,9 +48,15 @@ class TransferManager:
             if src is None
             else self.storage.upload(job_id, src=src)
         )
+        manifest_fn = getattr(self.storage, "manifest", None)
+        manifest = manifest_fn(job_id) if callable(manifest_fn) else None
+        if manifest is not None and manifest["artifact"]["key"] != key:
+            raise RuntimeError("uploaded artifact does not match its manifest")
         result = TransferResult(
             migration_id=job_id,
-            bytes_transferred=0,
+            bytes_transferred=(
+                int(manifest["artifact"]["size_bytes"]) if manifest else None
+            ),
             duration_seconds=time.monotonic() - started,
             status="COMPLETED",
         )
@@ -69,12 +75,17 @@ class TransferManager:
         self._require_storage()
         started = time.monotonic()
         if dst is None:
-            self.storage.download(job_id)
+            manifest = self.storage.download(job_id)
         else:
-            self.storage.download(job_id, dst=dst)
+            manifest = self.storage.download(job_id, dst=dst)
+        if manifest is None:
+            manifest_fn = getattr(self.storage, "manifest", None)
+            manifest = manifest_fn(job_id) if callable(manifest_fn) else None
         result = TransferResult(
             migration_id=job_id,
-            bytes_transferred=0,
+            bytes_transferred=(
+                int(manifest["artifact"]["size_bytes"]) if manifest else None
+            ),
             duration_seconds=time.monotonic() - started,
             status="COMPLETED",
         )

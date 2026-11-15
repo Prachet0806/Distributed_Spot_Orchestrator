@@ -110,15 +110,13 @@ def _ready():
 
 def test_first_tick_builds_pools():
     """Reproduces main.py per-job loop pool construction (Bug #1)."""
-    # main.py must expose these names (import guard against NameError).
+    # The pool types remain directly in main; capacity evidence is built in
+    # readiness_evidence after the loop was split into smaller modules.
     import orchestrator.main as main_mod
 
     for name in (
         "PoolRuntimeProfile",
         "PoolCapacityProfile",
-        "CapacityEvidence",
-        "CapacityStatus",
-        "EvidenceSource",
     ):
         assert hasattr(main_mod, name), f"main.py missing import: {name}"
 

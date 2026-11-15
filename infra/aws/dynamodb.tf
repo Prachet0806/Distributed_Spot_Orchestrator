@@ -210,6 +210,17 @@ resource "aws_dynamodb_table" "operations" {
     type = "S"
   }
 
+  attribute {
+    name = "operation_id"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "OperationIdIndex"
+    hash_key        = "operation_id"
+    projection_type = "ALL"
+  }
+
   point_in_time_recovery {
     enabled = true
   }

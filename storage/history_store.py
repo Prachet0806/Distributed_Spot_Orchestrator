@@ -53,7 +53,7 @@ class HistoryStore:
         return self._docs.get(migration_id)
 
     def list_by_job(self, job_id: str) -> list[dict]:
-        return [r for r in self._docs.all() if r.get("job_id") == job_id]
+        return self._docs.query_index("JobIndex", "job_id", job_id)
 
     def save(self, record) -> dict:
         """Upsert adapter for MigrationHistory (which calls storage.save).

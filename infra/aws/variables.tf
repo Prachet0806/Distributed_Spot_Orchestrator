@@ -18,7 +18,7 @@ variable "dynamodb_table_name" {
   description = "Name of the DynamoDB table for job registry"
   type        = string
   default     = "spot_arbitrage_registry"
-  
+
   validation {
     condition     = length(var.dynamodb_table_name) > 0
     error_message = "DynamoDB table name cannot be empty."
@@ -47,6 +47,12 @@ variable "target_region" {
   description = "AWS region for worker instances"
   type        = string
   default     = "us-east-1"
+}
+
+variable "allowed_worker_regions" {
+  description = "Regions in which the orchestrator may launch and terminate managed workers; empty means target_region only"
+  type        = list(string)
+  default     = []
 }
 
 variable "ami_id" {

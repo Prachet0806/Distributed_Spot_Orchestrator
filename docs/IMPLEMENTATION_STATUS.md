@@ -8,6 +8,32 @@ Invariant labels follow component-architecture §18 (IA-1, I1–I15); note
 Protocols I14 ("validation ≠ ownership") is a different invariant from
 §18 I14 ("audit-before-irreversible") used below.
 
+## V2 audit remediation snapshot (2026-11-15)
+
+The emergency checkpoint/persist and provision branches still run in parallel,
+while lifecycle transitions and callbacks now run on the coordinator thread.
+Checkpoint lock and durability mutations use bounded version-CAS retries.
+Checkpoint lineage and operation-ID lookups use DynamoDB GSIs; history by job
+uses its existing GSI. Target transfer uses operation-specific staging, file
+hash verification, an on-worker receipt, and atomic promotion. The coordinator
+probes the target transfer executor rather than the S3 transfer helper. Dump
+completion, S3 manifest publication, and restore journal status have separate
+resolvers. Transfer metrics use manifest archive size when available; an
+unmeasured test backend reports `None` instead of a false zero. IAM removes
+worker object deletion and scopes managed EC2 actions by configured regions,
+resource types, and managed-worker tags.
+
+These are code and local-test results only. Automatic arbitrary-phase replay
+remains disabled: `main.py` quarantines uncertain restart frontiers. Fencing,
+activation, the full lost-response matrix, native Linux CRIU restore,
+cross-region AWS IAM/KMS/EC2/S3 behavior, baked worker AMI, and the 20% overhead
+gate remain unqualified. No native Linux host or dedicated AWS development
+account was available for this remediation. Do not treat a green unit suite or
+Terraform validation as release qualification.
+The Windows local suite passed 403 tests with 3 skips; Terraform validated
+with existing DynamoDB schema deprecation warnings. The skipped tests and
+Windows run do not satisfy the native Linux or live AWS gates.
+
 ## Credential-free qualification snapshot (2026-10-18)
 
 The production iteration runs against injected Moto services. Separate Python
@@ -33,7 +59,7 @@ provider IAM, KMS, or economics result has been verified.
 |---|---|---|
 | 4-domain states, CAS sole path, version≠epoch | built | `storage/dynamo_registry.py` `transition()`, `storage/v2_transitions.py`, tests |
 | ULID `operation_id`, sole minter, reuse-on-retry | built | coordinator + provisioner replay test |
-| UNKNOWN → resolve, never blind retry | partial | timeout→UNKNOWN + probe resolution at every executor done (emulated, `tests/test_outcome_resolution.py`); live provider-status queries unwired |
+| UNKNOWN → resolve, never blind retry | partial | Distinct dump, S3 persistence, target-transfer, and restore probes are wired; fencing/activation and crash-phase replay remain unqualified |
 | Plan hash/TTL/pins/authorization | built | planner + kernel tests |
 | Step retry/backoff/priority (§10.8) | built | `orchestrator/step_retry.py` + coordinator wiring (op-ID reuse, UNKNOWN≠attempt, backoff consumes deadline, injection rejection, priority/criticality order); `tests/test_step_retry.py` (19 tests) |
 | Emergency deadline §24.1 (allowances, owner) | partial | formula + ingestion owner built (emulated): `orchestrator/interruption_ingestion.py` computes once from flag `detected_at`, `main.py` reuses it; remaining gap is the measured P95 allowance table (Track A6) |
@@ -41,14 +67,14 @@ provider IAM, KMS, or economics result has been verified.
 | Recovery vocabulary + recon gate | built | `decide_recovery()` + tests |
 | Validation L1–L4 + verdicts + epoch/lineage | built | validator + tests; L1/L2 **transport-backed probes** (`orchestrator/validator_probes.py`, `ps -p` + T1 freshness) wired in `main.py` via coordinator context sink; evidence-absence → INCONCLUSIVE (I7/I15); instance-id→IP resolution still live backlog |
 | Reconciliation taxonomy/lifecycle/gate | built | manager + tests; live drills scheduled |
-| Checkpoint durability/lineage/locks/GC | built | stores + S3 sha/manifest + tests |
+| Checkpoint durability/lineage/locks/GC | partial | stores + S3 sha/manifest + CAS retry and indexed lineage lookup tested locally; live concurrent DynamoDB and GC drills pending |
 | Fencing: pre-auth + epoch rotation + verified kill | built | coordinator + kernel tests; prod SSH wiring exists, controller trust scheduled (W1–W5) |
 | Audit-before-irreversible (§18 I14) | built | coordinator writes FENCE_STARTED pre-hooks (fail-closed), FENCE_CONFIRMED/COMPLETED/FAILED post-facto; `tests/test_audit_gate.py`; stores wired in `main.py` (Track B1) |
 | Telemetry contract (T1–T4) | partial | T1 emission (`job_runner` heartbeat/v1) + CPR intake/freshness library (`orchestrator/worker_telemetry.py`) + tests; T4 refusal emission (controller outbox) + filing (`file_refusal`) built emulated; live transport drill scheduled |
 | Worker-controller trust §12.6 (W1–W5) | partial | emulated controller (`worker/controller.py`: IMDS-env binding, epoch gate, op-ID dedup, T4 outbox, primitive-only) + CPR client (`orchestrator/worker_controller.py`: gated fence hooks, refusal filing), 21 tests; live cutover (AMI/IMDS/channel + `main.py` switch) scheduled |
 | Admission gate §3.3 | built | `orchestrator/admission.py` (contract checklist enforced, frozen `WorkloadContract`, idempotent resubmit); PENDING lifecycle + loop-owned provision/promote; `tests/test_spotctl_admission.py` |
 | Dispatcher/thread-pool/scaling target §13 | scheduled | interim single loop documented (§13.0) |
-| CPR lease + bootstrap §14.3 + fencing matrix §14.4 | partial | Durable lease and bootstrap report exist. `main.py` quarantines reported/unknown/orphan frontiers as `RECONCILIATION_REQUIRED`; restore has a root-owned issue journal/status receipt. Automatic crash-phase replay remains a gate. |
+| CPR lease + bootstrap §14.3 + fencing matrix §14.4 | partial | Durable lease and bootstrap report exist. `main.py` quarantines reported/unknown/orphan frontiers as `RECONCILIATION_REQUIRED`; restore has a root-owned issue journal/status receipt and transfer has a durable worker receipt. Automatic crash-phase replay remains a gate. |
 | Sole V2 engine §16 | built | V1 modules, routing, JSON CLI/registry, state table, executor aliases, and old-record adapters removed by owner request; strict V2 emulation retained |
 
 ## Runtime wiring (`main.py`)
@@ -69,7 +95,7 @@ provider IAM, KMS, or economics result has been verified.
 |---|---|
 | TF: tables, KMS, bucket, vars/outputs | built (code; **never applied**) | `terraform validate` passes locally with DynamoDB schema deprecation warnings. |
 | Baked AMI + digest pinning | partial | Immutable root-owned worker tree installer, self-check and script allowlist built; no AMI baked or live digest attested. Some emulation fixtures retain placeholder digests. |
-| IAM policies (§11) | partial | Store ARNs, checkpoint KMS access, worker lease read added; live policy simulation and apply are pending. |
+| IAM policies (§11) | partial | Worker S3 delete removed; worker EC2 launch/tag/terminate scoped to allowed regions and managed resources. Live policy simulation and apply are pending. |
 | Dashboards/alerts/playbooks | scheduled |
 | Billing proof, PITR/KMS drills, soak | scheduled |
 

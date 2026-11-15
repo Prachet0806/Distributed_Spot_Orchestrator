@@ -94,6 +94,15 @@ terraform apply
 ```
 
 This creates the DynamoDB tables, KMS key, and checkpoint bucket. Review `terraform plan` and confirm tables + GSIs ACTIVE before proceeding.
+Set `allowed_worker_regions` to every intended candidate region. The IAM policy
+limits worker launches, launch-time tags, and managed-worker termination to
+those regions. Terraform deploys the control-plane stores and an optional demo
+worker; it does not deploy an orchestrator host. Run the process on a dedicated
+host with the `orchestrator_profile` instance profile, or supply a dedicated
+AWS principal with equivalent permissions. A local AWS CLI profile does not
+automatically assume the Terraform-created EC2 role. Validate AMI, subnet,
+security group, key pair, S3/KMS, and DynamoDB access for each region pair
+before enabling migrations.
 
 ### 2. Configure pools and runtime
 

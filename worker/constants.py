@@ -4,6 +4,8 @@ Worker-side constants.
 Kept separate from orchestrator constants since worker runs independently.
 """
 
+from common_constants import READY_FLAG, SPOT_INTERRUPT_FLAG, WORKSPACE_ROOT
+
 # IMDS endpoints
 IMDS_BASE_URL = "http://169.254.169.254"
 IMDS_TOKEN_URL = f"{IMDS_BASE_URL}/latest/api/token"

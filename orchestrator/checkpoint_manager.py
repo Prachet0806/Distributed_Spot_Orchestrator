@@ -191,11 +191,18 @@ class CheckpointManager:
         )
 
     def get_operation_status(self, operation_id: str) -> dict:
-        return (
+        report = (
             self.status_provider(operation_id)
             if self.status_provider
             else {"operation_id": operation_id, "state": "UNKNOWN"}
         )
+        if not isinstance(report, dict):
+            return {"operation_id": operation_id, "state": "UNKNOWN"}
+        result = report.get("result")
+        if report.get("state") == "SUCCEEDED" and isinstance(result, CheckpointResult):
+            self._checkpoints[result.checkpoint_id] = result
+            self._record_store(result)
+        return report
 
     def _record_store(self, result: CheckpointResult, durability: str | None = None):
         if self.checkpoint_store is None:
@@ -218,13 +225,11 @@ class CheckpointManager:
             self.checkpoint_store.put(ref)
         except KeyError:
             if durability:
-                self.checkpoint_store.set_durability(result.checkpoint_id, durability)
-                self.checkpoint_store.update(
+                self.checkpoint_store.publish_durable(
                     result.checkpoint_id,
                     artifact_location=result.artifact_location,
                     checksum=result.digest,
                     size_bytes=result.size_bytes,
-                    integrity_verified=bool(result.digest),
                 )
         self.checkpoint_store.update(
             result.checkpoint_id, local_path=result.local_path, job_id=result.job_id
