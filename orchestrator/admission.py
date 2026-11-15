@@ -7,12 +7,12 @@ and creates a PENDING registry row. Worker provisioning (PA-8),
 telemetry PID/host discovery (PA-9) and RUNNING transition happen
 downstream — never as user inputs.
 """
+
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
-
+from dataclasses import asdict, dataclass
+from typing import Any
 
 CONTRACT_SCHEMA_VERSION = 1
 
@@ -36,16 +36,19 @@ class WorkloadContract:
     max_recovery_time_s: int = 100
     schema_version: int = CONTRACT_SCHEMA_VERSION
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["regions"] = list(self.regions)
         d["resources"] = {
-            "cpu": self.cpu, "memory_mb": self.memory_mb,
-            "gpu": self.gpu, "storage_gb": self.storage_gb,
+            "cpu": self.cpu,
+            "memory_mb": self.memory_mb,
+            "gpu": self.gpu,
+            "storage_gb": self.storage_gb,
         }
         d["runtime"] = {
             "artifact_digest": self.runtime_artifact_digest,
-            "python": self.python_version, "criu": self.criu_version,
+            "python": self.python_version,
+            "criu": self.criu_version,
             "kernel": self.kernel_version,
         }
         d["placement"] = {"regions": list(self.regions)}
@@ -53,7 +56,7 @@ class WorkloadContract:
         return d
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "WorkloadContract":
+    def from_dict(cls, d: dict[str, Any]) -> WorkloadContract:
         res = dict(d.get("resources", {}))
         rt = dict(d.get("runtime", {}))
         pl = dict(d.get("placement", {}))
@@ -67,14 +70,16 @@ class WorkloadContract:
             gpu=bool(res.get("gpu", d.get("gpu", False))),
             storage_gb=int(res.get("storage_gb", d.get("storage_gb", 10))),
             regions=tuple(regions or ()),
-            runtime_artifact_digest=rt.get("artifact_digest",
-                                           d.get("runtime_artifact_digest", "")),
+            runtime_artifact_digest=rt.get(
+                "artifact_digest", d.get("runtime_artifact_digest", "")
+            ),
             python_version=rt.get("python", d.get("python_version", "")),
             criu_version=rt.get("criu", d.get("criu_version", "")),
             kernel_version=rt.get("kernel", d.get("kernel_version", "")),
             workload_type=d.get("workload_type", "batch"),
-            max_recovery_time_s=int(rec.get("max_recovery_time_s",
-                                            d.get("max_recovery_time_s", 100))),
+            max_recovery_time_s=int(
+                rec.get("max_recovery_time_s", d.get("max_recovery_time_s", 100))
+            ),
             schema_version=int(d.get("schema_version", CONTRACT_SCHEMA_VERSION)),
         )
 
@@ -84,16 +89,16 @@ class AdmissionResult:
     job_id: str
     verdict: str  # ADMITTED | REJECTED | DUPLICATE
     reason: str = ""
-    contract: Optional[Dict[str, Any]] = None
+    contract: dict[str, Any] | None = None
 
 
 class JobAdmissionManager:
     """Validate contracts, create PENDING rows. No PID/IP/AMI inputs."""
 
-    def __init__(self, default_regions: Optional[List[str]] = None):
+    def __init__(self, default_regions: list[str] | None = None):
         self.default_regions = list(default_regions or [])
 
-    def validate(self, contract: WorkloadContract) -> List[str]:
+    def validate(self, contract: WorkloadContract) -> list[str]:
         errors = []
         if not contract.name:
             errors.append("name is required")
@@ -107,12 +112,17 @@ class JobAdmissionManager:
             errors.append("at least one region is required")
         return errors
 
-    def admit(self, contract: WorkloadContract, registry: Any,
-              job_id: Optional[str] = None) -> AdmissionResult:
+    def admit(
+        self, contract: WorkloadContract, registry: Any, job_id: str | None = None
+    ) -> AdmissionResult:
         errors = self.validate(contract)
         if errors:
-            return AdmissionResult(job_id or contract.name, "REJECTED",
-                                   "; ".join(errors), contract.to_dict())
+            return AdmissionResult(
+                job_id or contract.name,
+                "REJECTED",
+                "; ".join(errors),
+                contract.to_dict(),
+            )
         jid = job_id or f"{contract.name}-{uuid.uuid4().hex[:8]}"
         regions = list(contract.regions) or list(self.default_regions)
         row = {
@@ -127,20 +137,32 @@ class JobAdmissionManager:
         # Idempotent resubmit: same job_id + same contract ⇒ DUPLICATE.
         try:
             existing = registry.get(jid)
-            if isinstance(existing, dict) and existing.get("workload_contract") == row["workload_contract"]:
-                return AdmissionResult(jid, "DUPLICATE", "identical contract resubmitted",
-                                       contract.to_dict())
-            return AdmissionResult(jid, "REJECTED",
-                                   f"job {jid} exists with a different contract",
-                                   contract.to_dict())
+            if (
+                isinstance(existing, dict)
+                and existing.get("workload_contract") == row["workload_contract"]
+            ):
+                return AdmissionResult(
+                    jid,
+                    "DUPLICATE",
+                    "identical contract resubmitted",
+                    contract.to_dict(),
+                )
+            return AdmissionResult(
+                jid,
+                "REJECTED",
+                f"job {jid} exists with a different contract",
+                contract.to_dict(),
+            )
         except (KeyError, FileNotFoundError):
             pass
         except Exception as exc:
-            return AdmissionResult(jid, "REJECTED", f"registry read failed: {exc}",
-                                   contract.to_dict())
+            return AdmissionResult(
+                jid, "REJECTED", f"registry read failed: {exc}", contract.to_dict()
+            )
         try:
             registry.create(jid, **row)
         except Exception as exc:
-            return AdmissionResult(jid, "REJECTED", f"registry write failed: {exc}",
-                                   contract.to_dict())
+            return AdmissionResult(
+                jid, "REJECTED", f"registry write failed: {exc}", contract.to_dict()
+            )
         return AdmissionResult(jid, "ADMITTED", "contract-v1", contract.to_dict())

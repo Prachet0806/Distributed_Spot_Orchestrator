@@ -3,34 +3,39 @@
 Vehicles: I8 (worker authority prohibition), W1–W5 ceremonies, T4
 refusal → reconciliation finding, fail-closed controller fencing.
 """
-from storage.audit_store import AuditStore
-from tests.support import emulated_validator
+
 import json
 from datetime import datetime
 
 import pytest
 
+from orchestrator import worker_controller as wctl
+from orchestrator.checkpoint_manager import (
+    CheckpointManager,
+    CheckpointResult,
+    RestoreResult,
+)
+from orchestrator.migration_coordinator import MigrationCoordinator, MigrationState
+from orchestrator.migration_planner import MigrationPlanner
+from orchestrator.policy_engine import Decision, MigrationRegime, PolicyDecision
+from orchestrator.provisioner import EmulatedProvisioner
+from orchestrator.reconciliation_manager import (
+    MismatchType,
+    ReconciliationManager,
+)
+from orchestrator.transfer_manager import TransferManager
+from orchestrator.worker_telemetry import (
+    parse_heartbeat,
+    parse_refusal,
+    refusal_to_finding,
+)
+from orchestrator.workload_estimator import WorkloadEstimate
+from storage.audit_store import AuditStore
+from storage.memory_registry import MemoryRegistry
 from worker.controller import (
     ControllerError,
     WorkerController,
 )
-from orchestrator import worker_controller as wctl
-from orchestrator.migration_coordinator import MigrationCoordinator, MigrationState
-from orchestrator.migration_planner import MigrationPlanner
-from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
-from orchestrator.checkpoint_manager import (
-    CheckpointManager, CheckpointResult, RestoreResult)
-from orchestrator.provisioner import EmulatedProvisioner
-from orchestrator.transfer_manager import TransferManager
-from orchestrator.reconciliation_manager import (
-    MismatchType, ReconciliationManager,
-)
-from orchestrator.worker_telemetry import (
-    parse_heartbeat, parse_preflight_kv, parse_refusal, refusal_to_finding,
-)
-from orchestrator.workload_estimator import WorkloadEstimate
-from storage.checkpoint_store import CheckpointStore
-from storage.memory_registry import MemoryRegistry
 
 
 class _Exec:
@@ -56,8 +61,13 @@ class _Exec:
 
 
 def _cmd(op="op-1", epoch=0, instance="i-1", action="terminate", pid=4242):
-    return {"instance_id": instance, "operation_id": op,
-            "expected_execution_epoch": epoch, "action": action, "pid": pid}
+    return {
+        "instance_id": instance,
+        "operation_id": op,
+        "expected_execution_epoch": epoch,
+        "action": action,
+        "pid": pid,
+    }
 
 
 # -- W1 lifecycle --
@@ -82,8 +92,7 @@ def test_boot_refuses_missing_identity(monkeypatch):
 
 # -- W2 binding --
 def test_wrong_instance_refused_pairing():
-    ctl = WorkerController(instance_id="i-1", admission_epoch=0,
-                           executor=_Exec())
+    ctl = WorkerController(instance_id="i-1", admission_epoch=0, executor=_Exec())
     out = ctl.handle_command(_cmd(instance="i-OTHER"))
     assert out["accepted"] is False and out["reason"] == "PAIRING_FAILED"
     refusal = parse_refusal(ctl.refusals[-1])  # T4 schema holds
@@ -93,8 +102,7 @@ def test_wrong_instance_refused_pairing():
 # -- W3 epoch gate --
 @pytest.mark.parametrize("expected,accepted", [(0, True), (3, True), (-1, False)])
 def test_epoch_gate_stale_refused_forward_accepted(expected, accepted):
-    ctl = WorkerController(instance_id="i-1", admission_epoch=0,
-                           executor=_Exec())
+    ctl = WorkerController(instance_id="i-1", admission_epoch=0, executor=_Exec())
     out = ctl.handle_command(_cmd(epoch=expected))
     assert out["accepted"] is accepted
     if not accepted:
@@ -102,10 +110,10 @@ def test_epoch_gate_stale_refused_forward_accepted(expected, accepted):
 
 
 def test_missing_epoch_refused():
-    ctl = WorkerController(instance_id="i-1", admission_epoch=0,
-                           executor=_Exec())
-    out = ctl.handle_command({"instance_id": "i-1", "operation_id": "op-1",
-                              "action": "terminate", "pid": 1})
+    ctl = WorkerController(instance_id="i-1", admission_epoch=0, executor=_Exec())
+    out = ctl.handle_command(
+        {"instance_id": "i-1", "operation_id": "op-1", "action": "terminate", "pid": 1}
+    )
     assert out["accepted"] is False
 
 
@@ -120,30 +128,43 @@ def test_triple_execute_converges_without_reexec():
 
 
 # -- I8 autonomy prohibition --
-@pytest.mark.parametrize("action", ["migrate", "recover", "replan",
-                                    "supersede", "fence", "checkpoint"])
+@pytest.mark.parametrize(
+    "action", ["migrate", "recover", "replan", "supersede", "fence", "checkpoint"]
+)
 def test_decision_shaped_commands_refused(action):
-    ctl = WorkerController(instance_id="i-1", admission_epoch=0,
-                           executor=_Exec())
+    ctl = WorkerController(instance_id="i-1", admission_epoch=0, executor=_Exec())
     out = ctl.handle_command(_cmd(action=action))
     assert out["accepted"] is False
     assert out["reason"] == "UNKNOWN_OPERATION"
 
 
 def test_no_migration_entrypoint_exists():
-    ctl = WorkerController(instance_id="i-1", admission_epoch=0,
-                           executor=_Exec())
-    for name in ("migrate", "recover", "replan", "supersede",
-                 "start_migration", "decide"):
+    ctl = WorkerController(instance_id="i-1", admission_epoch=0, executor=_Exec())
+    for name in (
+        "migrate",
+        "recover",
+        "replan",
+        "supersede",
+        "start_migration",
+        "decide",
+    ):
         assert not hasattr(ctl, name)
 
 
 def test_activation_requires_lease_and_restored_process_identity():
     exe = _Exec()
-    ctl = WorkerController(instance_id="i-1", admission_epoch=0, executor=exe,
-                           lease_validator=lambda cmd: cmd.get("lease") == "fresh")
-    command = {**_cmd(op="activate-1", epoch=1, action="activate"),
-               "job_id": "fixture", "process_start": "123", "lease": "stale"}
+    ctl = WorkerController(
+        instance_id="i-1",
+        admission_epoch=0,
+        executor=exe,
+        lease_validator=lambda cmd: cmd.get("lease") == "fresh",
+    )
+    command = {
+        **_cmd(op="activate-1", epoch=1, action="activate"),
+        "job_id": "fixture",
+        "process_start": "123",
+        "lease": "stale",
+    }
     assert ctl.handle_command(command)["reason"] == "LEASE_EXPIRED"
     assert exe.activations == []
     command["lease"] = "fresh"
@@ -153,6 +174,7 @@ def test_activation_requires_lease_and_restored_process_identity():
 
 def test_bootstrap_binds_imdsv2_identity_and_epoch():
     from orchestrator.worker_bootstrap import control_userdata
+
     script = control_userdata(7)
     assert script.startswith("#!/bin/bash\n") and "\r" not in script
     assert '"admission_epoch": 7' in script
@@ -164,8 +186,7 @@ def test_bootstrap_binds_imdsv2_identity_and_epoch():
 
 # -- W5 refusal → finding --
 def test_refusal_files_reconciliation_finding():
-    ctl = WorkerController(instance_id="i-1", admission_epoch=5,
-                           executor=_Exec())
+    ctl = WorkerController(instance_id="i-1", admission_epoch=5, executor=_Exec())
     out = ctl.handle_command(_cmd(epoch=0))  # stale CPR
     assert out["accepted"] is False
     finding = refusal_to_finding(parse_refusal(ctl.refusals[-1]))
@@ -173,8 +194,9 @@ def test_refusal_files_reconciliation_finding():
 
     class _Reg:
         def __init__(self):
-            self.jobs = {"job-1": {"job_id": "job-1", "state": "RUNNING",
-                                   "execution_epoch": 0}}
+            self.jobs = {
+                "job-1": {"job_id": "job-1", "state": "RUNNING", "execution_epoch": 0}
+            }
 
         def get(self, jid):
             return dict(self.jobs[jid])
@@ -184,12 +206,12 @@ def test_refusal_files_reconciliation_finding():
             return dict(self.jobs[jid])
 
         def list_by_state(self, state):
-            return [dict(j) for j in self.jobs.values()
-                    if j.get("state") == state]
+            return [dict(j) for j in self.jobs.values() if j.get("state") == state]
 
     recon = ReconciliationManager(_Reg(), None, None)
-    findings = wctl.file_refusal(ctl.refusals[-1], recon, job_id="job-1",
-                                 migration_id="m-1")
+    findings = wctl.file_refusal(
+        ctl.refusals[-1], recon, job_id="job-1", migration_id="m-1"
+    )
     assert len(findings) == 1
     assert findings[0].mismatch_type == MismatchType.EPOCH_MISMATCH
 
@@ -198,11 +220,14 @@ def test_refusal_files_reconciliation_finding():
 def _hooks(controller, sink, epoch=0):
     return wctl.make_controller_fence_hooks(
         lambda host: controller.handle_command,
-        lambda plan: {"host": "10.0.0.9",
-                      "pid": getattr(plan, "pid", None),
-                      "instance_id": "i-1"},
+        lambda plan: {
+            "host": "10.0.0.9",
+            "pid": getattr(plan, "pid", None),
+            "instance_id": "i-1",
+        },
         epoch_resolver=lambda plan: epoch,
-        refusal_sink=sink)
+        refusal_sink=sink,
+    )
 
 
 def test_client_accepts_healthy_fence():
@@ -255,23 +280,41 @@ def test_client_verify_alive_is_not_confirmed():
 # -- coordinator integration: fenced through the controller --
 def _est():
     return WorkloadEstimate(
-        job_id="job-1", execution_epoch=0, progress=0.5,
-        remaining_runtime_seconds=7200, expected_completion_at=None,
-        prediction_confidence=0.8, checkpoint_size_estimate_bytes=100,
+        job_id="job-1",
+        execution_epoch=0,
+        progress=0.5,
+        remaining_runtime_seconds=7200,
+        expected_completion_at=None,
+        prediction_confidence=0.8,
+        checkpoint_size_estimate_bytes=100,
         checkpoint_duration_estimate_seconds=1.0,
-        estimated_at=datetime.utcnow(), estimator_version="v",
-        model_version="v", observation_snapshot_version="1")
+        estimated_at=datetime.utcnow(),
+        estimator_version="v",
+        model_version="v",
+        observation_snapshot_version="1",
+    )
 
 
 def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
-    return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
-                            duration_seconds=0.01, digest="sha256:ctl",
-                            status="LOCAL", job_id=job_id, lineage_id=job_id)
+    return CheckpointResult(
+        checkpoint_id=f"chk-{job_id}",
+        size_bytes=64,
+        duration_seconds=0.01,
+        digest="sha256:ctl",
+        status="LOCAL",
+        job_id=job_id,
+        lineage_id=job_id,
+    )
 
 
 def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
-                         duration_seconds=0.01, process_id=4242)
+    return RestoreResult(
+        checkpoint_id=checkpoint_id,
+        success=True,
+        contained=True,
+        duration_seconds=0.01,
+        process_id=4242,
+    )
 
 
 class _Storage:
@@ -286,8 +329,12 @@ class _Storage:
 
 class _Validator:
     def validate(self, migration_id, job_id, epoch, **kw):
-        return {"passed": True, "migration_id": migration_id,
-                "job_id": job_id, "epoch": epoch}
+        return {
+            "passed": True,
+            "migration_id": migration_id,
+            "job_id": job_id,
+            "epoch": epoch,
+        }
 
 
 class _Cleanup:
@@ -297,40 +344,66 @@ class _Cleanup:
 
 def _run_with_controller(tmp_path, admission_epoch, prototype_epoch=0):
     path = tmp_path / "registry.json"
-    path.write_text(json.dumps({"job-1": {
-        "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
-        "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
-        "execution_epoch": 0, "active_migration_id": None}}))
+    path.write_text(
+        json.dumps(
+            {
+                "job-1": {
+                    "job_id": "job-1",
+                    "state": "RUNNING",
+                    "region": "us-east-1",
+                    "public_ip": "10.0.0.9",
+                    "pid": 4242,
+                    "version": 0,
+                    "execution_epoch": 0,
+                    "active_migration_id": None,
+                }
+            }
+        )
+    )
     reg = MemoryRegistry(json.loads(path.read_text()))
     exe = _Exec(dead=True)
-    ctl = WorkerController(instance_id="i-1", admission_epoch=admission_epoch,
-                           executor=exe)
+    ctl = WorkerController(
+        instance_id="i-1", admission_epoch=admission_epoch, executor=exe
+    )
     sunk = []
     hooks = wctl.make_controller_fence_hooks(
         lambda host: ctl.handle_command,
-        lambda plan: {"host": "10.0.0.9", "pid": plan.pid,
-                      "instance_id": "i-1"},
+        lambda plan: {"host": "10.0.0.9", "pid": plan.pid, "instance_id": "i-1"},
         epoch_resolver=lambda plan: prototype_epoch,
-        refusal_sink=sunk.append)
-    coord = MigrationCoordinator(audit_store=AuditStore(),
-        registry=reg, provisioner=EmulatedProvisioner(),
+        refusal_sink=sunk.append,
+    )
+    coord = MigrationCoordinator(
+        audit_store=AuditStore(),
+        registry=reg,
+        provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
-            storage=_Storage(), dump_handler=_dump, restore_handler=_restore),
+            storage=_Storage(), dump_handler=_dump, restore_handler=_restore
+        ),
         transfer_manager=TransferManager(storage=_Storage()),
-        validator=_Validator(), cleanup_executor=_Cleanup(),
+        validator=_Validator(),
+        cleanup_executor=_Cleanup(),
         fence_invalidate=hooks["invalidate"],
         fence_terminate=hooks["terminate"],
         fence_verify=hooks["verify"],
         snapshot_provider=lambda jid, phase: {"progress": 0.5},
-        step_timeout_seconds=30.0)
+        step_timeout_seconds=30.0,
+    )
     plan = MigrationPlanner().create_plan(
-        job_id="job-1", execution_epoch=0, regime=MigrationRegime.ARBITRAGE,
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.ARBITRAGE,
         policy_decision=PolicyDecision(
-            decision=Decision.MIGRATE, regime=MigrationRegime.ARBITRAGE,
-            reason="t", target_candidate_id="pool-t", confidence=0.9,
-            metadata={}),
-        source_pool_id="pool-s", target_pool_id="pool-t",
-        workload_estimate=_est())
+            decision=Decision.MIGRATE,
+            regime=MigrationRegime.ARBITRAGE,
+            reason="t",
+            target_candidate_id="pool-t",
+            confidence=0.9,
+            metadata={},
+        ),
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
+        workload_estimate=_est(),
+    )
     plan.pid = 4242
     plan.source_host = "10.0.0.9"
     plan.plan_hash = MigrationPlanner.compute_hash(plan)

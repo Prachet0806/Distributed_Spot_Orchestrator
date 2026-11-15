@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Optional, List, Dict, TYPE_CHECKING
-from enum import Enum
-import uuid
-import yaml
 import logging
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import TYPE_CHECKING, Any
+
+import yaml
 
 if TYPE_CHECKING:
     from orchestrator.candidate_compatibility import CompatibilityStatus
@@ -46,26 +47,26 @@ class RankedCandidate:
     cost_score: float
     risk_score: float
     total_score: float
-    rationale: List[str]
+    rationale: list[str]
 
 
 @dataclass
 class PlacementRecommendation:
     recommendation_id: str
-    ranked_candidates: List[RankedCandidate]
-    selected_candidate_id: Optional[str]
+    ranked_candidates: list[RankedCandidate]
+    selected_candidate_id: str | None
     policy_version: str
     generated_at: datetime
     expires_at: datetime
-    assessment_snapshots: Dict[str, str]
+    assessment_snapshots: dict[str, str]
 
 
 class PlacementPolicy:
     def __init__(
         self,
         version: str,
-        hard_constraints: Dict = None,
-        ranking_weights: Dict = None,
+        hard_constraints: dict = None,
+        ranking_weights: dict = None,
     ):
         if version != "v3":
             raise ValueError("Only placement policy v3 is supported")
@@ -78,7 +79,7 @@ class PlacementPolicy:
         self.ranking_weights = ranking_weights or dict(PLACEMENT_V3_WEIGHTS)
 
     @classmethod
-    def load_from_file(cls, path: str) -> "PlacementPolicy":
+    def load_from_file(cls, path: str) -> PlacementPolicy:
         with open(path) as f:
             data = yaml.safe_load(f)
         version = data["version"]
@@ -93,17 +94,16 @@ class PlacementPolicy:
         )
 
 
-
 @dataclass
 class PlacementInput:
     pool_id: str
-    compatibility_status: "CompatibilityStatus"
-    readiness_status: "ReadinessStatus"
-    compatibility_dimensions: Dict[str, bool]
-    readiness_checks: List[Dict]
-    cost_analysis: Dict
-    risk_analysis: Dict
-    topology: Dict
+    compatibility_status: CompatibilityStatus
+    readiness_status: ReadinessStatus
+    compatibility_dimensions: dict[str, bool]
+    readiness_checks: list[dict]
+    cost_analysis: dict
+    risk_analysis: dict
+    topology: dict
     capacity_confidence: float
     # Track C3: pool lifecycle (§7.4.2). Defaults ACTIVE for inputs built
     # before lifecycle tracking landed.
@@ -116,12 +116,12 @@ class PlacementEngine:
 
     def rank(
         self,
-        inputs: List[PlacementInput],
+        inputs: list[PlacementInput],
         ttl_seconds: float = PLACEMENT_TTL_SECONDS,
-        migration_time_estimates: Optional[Dict[str, float]] = None,
-        freshness: Optional[Dict[str, float]] = None,
-        regime: Optional[str] = None,
-        concurrency: Optional[Any] = None,
+        migration_time_estimates: dict[str, float] | None = None,
+        freshness: dict[str, float] | None = None,
+        regime: str | None = None,
+        concurrency: Any | None = None,
     ) -> PlacementRecommendation:
         """Rank candidates. `regime` gates DEGRADED pools (emergency
         excludes them); `concurrency` is a PoolConcurrencyTracker peeked
@@ -131,10 +131,9 @@ class PlacementEngine:
         now = datetime.utcnow()
         # Pre-normalize operational cost across ELIGIBLE candidates only.
         eligible_costs = []
-        eligibility_cache: Dict[str, PlacementEligibility] = {}
+        eligibility_cache: dict[str, PlacementEligibility] = {}
         for inp in inputs:
-            el = self._check_eligibility(inp, regime=regime,
-                                         concurrency=concurrency)
+            el = self._check_eligibility(inp, regime=regime, concurrency=concurrency)
             eligibility_cache[inp.pool_id] = el
             if el == PlacementEligibility.ELIGIBLE:
                 eligible_costs.append(self._extract_cost(inp))
@@ -144,17 +143,19 @@ class PlacementEngine:
         for i, inp in enumerate(inputs):
             eligibility = eligibility_cache[inp.pool_id]
             if eligibility != PlacementEligibility.ELIGIBLE:
-                ranked.append(RankedCandidate(
-                    pool_id=inp.pool_id,
-                    rank=i + 1,
-                    eligibility=eligibility,
-                    compatibility_score=0.0,
-                    readiness_score=0.0,
-                    cost_score=0.0,
-                    risk_score=0.0,
-                    total_score=0.0,
-                    rationale=[f"Ineligible: {eligibility.value}"],
-                ))
+                ranked.append(
+                    RankedCandidate(
+                        pool_id=inp.pool_id,
+                        rank=i + 1,
+                        eligibility=eligibility,
+                        compatibility_score=0.0,
+                        readiness_score=0.0,
+                        cost_score=0.0,
+                        risk_score=0.0,
+                        total_score=0.0,
+                        rationale=[f"Ineligible: {eligibility.value}"],
+                    )
+                )
                 continue
 
             compat_score = self._compute_compatibility_score(inp)
@@ -166,27 +167,29 @@ class PlacementEngine:
 
             weights = self.policy.ranking_weights
             total = (
-                compat_score * weights.get("compatibility", 0.30) +
-                readiness_score * weights.get("readiness", 0.25) +
-                capacity_score * weights.get("capacity", 0.20) +
-                locality_score * weights.get("locality", 0.10) +
-                risk_score * weights.get("reliability", 0.10) +
-                cost_score * weights.get("operational_cost", 0.05)
+                compat_score * weights.get("compatibility", 0.30)
+                + readiness_score * weights.get("readiness", 0.25)
+                + capacity_score * weights.get("capacity", 0.20)
+                + locality_score * weights.get("locality", 0.10)
+                + risk_score * weights.get("reliability", 0.10)
+                + cost_score * weights.get("operational_cost", 0.05)
             )
 
             rationale = self._build_rationale(inp, total)
 
-            ranked.append(RankedCandidate(
-                pool_id=inp.pool_id,
-                rank=i + 1,
-                eligibility=PlacementEligibility.ELIGIBLE,
-                compatibility_score=compat_score,
-                readiness_score=readiness_score,
-                cost_score=cost_score,
-                risk_score=risk_score,
-                total_score=total,
-                rationale=rationale,
-            ))
+            ranked.append(
+                RankedCandidate(
+                    pool_id=inp.pool_id,
+                    rank=i + 1,
+                    eligibility=PlacementEligibility.ELIGIBLE,
+                    compatibility_score=compat_score,
+                    readiness_score=readiness_score,
+                    cost_score=cost_score,
+                    risk_score=risk_score,
+                    total_score=total,
+                    rationale=rationale,
+                )
+            )
 
         mig_est = migration_time_estimates or {}
         fresh = freshness or {}
@@ -208,11 +211,17 @@ class PlacementEngine:
         for i, r in enumerate(ranked):
             r.rank = i + 1
 
-        selected = ranked[0].pool_id if ranked and ranked[0].eligibility == PlacementEligibility.ELIGIBLE else None
+        selected = (
+            ranked[0].pool_id
+            if ranked and ranked[0].eligibility == PlacementEligibility.ELIGIBLE
+            else None
+        )
 
         snapshots = {}
         for inp in inputs:
-            snapshots[inp.pool_id] = f"compat:{inp.compatibility_status.value},readiness:{inp.readiness_status.value}"
+            snapshots[inp.pool_id] = (
+                f"compat:{inp.compatibility_status.value},readiness:{inp.readiness_status.value}"
+            )
 
         return PlacementRecommendation(
             recommendation_id=str(uuid.uuid4()),
@@ -224,8 +233,12 @@ class PlacementEngine:
             assessment_snapshots=snapshots,
         )
 
-    def _check_eligibility(self, inp: PlacementInput, regime: Optional[str] = None,
-                           concurrency: Optional[Any] = None) -> PlacementEligibility:
+    def _check_eligibility(
+        self,
+        inp: PlacementInput,
+        regime: str | None = None,
+        concurrency: Any | None = None,
+    ) -> PlacementEligibility:
         if inp.compatibility_status.value == "UNKNOWN":
             if self.policy.hard_constraints.get("reject_unknown", True):
                 return PlacementEligibility.INELIGIBLE_UNKNOWN
@@ -235,9 +248,11 @@ class PlacementEngine:
             if self.policy.hard_constraints.get("require_ready", True):
                 return PlacementEligibility.INELIGIBLE_READINESS
         from orchestrator.pool_lifecycle import eligible_for_regime
+
         try:
             lifecycle_ok = eligible_for_regime(
-                getattr(inp, "pool_lifecycle", "ACTIVE"), regime or "ARBITRAGE")
+                getattr(inp, "pool_lifecycle", "ACTIVE"), regime or "ARBITRAGE"
+            )
         except ValueError:
             lifecycle_ok = False
         if not lifecycle_ok:
@@ -300,7 +315,7 @@ class PlacementEngine:
         risk = self._extract_risk(inp)
         return max(0.0, 1.0 - risk)
 
-    def _build_rationale(self, inp: PlacementInput, total: float) -> List[str]:
+    def _build_rationale(self, inp: PlacementInput, total: float) -> list[str]:
         reasons = [f"Total score: {total:.3f}"]
         if inp.compatibility_status.value == "COMPATIBLE":
             reasons.append("Fully compatible")

@@ -1,63 +1,102 @@
 """Phase 3: execution kernel — planner DAG, coordinator safety, executors."""
-from storage.audit_store import AuditStore
-from tests.support import emulated_validator
+
 import json
 import time
 from datetime import datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 
-from orchestrator.migration_planner import MigrationPlanner, MigrationState
-from orchestrator.migration_coordinator import (
-    MigrationCoordinator, MigrationExecutionState, MigrationFailed,
-    OperationUnknownError,
+from orchestrator.checkpoint_manager import (
+    CheckpointManager,
+    CheckpointResult,
+    RestoreResult,
 )
-from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
-from orchestrator.workload_estimator import WorkloadEstimate
-from orchestrator.checkpoint_manager import CheckpointManager, CheckpointResult, RestoreResult
+from orchestrator.migration_coordinator import (
+    MigrationCoordinator,
+    MigrationExecutionState,
+    MigrationFailed,
+)
+from orchestrator.migration_planner import MigrationPlanner, MigrationState
+from orchestrator.models_v2 import PlanStepType
+from orchestrator.policy_engine import Decision, MigrationRegime, PolicyDecision
 from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.transfer_manager import TransferManager
-from orchestrator.models_v2 import PlanStepType
+from orchestrator.workload_estimator import WorkloadEstimate
+from storage.audit_store import AuditStore
+from storage.checkpoint_store import CheckpointStore
 from storage.memory_registry import MemoryRegistry
 from storage.plan_store import PlanStore
-from storage.checkpoint_store import CheckpointStore
 
 
 def _est(remaining=7200):
     return WorkloadEstimate(
-        job_id="job-1", execution_epoch=0, progress=0.5,
-        remaining_runtime_seconds=remaining, expected_completion_at=None,
-        prediction_confidence=0.8, checkpoint_size_estimate_bytes=100,
+        job_id="job-1",
+        execution_epoch=0,
+        progress=0.5,
+        remaining_runtime_seconds=remaining,
+        expected_completion_at=None,
+        prediction_confidence=0.8,
+        checkpoint_size_estimate_bytes=100,
         checkpoint_duration_estimate_seconds=1.0,
-        estimated_at=datetime.utcnow(), estimator_version="v",
-        model_version="v", observation_snapshot_version="1")
+        estimated_at=datetime.utcnow(),
+        estimator_version="v",
+        model_version="v",
+        observation_snapshot_version="1",
+    )
 
 
 def _decision():
-    return PolicyDecision(decision=Decision.MIGRATE, regime=MigrationRegime.ARBITRAGE,
-                          reason="t", target_candidate_id="pool-t",
-                          confidence=0.9, metadata={})
+    return PolicyDecision(
+        decision=Decision.MIGRATE,
+        regime=MigrationRegime.ARBITRAGE,
+        reason="t",
+        target_candidate_id="pool-t",
+        confidence=0.9,
+        metadata={},
+    )
 
 
 def _registry(tmp_path):
     path = tmp_path / "registry.json"
-    path.write_text(json.dumps({"job-1": {
-        "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
-        "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
-        "execution_epoch": 0, "active_migration_id": None}}))
+    path.write_text(
+        json.dumps(
+            {
+                "job-1": {
+                    "job_id": "job-1",
+                    "state": "RUNNING",
+                    "region": "us-east-1",
+                    "public_ip": "10.0.0.9",
+                    "pid": 4242,
+                    "version": 0,
+                    "execution_epoch": 0,
+                    "active_migration_id": None,
+                }
+            }
+        )
+    )
     return MemoryRegistry(json.loads(path.read_text()))
 
 
 def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
-    return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=100,
-                            duration_seconds=0.01, digest="sha256:fake",
-                            status="LOCAL", job_id=job_id, lineage_id=job_id)
+    return CheckpointResult(
+        checkpoint_id=f"chk-{job_id}",
+        size_bytes=100,
+        duration_seconds=0.01,
+        digest="sha256:fake",
+        status="LOCAL",
+        job_id=job_id,
+        lineage_id=job_id,
+    )
 
 
 def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
-                         duration_seconds=0.01, process_id=999)
+    return RestoreResult(
+        checkpoint_id=checkpoint_id,
+        success=True,
+        contained=True,
+        duration_seconds=0.01,
+        process_id=999,
+    )
 
 
 class _Storage:
@@ -81,8 +120,12 @@ class _Validator:
 
     def validate(self, migration_id, job_id, epoch, **kw):
         self.calls += 1
-        return {"passed": self._passed, "migration_id": migration_id,
-                "job_id": job_id, "epoch": epoch}
+        return {
+            "passed": self._passed,
+            "migration_id": migration_id,
+            "job_id": job_id,
+            "epoch": epoch,
+        }
 
 
 class _Cleanup:
@@ -90,8 +133,7 @@ class _Cleanup:
         self.calls = []
 
     def cleanup_migration(self, plan, operations, safety_critical_only=False, **kwargs):
-        self.calls.append((plan.migration_id, len(operations),
-                           safety_critical_only))
+        self.calls.append((plan.migration_id, len(operations), safety_critical_only))
 
 
 def _fences(calls):
@@ -102,34 +144,53 @@ def _fences(calls):
     }
 
 
-def _coordinator(reg, fences=None, validator=None, checkpoint_store=None,
-                 plan_store=None, transfer_storage=None, provisioner=None,
-                 **kw):
+def _coordinator(
+    reg,
+    fences=None,
+    validator=None,
+    checkpoint_store=None,
+    plan_store=None,
+    transfer_storage=None,
+    provisioner=None,
+    **kw,
+):
     calls = []
     fh = fences if fences is not None else _fences(calls)
-    return MigrationCoordinator(audit_store=AuditStore(),
+    return MigrationCoordinator(
+        audit_store=AuditStore(),
         registry=reg,
         provisioner=provisioner or EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
-            storage=_Storage(), dump_handler=_dump, restore_handler=_restore,
-            checkpoint_store=checkpoint_store),
+            storage=_Storage(),
+            dump_handler=_dump,
+            restore_handler=_restore,
+            checkpoint_store=checkpoint_store,
+        ),
         transfer_manager=TransferManager(storage=transfer_storage or _Storage()),
         validator=validator or _Validator(),
         cleanup_executor=_Cleanup(),
         plan_store=plan_store,
         checkpoint_store=checkpoint_store,
-        fence_invalidate=fh["invalidate"], fence_terminate=fh["terminate"],
+        fence_invalidate=fh["invalidate"],
+        fence_terminate=fh["terminate"],
         fence_verify=fh["verify"],
         step_timeout_seconds=kw.pop("step_timeout_seconds", 30.0),
-        **kw), calls
+        **kw,
+    ), calls
 
 
 def _plan(regime=MigrationRegime.ARBITRAGE, **kw):
     planner = MigrationPlanner()
     return planner.create_plan(
-        job_id="job-1", execution_epoch=0, regime=regime,
-        policy_decision=_decision(), source_pool_id="pool-s",
-        target_pool_id="pool-t", workload_estimate=_est(), **kw)
+        job_id="job-1",
+        execution_epoch=0,
+        regime=regime,
+        policy_decision=_decision(),
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
+        workload_estimate=_est(),
+        **kw,
+    )
 
 
 # -- planner --
@@ -146,14 +207,22 @@ def test_planner_hash_ttl_and_fencing_authorized():
 
 
 def test_planner_emergency_dag_parallel(tmp_path):
-    plan = _plan(regime=MigrationRegime.EMERGENCY,
-                 absolute_deadline=datetime.utcnow() + timedelta(seconds=300))
+    plan = _plan(
+        regime=MigrationRegime.EMERGENCY,
+        absolute_deadline=datetime.utcnow() + timedelta(seconds=300),
+    )
     planner = MigrationPlanner()
     dag = planner.to_v2_dag(plan)
     assert [s.type for s in dag] == [
-        PlanStepType.PRECHECK, PlanStepType.CHECKPOINT, PlanStepType.PERSIST,
-        PlanStepType.PROVISION, PlanStepType.TRANSFER, PlanStepType.RESTORE,
-        PlanStepType.FENCE, PlanStepType.VALIDATE, PlanStepType.ACTIVATE,
+        PlanStepType.PRECHECK,
+        PlanStepType.CHECKPOINT,
+        PlanStepType.PERSIST,
+        PlanStepType.PROVISION,
+        PlanStepType.TRANSFER,
+        PlanStepType.RESTORE,
+        PlanStepType.FENCE,
+        PlanStepType.VALIDATE,
+        PlanStepType.ACTIVATE,
         PlanStepType.FINALIZE,
     ]
     by_type = {s.type: s for s in dag}
@@ -198,13 +267,17 @@ def test_emergency_provisions_exactly_once(tmp_path):
     prov = EmulatedProvisioner()
     calls_provision = []
     orig = prov.provision_with_operation
+
     def _count(cid, operation_id=None, **kw):
         calls_provision.append(operation_id)
         return orig(cid, operation_id=operation_id, **kw)
+
     prov.provision_with_operation = _count
     coord, _ = _coordinator(reg, provisioner=prov)
-    plan = _plan(regime=MigrationRegime.EMERGENCY,
-                 absolute_deadline=datetime.utcnow() + timedelta(seconds=600))
+    plan = _plan(
+        regime=MigrationRegime.EMERGENCY,
+        absolute_deadline=datetime.utcnow() + timedelta(seconds=600),
+    )
     out = coord.execute_plan(plan)
     assert out.current_state == MigrationState.SUCCESS
     assert len(calls_provision) == 1  # no double-provision regression
@@ -227,13 +300,18 @@ def test_expired_plan_fails_without_side_effects(tmp_path):
 
 def test_fencing_fails_closed_without_hooks(tmp_path):
     reg = _registry(tmp_path)
-    coord = MigrationCoordinator(audit_store=AuditStore(),
-        registry=reg, provisioner=EmulatedProvisioner(),
+    coord = MigrationCoordinator(
+        audit_store=AuditStore(),
+        registry=reg,
+        provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
-            storage=_Storage(), dump_handler=_dump, restore_handler=_restore),
+            storage=_Storage(), dump_handler=_dump, restore_handler=_restore
+        ),
         transfer_manager=TransferManager(storage=_Storage()),
-        validator=_Validator(), cleanup_executor=_Cleanup(),
-        step_timeout_seconds=30.0)
+        validator=_Validator(),
+        cleanup_executor=_Cleanup(),
+        step_timeout_seconds=30.0,
+    )
     out = coord.execute_plan(_plan())
     assert out.current_state == MigrationState.FAILED
     # FENCING_FAILED → reconciliation gate, never fake success.
@@ -242,8 +320,10 @@ def test_fencing_fails_closed_without_hooks(tmp_path):
 
 def test_prefence_failure_rolls_back_to_running(tmp_path):
     reg = _registry(tmp_path)
+
     def _boom(job_id, pid, host, timeout=300.0):
         raise RuntimeError("criu exploded")
+
     coord, _ = _coordinator(reg)
     coord.checkpoint_manager.dump_handler = _boom
     out = coord.execute_plan(_plan())
@@ -257,10 +337,16 @@ def test_prefence_failure_with_durable_goes_recovery(tmp_path):
     reg = _registry(tmp_path)
     store = CheckpointStore()
     from orchestrator.models_v2 import CheckpointRef
-    store.put(CheckpointRef("chk-job-1", "job-1", 1, 0, durability="DURABLE",
-                            integrity_verified=True))
+
+    store.put(
+        CheckpointRef(
+            "chk-job-1", "job-1", 1, 0, durability="DURABLE", integrity_verified=True
+        )
+    )
+
     def _boom(job_id, pid, host, timeout=300.0):
         raise RuntimeError("criu exploded")
+
     coord, _ = _coordinator(reg, checkpoint_store=store)
     coord.checkpoint_manager.dump_handler = _boom
     out = coord.execute_plan(_plan())
@@ -272,11 +358,16 @@ def test_prefence_failure_with_durable_resumes_source_when_verified(tmp_path):
     reg = _registry(tmp_path)
     store = CheckpointStore()
     from orchestrator.models_v2 import CheckpointRef
-    store.put(CheckpointRef("chk-job-1", "job-1", 1, 0, durability="DURABLE",
-                            integrity_verified=True))
+
+    store.put(
+        CheckpointRef(
+            "chk-job-1", "job-1", 1, 0, durability="DURABLE", integrity_verified=True
+        )
+    )
     coord, _ = _coordinator(reg, checkpoint_store=store)
-    coord.checkpoint_manager.dump_handler = lambda *args, **kwargs: (_ for _ in ()).throw(
-        RuntimeError("checkpoint operation failed"))
+    coord.checkpoint_manager.dump_handler = lambda *args, **kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("checkpoint operation failed"))
     resumed = []
     coord.rollback_source = lambda plan: resumed.append(plan.job_id)
     out = coord.execute_plan(_plan())
@@ -288,9 +379,12 @@ def test_prefence_failure_with_durable_resumes_source_when_verified(tmp_path):
 def test_prefence_resume_failure_does_not_claim_running(tmp_path):
     reg = _registry(tmp_path)
     coord, _ = _coordinator(reg)
-    coord.checkpoint_manager.dump_handler = lambda *args, **kwargs: (_ for _ in ()).throw(
-        RuntimeError("checkpoint operation failed"))
-    coord.rollback_source = lambda plan: (_ for _ in ()).throw(RuntimeError("source unreachable"))
+    coord.checkpoint_manager.dump_handler = lambda *args, **kwargs: (
+        _ for _ in ()
+    ).throw(RuntimeError("checkpoint operation failed"))
+    coord.rollback_source = lambda plan: (_ for _ in ()).throw(
+        RuntimeError("source unreachable")
+    )
     out = coord.execute_plan(_plan())
     assert out.current_state == MigrationState.FAILED
     assert reg.get("job-1")["state"] == "RECOVERY_REQUIRED"
@@ -299,13 +393,18 @@ def test_prefence_resume_failure_does_not_claim_running(tmp_path):
 def test_prefence_supersession_resumes_source_before_successor(tmp_path):
     reg = _registry(tmp_path)
     plan = _plan()
-    reg.transition(plan.job_id, "MIGRATING", expected_epoch=0,
-                   active_migration_id=plan.migration_id)
+    reg.transition(
+        plan.job_id,
+        "MIGRATING",
+        expected_epoch=0,
+        active_migration_id=plan.migration_id,
+    )
     coord, _ = _coordinator(reg)
     resumed = []
     coord.rollback_source = lambda old: resumed.append(old.job_id)
     coord._execution_state = MigrationExecutionState(
-        plan=plan, current_state=MigrationState.RESTORING)
+        plan=plan, current_state=MigrationState.RESTORING
+    )
     coord._handle_superseded("newer plan")
     assert resumed == ["job-1"]
     assert coord._execution_state.current_state == MigrationState.SUPERSEDED
@@ -316,7 +415,8 @@ def test_postfence_supersession_rejected(tmp_path):
     reg = _registry(tmp_path)
     coord, _ = _coordinator(reg)
     coord._execution_state = MigrationExecutionState(
-        plan=_plan(), current_state=MigrationState.FENCING)
+        plan=_plan(), current_state=MigrationState.FENCING
+    )
     with pytest.raises(MigrationFailed, match="post-fence"):
         coord.supersede_and_replan(MigrationPlanner(), "newer plan")
 
@@ -344,27 +444,28 @@ def test_no_rollback_action_after_fencing_start(tmp_path):
     calls, cleanup_calls, terminated = [], [], []
 
     class _RecordingCleanup:
-        def cleanup_migration(self, plan, operations,
-                              safety_critical_only=False):
+        def cleanup_migration(self, plan, operations, safety_critical_only=False):
             cleanup_calls.append((plan.migration_id, safety_critical_only))
 
     prov = EmulatedProvisioner()
     orig_terminate = prov.terminate
     prov.terminate = lambda instance_id: terminated.append(instance_id) or True
     try:
-        coord = MigrationCoordinator(audit_store=AuditStore(),
+        coord = MigrationCoordinator(
+            audit_store=AuditStore(),
             registry=reg,
             provisioner=prov,
             checkpoint_manager=CheckpointManager(
-                storage=_Storage(), dump_handler=_dump,
-                restore_handler=_restore),
+                storage=_Storage(), dump_handler=_dump, restore_handler=_restore
+            ),
             transfer_manager=TransferManager(storage=_Storage()),
             validator=_Validator(passed=False),
             cleanup_executor=_RecordingCleanup(),
             fence_invalidate=lambda plan: calls.append("invalidate"),
             fence_terminate=lambda plan: calls.append("terminate"),
             fence_verify=lambda plan: calls.append("verify") or True,
-            step_timeout_seconds=30.0)
+            step_timeout_seconds=30.0,
+        )
         out = coord.execute_plan(_plan())
     finally:
         prov.terminate = orig_terminate
@@ -390,9 +491,11 @@ def test_epoch_drift_blocks_before_fence(tmp_path):
 
 def test_step_timeout_marks_unknown(tmp_path):
     reg = _registry(tmp_path)
+
     def _slow(job_id, pid, host, timeout=300.0, operation_id=None):
         time.sleep(5)
         return _dump(job_id, pid, host)
+
     coord, _ = _coordinator(reg, step_timeout_seconds=0.2)
     coord.checkpoint_manager.dump_handler = _slow
     out = coord.execute_plan(_plan())
@@ -402,10 +505,15 @@ def test_step_timeout_marks_unknown(tmp_path):
 
 
 def test_no_abort_transition_out_of_fencing():
-    coord = MigrationCoordinator(audit_store=AuditStore(),
-        registry=object(), provisioner=object(),
-        checkpoint_manager=object(), transfer_manager=object(),
-        validator=object(), cleanup_executor=object())
+    coord = MigrationCoordinator(
+        audit_store=AuditStore(),
+        registry=object(),
+        provisioner=object(),
+        checkpoint_manager=object(),
+        transfer_manager=object(),
+        validator=object(),
+        cleanup_executor=object(),
+    )
     sm = coord._state_machine[MigrationState.FENCING]
     assert "abort" not in sm  # COMPLETE_FENCING invariant
 
@@ -427,8 +535,10 @@ def test_provisioner_triple_execute_single_side_effect():
     orig = prov._launch
     prov._launch = lambda cid, op: (made.append(cid), orig(cid, op))[1]
     try:
-        results = [prov.provision_with_operation("pool-x", operation_id="op-3")
-                   for _ in range(3)]
+        results = [
+            prov.provision_with_operation("pool-x", operation_id="op-3")
+            for _ in range(3)
+        ]
     finally:
         prov._launch = orig
     assert [r.instance_id for r in results] == [results[0].instance_id] * 3
@@ -481,6 +591,7 @@ def test_transfer_manager_fails_closed():
 
 def test_plan_store_step_tracking(tmp_path):
     from orchestrator.migration_planner import MigrationPlanner
+
     reg = _registry(tmp_path)
     store = PlanStore()
     planner = MigrationPlanner()
@@ -488,11 +599,18 @@ def test_plan_store_step_tracking(tmp_path):
     v2dag = planner.to_v2_dag(plan)
     plan.plan_id = "plan-track-1"
     from orchestrator.models_v2 import MigrationPlanV2, compute_plan_hash
+
     v2plan = MigrationPlanV2(
-        plan_id="plan-track-1", job_id="job-1", migration_id=plan.migration_id,
-        regime="ARBITRAGE", source_pool_id="s", target_pool_id="t",
-        created_at="2026-01-01T00:00:00", expires_at="2099-01-01T00:00:00",
-        steps=v2dag)
+        plan_id="plan-track-1",
+        job_id="job-1",
+        migration_id=plan.migration_id,
+        regime="ARBITRAGE",
+        source_pool_id="s",
+        target_pool_id="t",
+        created_at="2026-01-01T00:00:00",
+        expires_at="2099-01-01T00:00:00",
+        steps=v2dag,
+    )
     v2plan.plan_hash = compute_plan_hash(v2plan)
     store.put_plan(v2plan)
     # Emulate coordinator tracking: PRECHECK running→succeeded across a hop.
@@ -500,4 +618,6 @@ def test_plan_store_step_tracking(tmp_path):
     store.update_step_state("plan-track-1", pre.step_id, "PENDING", "RUNNING")
     store.update_step_state("plan-track-1", pre.step_id, "RUNNING", "SUCCEEDED")
     doc = store.get_plan("plan-track-1")
-    assert next(s for s in doc["steps"] if s["type"] == "PRECHECK")["state"] == "SUCCEEDED"
+    assert (
+        next(s for s in doc["steps"] if s["type"] == "PRECHECK")["state"] == "SUCCEEDED"
+    )

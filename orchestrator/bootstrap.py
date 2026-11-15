@@ -10,21 +10,41 @@ to resume, what needs reconciliation, and what must halt. Wall-clock
 `absolute_deadline` is the conservative budget basis (monotonic anchors do
 not survive restart, Protocols §24.1).
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 # Canonical step order; the frontier is the furthest non-terminal step.
-STEP_ORDER = ["PRECHECK", "CHECKPOINT", "PERSIST", "PROVISION", "TRANSFER",
-              "RESTORE", "FENCE", "VALIDATE", "ACTIVATE", "FINALIZE"]
+STEP_ORDER = [
+    "PRECHECK",
+    "CHECKPOINT",
+    "PERSIST",
+    "PROVISION",
+    "TRANSFER",
+    "RESTORE",
+    "FENCE",
+    "VALIDATE",
+    "ACTIVATE",
+    "FINALIZE",
+]
 TERMINAL_STEP_STATES = {"SUCCEEDED", "FAILED", "SKIPPED"}
 # Post-fencing frontier: never roll back, forward recovery only (I4).
-POST_FENCE_STEPS = {"FENCING", "FENCE", "VALIDATING", "VALIDATE",
-                    "ACTIVATING", "ACTIVATE", "FINALIZING", "FINALIZE"}
+POST_FENCE_STEPS = {
+    "FENCING",
+    "FENCE",
+    "VALIDATING",
+    "VALIDATE",
+    "ACTIVATING",
+    "ACTIVATE",
+    "FINALIZING",
+    "FINALIZE",
+}
 
 
-def _parse_time(value: Any) -> Optional[datetime]:
+def _parse_time(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         ts = value
     elif isinstance(value, str) and value:
@@ -39,7 +59,7 @@ def _parse_time(value: Any) -> Optional[datetime]:
     return ts
 
 
-def _frontier(steps: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _frontier(steps: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Furthest started step not in a terminal state (plan order).
 
     Started (RUNNING/UNKNOWN) outranks merely PENDING: trailing PENDING
@@ -48,17 +68,19 @@ def _frontier(steps: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     all-PENDING plan resumes from its first step.
     """
     order = {name: i for i, name in enumerate(STEP_ORDER)}
-    pending = [s for s in steps
-               if str(s.get("state", "")).upper() not in TERMINAL_STEP_STATES]
+    pending = [
+        s for s in steps if str(s.get("state", "")).upper() not in TERMINAL_STEP_STATES
+    ]
     if not pending:
         return None
 
-    def _rank(step: Dict[str, Any]) -> int:
+    def _rank(step: dict[str, Any]) -> int:
         stype = str(step.get("type", "")).upper()
         return order.get(stype, len(order))
 
-    started = [s for s in pending
-               if str(s.get("state", "")).upper() in ("RUNNING", "UNKNOWN")]
+    started = [
+        s for s in pending if str(s.get("state", "")).upper() in ("RUNNING", "UNKNOWN")
+    ]
     candidates = started or pending
     # Furthest = max rank; ties keep document order (stable max).
     best, best_rank = None, -1
@@ -73,16 +95,19 @@ def bootstrap_recovery(
     *,
     lease: Any,
     plan_store: Any,
-    active_refs: Optional[List[Dict[str, Any]]] = None,
-    resolve_operation: Optional[Callable[[str], str]] = None,
-    now: Optional[datetime] = None,
-) -> Dict[str, Any]:
+    active_refs: list[dict[str, Any]] | None = None,
+    resolve_operation: Callable[[str], str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     """Run the §14.3 bootstrap. Returns a resume/reconcile/halt report."""
     now = now or datetime.now(timezone.utc)
-    report: Dict[str, Any] = {
-        "halted": False, "halt_reason": None,
-        "resumed": [], "abandoned": [],
-        "unknown_unresolved": [], "unknown_resolved": [],
+    report: dict[str, Any] = {
+        "halted": False,
+        "halt_reason": None,
+        "resumed": [],
+        "abandoned": [],
+        "unknown_unresolved": [],
+        "unknown_resolved": [],
         "orphans": [],
     }
 
@@ -119,13 +144,15 @@ def bootstrap_recovery(
                     outcome = str(resolve_operation(op_id)).upper()
                 except Exception:
                     outcome = "UNKNOWN"
-            entry = {"plan_id": plan_id,
-                     "migration_id": doc.get("migration_id"),
-                     "job_id": doc.get("job_id"),
-                     "step_id": step.get("step_id"),
-                     "step_type": str(step.get("type", "")).upper(),
-                     "operation_id": op_id,
-                     "outcome": outcome}
+            entry = {
+                "plan_id": plan_id,
+                "migration_id": doc.get("migration_id"),
+                "job_id": doc.get("job_id"),
+                "step_id": step.get("step_id"),
+                "step_type": str(step.get("type", "")).upper(),
+                "operation_id": op_id,
+                "outcome": outcome,
+            }
             if outcome in ("SUCCEEDED", "FAILED"):
                 report["unknown_resolved"].append(entry)
             else:
@@ -156,40 +183,46 @@ def bootstrap_recovery(
             # deadline never interrupts an in-progress ownership
             # transition — matching the live Coordinator, which continues
             # post-fence instead of aborting.
-            report["abandoned"].append({
-                "plan_id": plan_id, "migration_id": doc.get("migration_id"),
-                "job_id": doc.get("job_id"),
-                "reason": "DEADLINE_EXCEEDED"})
+            report["abandoned"].append(
+                {
+                    "plan_id": plan_id,
+                    "migration_id": doc.get("migration_id"),
+                    "job_id": doc.get("job_id"),
+                    "reason": "DEADLINE_EXCEEDED",
+                }
+            )
             continue
-        report["resumed"].append({
-            "plan_id": plan_id,
-            "migration_id": doc.get("migration_id"),
-            "job_id": doc.get("job_id"),
-            "resume_from_step": frontier.get("step_id"),
-            "resume_from_type": ftype,
-            "forward_only": forward,
-            "remaining_budget_seconds": remaining,
-        })
+        report["resumed"].append(
+            {
+                "plan_id": plan_id,
+                "migration_id": doc.get("migration_id"),
+                "job_id": doc.get("job_id"),
+                "resume_from_step": frontier.get("step_id"),
+                "resume_from_type": ftype,
+                "forward_only": forward,
+                "remaining_budget_seconds": remaining,
+            }
+        )
 
     # 6. Sweep: registry refs with no plan record ⇒ orphan findings input.
     for ref in active_refs or []:
-        mid = (ref.get("migration_id") if isinstance(ref, dict) else None)
+        mid = ref.get("migration_id") if isinstance(ref, dict) else None
         if mid and mid not in known_migrations:
             report["orphans"].append(ref)
 
     return report
 
 
-def collect_active_refs(registry: Any,
-                        states: tuple = ("MIGRATING",
-                                         "RECONCILIATION_REQUIRED")) -> List[Dict[str, Any]]:
+def collect_active_refs(
+    registry: Any, states: tuple = ("MIGRATING", "RECONCILIATION_REQUIRED")
+) -> list[dict[str, Any]]:
     """Gather registry active-migration refs for the orphan sweep (§14.3.6).
 
     Never raises: an unreadable registry yields no refs (the bootstrap
     then treats every in-flight plan as unowned-by-registry, which the
     sweep surfaces rather than hides).
     """
-    refs: List[Dict[str, Any]] = []
+    refs: list[dict[str, Any]] = []
     list_by_state = getattr(registry, "list_by_state", None)
     if not callable(list_by_state):
         return refs
@@ -202,20 +235,25 @@ def collect_active_refs(registry: Any,
             if not isinstance(job, dict):
                 continue
             if job.get("active_migration_id"):
-                refs.append({
-                    "job_id": job.get("job_id"),
-                    "migration_id": job.get("active_migration_id"),
-                    "execution_epoch": int(job.get("execution_epoch", 0) or 0),
-                })
+                refs.append(
+                    {
+                        "job_id": job.get("job_id"),
+                        "migration_id": job.get("active_migration_id"),
+                        "execution_epoch": int(job.get("execution_epoch", 0) or 0),
+                    }
+                )
     return refs
 
 
-def fence_adjacent_unresolved(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+def fence_adjacent_unresolved(report: dict[str, Any]) -> list[dict[str, Any]]:
     """Unknown-outcome entries at/after the fence frontier (S10 triage).
 
     These must gate on reconciliation (never inferred, never resumed):
     ownership may already have moved. Pre-fence unknowns are left to the
     periodic sweep (stale/dangling findings), which already covers them.
     """
-    return [e for e in report.get("unknown_unresolved", [])
-            if str(e.get("step_type", "")).upper() in POST_FENCE_STEPS]
+    return [
+        e
+        for e in report.get("unknown_unresolved", [])
+        if str(e.get("step_type", "")).upper() in POST_FENCE_STEPS
+    ]

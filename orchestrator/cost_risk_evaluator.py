@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 from enum import Enum
 
-from orchestrator.workload_estimator import WorkloadEstimate
 from orchestrator.recovery_feasibility import RecoveryFeasibility
+from orchestrator.workload_estimator import WorkloadEstimate
 
 
 class CostComponent(str, Enum):
@@ -102,7 +101,10 @@ class CostRiskEvaluator:
         return CostAnalysis(
             status="STAY_EVALUATED",
             cost_breakdown=breakdown,
-            assumptions=["No migration performed", "Risk modeled as interruption probability"],
+            assumptions=[
+                "No migration performed",
+                "Risk modeled as interruption probability",
+            ],
             confidence=workload_estimate.prediction_confidence,
             evaluated_at=datetime.utcnow(),
             estimator_version=workload_estimate.estimator_version,
@@ -115,12 +117,12 @@ class CostRiskEvaluator:
         candidate_price_per_hour: float,
         workload_estimate: WorkloadEstimate,
         interruption_risk: float,
-        checkpoint_size_bytes: Optional[int] = None,
-        checkpoint_duration_seconds: Optional[float] = None,
-        transfer_duration_seconds: Optional[float] = None,
-        provision_duration_seconds: Optional[float] = None,
-        restore_duration_seconds: Optional[float] = None,
-        validation_duration_seconds: Optional[float] = None,
+        checkpoint_size_bytes: int | None = None,
+        checkpoint_duration_seconds: float | None = None,
+        transfer_duration_seconds: float | None = None,
+        provision_duration_seconds: float | None = None,
+        restore_duration_seconds: float | None = None,
+        validation_duration_seconds: float | None = None,
         provisioning_cost: float = 0.0,
         restore_cost: float = 0.0,
         validation_cost: float = 0.0,
@@ -197,9 +199,11 @@ class CostRiskEvaluator:
         )
 
     @staticmethod
-    def short_job_band(remaining_runtime_seconds: Optional[float],
-                       short_seconds: float = 900.0,
-                       medium_seconds: float = 3600.0) -> str:
+    def short_job_band(
+        remaining_runtime_seconds: float | None,
+        short_seconds: float = 900.0,
+        medium_seconds: float = 3600.0,
+    ) -> str:
         """ADR-007 workload bands: SHORT / MEDIUM / LONG."""
         if not remaining_runtime_seconds:
             return "UNKNOWN"
@@ -210,14 +214,18 @@ class CostRiskEvaluator:
         return "LONG"
 
     @staticmethod
-    def medium_band_net_benefit_ok(expected_savings: float,
-                                   total_migration_cost: float,
-                                   remaining_savings: float,
-                                   multiplier: float = 2.0,
-                                   savings_fraction: float = 0.20) -> tuple[bool, float]:
+    def medium_band_net_benefit_ok(
+        expected_savings: float,
+        total_migration_cost: float,
+        remaining_savings: float,
+        multiplier: float = 2.0,
+        savings_fraction: float = 0.20,
+    ) -> tuple[bool, float]:
         """ADR-007 MEDIUM rule. Returns (ok, required_threshold)."""
-        required = max(total_migration_cost * multiplier,
-                       max(remaining_savings, 0.0) * savings_fraction)
+        required = max(
+            total_migration_cost * multiplier,
+            max(remaining_savings, 0.0) * savings_fraction,
+        )
         return expected_savings >= required, required
 
     def evaluate_recovery(
@@ -233,23 +241,33 @@ class CostRiskEvaluator:
         if recovery_feasibility.critical_path_seconds:
             recovery_hours = recovery_feasibility.critical_path_seconds / 3600
             recovery_cost = recovery_hours * candidate_price_per_hour
-            assumptions.append(f"Recovery execution cost: {recovery_hours:.2f}h at ${candidate_price_per_hour}/h")
+            assumptions.append(
+                f"Recovery execution cost: {recovery_hours:.2f}h at ${candidate_price_per_hour}/h"
+            )
 
         if recovery_feasibility.steps:
             for step in recovery_feasibility.steps:
                 if step.name == "checkpoint" and step.estimated_seconds:
-                    assumptions.append(f"Checkpoint overhead: {step.estimated_seconds:.0f}s")
+                    assumptions.append(
+                        f"Checkpoint overhead: {step.estimated_seconds:.0f}s"
+                    )
                 if step.name == "provision" and step.estimated_seconds:
-                    assumptions.append(f"Provisioning overhead: {step.estimated_seconds:.0f}s")
+                    assumptions.append(
+                        f"Provisioning overhead: {step.estimated_seconds:.0f}s"
+                    )
 
         alternative_cost = float("inf")
         if workload_estimate.remaining_runtime_seconds:
             alt_hours = workload_estimate.remaining_runtime_seconds / 3600
             alternative_cost = alt_hours * current_price_per_hour
-            assumptions.append(f"Alternative (stay) cost: {alt_hours:.2f}h at ${current_price_per_hour}/h")
+            assumptions.append(
+                f"Alternative (stay) cost: {alt_hours:.2f}h at ${current_price_per_hour}/h"
+            )
 
         return RecoveryCostAnalysis(
-            status="RECOVERY_EVALUATED" if recovery_feasibility.status.value == "FEASIBLE" else "RECOVERY_INFEASIBLE",
+            status="RECOVERY_EVALUATED"
+            if recovery_feasibility.status.value == "FEASIBLE"
+            else "RECOVERY_INFEASIBLE",
             recovery_cost=recovery_cost,
             alternative_cost=alternative_cost,
             assumptions=assumptions,

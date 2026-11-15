@@ -1,7 +1,6 @@
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional
 import logging
+from dataclasses import dataclass
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -10,11 +9,11 @@ logger = logging.getLogger(__name__)
 class WorkloadObservation:
     job_id: str
     execution_epoch: int
-    progress: Optional[float]
-    checkpoint_size_bytes: Optional[int]
-    checkpoint_duration_seconds: Optional[float]
-    cpu_utilization: Optional[float]
-    memory_utilization: Optional[float]
+    progress: float | None
+    checkpoint_size_bytes: int | None
+    checkpoint_duration_seconds: float | None
+    cpu_utilization: float | None
+    memory_utilization: float | None
     observed_at: datetime
     observation_confidence: float
     source: str = "worker"
@@ -24,12 +23,12 @@ class WorkloadObservation:
 class WorkloadEstimate:
     job_id: str
     execution_epoch: int
-    progress: Optional[float]
-    remaining_runtime_seconds: Optional[float]
-    expected_completion_at: Optional[datetime]
+    progress: float | None
+    remaining_runtime_seconds: float | None
+    expected_completion_at: datetime | None
     prediction_confidence: float
-    checkpoint_size_estimate_bytes: Optional[int]
-    checkpoint_duration_estimate_seconds: Optional[float]
+    checkpoint_size_estimate_bytes: int | None
+    checkpoint_duration_estimate_seconds: float | None
     estimated_at: datetime
     estimator_version: str
     model_version: str
@@ -45,7 +44,7 @@ class EstimatorConfig:
 
 
 class WorkloadEstimator:
-    def __init__(self, config: Optional[EstimatorConfig] = None):
+    def __init__(self, config: EstimatorConfig | None = None):
         self.config = config or EstimatorConfig()
         self._observation_history: dict[str, list[WorkloadObservation]] = {}
 
@@ -54,23 +53,31 @@ class WorkloadEstimator:
         job_id: str,
         execution_epoch: int,
         workload_type: str,
-        observation: Optional[WorkloadObservation] = None,
-        checkpoint_history: Optional[list[dict]] = None,
+        observation: WorkloadObservation | None = None,
+        checkpoint_history: list[dict] | None = None,
     ) -> WorkloadEstimate:
         if observation is None:
             return self._conservative_estimate(job_id, execution_epoch, workload_type)
 
         self._record_observation(job_id, observation)
 
-        if observation.progress is None or observation.observation_confidence < self.config.min_confidence_for_estimate:
+        if (
+            observation.progress is None
+            or observation.observation_confidence
+            < self.config.min_confidence_for_estimate
+        ):
             return self._conservative_estimate(job_id, execution_epoch, workload_type)
 
         remaining_runtime = self._predict_remaining_runtime(
             workload_type, observation.progress, observation
         )
 
-        checkpoint_size_est = self._predict_checkpoint_size(observation, checkpoint_history)
-        checkpoint_duration_est = self._predict_checkpoint_duration(observation, checkpoint_history)
+        checkpoint_size_est = self._predict_checkpoint_size(
+            observation, checkpoint_history
+        )
+        checkpoint_duration_est = self._predict_checkpoint_duration(
+            observation, checkpoint_history
+        )
 
         return WorkloadEstimate(
             job_id=job_id,
@@ -93,20 +100,24 @@ class WorkloadEstimator:
 
     def _predict_remaining_runtime(
         self, workload_type: str, progress: float, observation: WorkloadObservation
-    ) -> Optional[float]:
+    ) -> float | None:
         if progress <= 0 or progress >= 1.0:
             return None
 
         history = self._observation_history.get(observation.job_id, [])
         if len(history) < 2:
-            return self._heuristic_remaining_runtime(workload_type, progress, observation)
+            return self._heuristic_remaining_runtime(
+                workload_type, progress, observation
+            )
 
         recent = history[-2:]
         p1, t1 = recent[0].progress, recent[0].observed_at.timestamp()
         p2, t2 = recent[1].progress, recent[1].observed_at.timestamp()
 
         if p2 <= p1 or t2 <= t1:
-            return self._heuristic_remaining_runtime(workload_type, progress, observation)
+            return self._heuristic_remaining_runtime(
+                workload_type, progress, observation
+            )
 
         rate = (p2 - p1) / (t2 - t1)
         if rate <= 0:
@@ -117,7 +128,7 @@ class WorkloadEstimator:
 
     def _heuristic_remaining_runtime(
         self, workload_type: str, progress: float, observation: WorkloadObservation
-    ) -> Optional[float]:
+    ) -> float | None:
         type_defaults = {
             "short": 300,
             "medium": 3600,
@@ -130,10 +141,13 @@ class WorkloadEstimator:
         return base_duration
 
     def _predict_checkpoint_size(
-        self, observation: WorkloadObservation, history: Optional[list[dict]]
-    ) -> Optional[int]:
+        self, observation: WorkloadObservation, history: list[dict] | None
+    ) -> int | None:
         if observation.checkpoint_size_bytes is not None:
-            est = int(observation.checkpoint_size_bytes * self.config.default_checkpoint_overhead_factor)
+            est = int(
+                observation.checkpoint_size_bytes
+                * self.config.default_checkpoint_overhead_factor
+            )
             if history:
                 avg_actual = sum(h.get("size_bytes", 0) for h in history) / len(history)
                 est = int((est + avg_actual) / 2)
@@ -144,12 +158,17 @@ class WorkloadEstimator:
         return None
 
     def _predict_checkpoint_duration(
-        self, observation: WorkloadObservation, history: Optional[list[dict]]
-    ) -> Optional[float]:
+        self, observation: WorkloadObservation, history: list[dict] | None
+    ) -> float | None:
         if observation.checkpoint_duration_seconds is not None:
-            est = observation.checkpoint_duration_seconds * self.config.default_checkpoint_overhead_factor
+            est = (
+                observation.checkpoint_duration_seconds
+                * self.config.default_checkpoint_overhead_factor
+            )
             if history:
-                avg_actual = sum(h.get("duration_seconds", 0) for h in history) / len(history)
+                avg_actual = sum(h.get("duration_seconds", 0) for h in history) / len(
+                    history
+                )
                 est = (est + avg_actual) / 2
             return est
         if history:

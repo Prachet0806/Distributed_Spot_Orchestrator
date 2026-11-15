@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+
 from storage.backend import Documents
 
 
@@ -24,5 +25,7 @@ class ConfigStore:
             return deepcopy(payload)
 
     def resolve(self, pins: dict[str, str]) -> dict:
-        return {domain: self._docs.get(f"{domain}@{version}")["payload"]
-                for domain, version in pins.items()}
+        return {
+            domain: self._docs.get(f"{domain}@{version}")["payload"]
+            for domain, version in pins.items()
+        }

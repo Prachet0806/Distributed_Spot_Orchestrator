@@ -5,6 +5,7 @@ Vehicles: S09 (crash at every migration state → resume, RPO 0), S10
 mid-FENCING → safe forward conclusion), IA-1 (crash ≠ workload failure)
 unit evidence. All emulated: no AWS, no actuation (report-only).
 """
+
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -60,19 +61,28 @@ class _MemPlanStore:
         self._docs = {d["plan_id"]: d for d in docs}
 
     def list_active(self):
-        return [d for d in self._docs.values()
-                if any(str(s.get("state", "")).upper()
-                       not in ("SUCCEEDED", "FAILED", "SKIPPED")
-                       for s in d.get("steps", []))]
+        return [
+            d
+            for d in self._docs.values()
+            if any(
+                str(s.get("state", "")).upper()
+                not in ("SUCCEEDED", "FAILED", "SKIPPED")
+                for s in d.get("steps", [])
+            )
+        ]
 
 
 def _step(sid, stype, state="PENDING", op=None):
-    return {"step_id": sid, "type": stype, "state": state,
-            "operation_id": op}
+    return {"step_id": sid, "type": stype, "state": state, "operation_id": op}
 
 
-def _crashed_at(frontier_type, frontier_state="RUNNING", deadline=FUTURE,
-                plan_id="plan-1", unknown_op=None):
+def _crashed_at(
+    frontier_type,
+    frontier_state="RUNNING",
+    deadline=FUTURE,
+    plan_id="plan-1",
+    unknown_op=None,
+):
     """Plan doc as if CPR died with the frontier at `frontier_type`.
 
     Lists steps up to the frontier only (store convention: unreached
@@ -81,22 +91,34 @@ def _crashed_at(frontier_type, frontier_state="RUNNING", deadline=FUTURE,
     steps = []
     for name in STEP_ORDER:
         if name == frontier_type:
-            state = ("UNKNOWN" if unknown_op else frontier_state)
-            steps.append(_step(f"s-{name.lower()}", name, state,
-                               op=unknown_op if unknown_op else None))
+            state = "UNKNOWN" if unknown_op else frontier_state
+            steps.append(
+                _step(
+                    f"s-{name.lower()}",
+                    name,
+                    state,
+                    op=unknown_op if unknown_op else None,
+                )
+            )
             break
         steps.append(_step(f"s-{name.lower()}", name, "SUCCEEDED"))
-    return {"plan_id": plan_id, "migration_id": "m-1", "job_id": "job-1",
-            "plan_hash": "h", "version": 1, "absolute_deadline": deadline,
-            "steps": steps}
+    return {
+        "plan_id": plan_id,
+        "migration_id": "m-1",
+        "job_id": "job-1",
+        "plan_hash": "h",
+        "version": 1,
+        "absolute_deadline": deadline,
+        "steps": steps,
+    }
 
 
 # -- S09: crash at every migration state resumes at the frontier --
 @pytest.mark.parametrize("step_type", STEP_ORDER)
 def test_s09_crash_at_every_state_resumes_at_frontier(step_type):
     rep = bootstrap_recovery(
-        lease=_Lease(), plan_store=_MemPlanStore([_crashed_at(step_type)]),
-        now=NOW)
+        lease=_Lease(), plan_store=_MemPlanStore([_crashed_at(step_type)]), now=NOW
+    )
     assert not rep["halted"]
     assert len(rep["resumed"]) == 1
     resumed = rep["resumed"][0]
@@ -111,9 +133,14 @@ def test_s09_crash_at_every_state_resumes_at_frontier(step_type):
 def test_unknown_resolved_at_every_state_resumes(step_type):
     doc = _crashed_at(step_type, unknown_op="op-9")
     rep = bootstrap_recovery(
-        lease=_Lease(), plan_store=_MemPlanStore([doc]),
-        resolve_operation=lambda op: "SUCCEEDED", now=NOW)
-    assert rep["unknown_resolved"] and rep["unknown_resolved"][0]["operation_id"] == "op-9"
+        lease=_Lease(),
+        plan_store=_MemPlanStore([doc]),
+        resolve_operation=lambda op: "SUCCEEDED",
+        now=NOW,
+    )
+    assert (
+        rep["unknown_resolved"] and rep["unknown_resolved"][0]["operation_id"] == "op-9"
+    )
     assert rep["unknown_resolved"][0]["step_type"] == step_type
     assert [r["plan_id"] for r in rep["resumed"]] == ["plan-1"]
     assert rep["unknown_unresolved"] == []
@@ -123,8 +150,11 @@ def test_unknown_resolved_at_every_state_resumes(step_type):
 def test_unknown_unresolved_at_any_state_is_held(step_type):
     doc = _crashed_at(step_type, unknown_op="op-lost")
     rep = bootstrap_recovery(
-        lease=_Lease(), plan_store=_MemPlanStore([doc]),
-        resolve_operation=lambda op: "UNKNOWN", now=NOW)
+        lease=_Lease(),
+        plan_store=_MemPlanStore([doc]),
+        resolve_operation=lambda op: "UNKNOWN",
+        now=NOW,
+    )
     assert rep["resumed"] == []  # never inferred, never resumed
     assert len(rep["unknown_unresolved"]) == 1
     entry = rep["unknown_unresolved"][0]
@@ -138,21 +168,20 @@ def test_s17_expired_post_fence_frontier_resumes_forward_only(step_type):
     rep = bootstrap_recovery(
         lease=_Lease(),
         plan_store=_MemPlanStore([_crashed_at(step_type, deadline=PAST)]),
-        now=NOW)
+        now=NOW,
+    )
     assert rep["abandoned"] == []  # COMPLETE_FENCING: deadline never interrupts
     assert len(rep["resumed"]) == 1
     assert rep["resumed"][0]["forward_only"] is True
     assert rep["resumed"][0]["remaining_budget_seconds"] < 0
 
 
-@pytest.mark.parametrize("alias", ["FENCING", "VALIDATING", "ACTIVATING",
-                                   "FINALIZING"])
+@pytest.mark.parametrize("alias", ["FENCING", "VALIDATING", "ACTIVATING", "FINALIZING"])
 def test_state_name_aliases_classify_forward_only(alias):
     """MigrationState names (vs PlanStepType names) are fence-adjacent too."""
     doc = _crashed_at("TRANSFER", deadline=PAST)
     doc["steps"].append(_step("s-alias", alias, "RUNNING"))
-    rep = bootstrap_recovery(
-        lease=_Lease(), plan_store=_MemPlanStore([doc]), now=NOW)
+    rep = bootstrap_recovery(lease=_Lease(), plan_store=_MemPlanStore([doc]), now=NOW)
     assert rep["abandoned"] == []
     assert rep["resumed"][0]["forward_only"] is True
 
@@ -161,7 +190,8 @@ def test_expired_pre_fence_frontier_abandons():
     rep = bootstrap_recovery(
         lease=_Lease(),
         plan_store=_MemPlanStore([_crashed_at("TRANSFER", deadline=PAST)]),
-        now=NOW)
+        now=NOW,
+    )
     assert rep["resumed"] == []
     assert rep["abandoned"][0]["reason"] == "DEADLINE_EXCEEDED"
     assert rep["abandoned"][0]["job_id"] == "job-1"
@@ -181,11 +211,13 @@ def test_s10_fence_unknown_gates_while_transfer_unknown_sweeps():
         _step("s-fence", "FENCE", "UNKNOWN", op="op-fence"),
         _step("s-validate", "VALIDATE", "PENDING"),
     ]
-    transfer_doc = _crashed_at("TRANSFER", unknown_op="op-xfer",
-                               plan_id="plan-2")
+    transfer_doc = _crashed_at("TRANSFER", unknown_op="op-xfer", plan_id="plan-2")
     rep = bootstrap_recovery(
-        lease=_Lease(), plan_store=_MemPlanStore([fence_doc, transfer_doc]),
-        resolve_operation=lambda op: "UNKNOWN", now=NOW)
+        lease=_Lease(),
+        plan_store=_MemPlanStore([fence_doc, transfer_doc]),
+        resolve_operation=lambda op: "UNKNOWN",
+        now=NOW,
+    )
     assert rep["resumed"] == []
     gated = fence_adjacent_unresolved(rep)
     assert [e["operation_id"] for e in gated] == ["op-fence"]
@@ -230,6 +262,7 @@ def test_lease_guard_reports_lease_errors():
     class _Boom:
         def is_holder(self):
             raise RuntimeError("store gone")
+
     ok, action = check_lease_for_iteration(_Boom())
     assert ok is False and action.startswith("lease-error")
 
@@ -239,13 +272,29 @@ def test_collect_active_refs_from_registry_states():
     class _Reg:
         def list_by_state(self, state):
             if state == "MIGRATING":
-                return [{"job_id": "j1", "state": "MIGRATING",
-                         "execution_epoch": 3, "active_migration_id": "m-1"},
-                        {"job_id": "j2", "state": "MIGRATING",
-                         "execution_epoch": 0, "active_migration_id": None}]
+                return [
+                    {
+                        "job_id": "j1",
+                        "state": "MIGRATING",
+                        "execution_epoch": 3,
+                        "active_migration_id": "m-1",
+                    },
+                    {
+                        "job_id": "j2",
+                        "state": "MIGRATING",
+                        "execution_epoch": 0,
+                        "active_migration_id": None,
+                    },
+                ]
             if state == "RECONCILIATION_REQUIRED":
-                return [{"job_id": "j3", "state": "RECONCILIATION_REQUIRED",
-                         "execution_epoch": 1, "active_migration_id": "m-3"}]
+                return [
+                    {
+                        "job_id": "j3",
+                        "state": "RECONCILIATION_REQUIRED",
+                        "execution_epoch": 1,
+                        "active_migration_id": "m-3",
+                    }
+                ]
             raise AssertionError("unexpected state " + state)
 
     refs = collect_active_refs(_Reg())

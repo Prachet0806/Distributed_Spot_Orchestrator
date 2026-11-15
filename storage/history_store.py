@@ -1,14 +1,20 @@
 # storage/history_store.py — migration history (insert-once, enrich-once).
 """Dynamo shape (when wired): table `spot_arbitrage_migration_history`,
 PK `migration_id`, GSI `job_id`. Estimated vs actual stay distinct."""
+
 from __future__ import annotations
 
 from copy import deepcopy
-from storage.backend import Documents, encode, decode
+
+from storage.backend import Documents
 
 
 class HistoryStore:
-    def __init__(self, table_name: str = "spot_arbitrage_migration_history", dynamodb_resource=None):
+    def __init__(
+        self,
+        table_name: str = "spot_arbitrage_migration_history",
+        dynamodb_resource=None,
+    ):
         self.table_name = table_name
         self.dynamodb = dynamodb_resource
         self._docs = Documents("migration_id", table_name, dynamodb_resource)
@@ -34,7 +40,9 @@ class HistoryStore:
             raise RuntimeError(f"history {migration_id} already enriched")
         for k, v in patch.items():
             if k in doc and k.startswith("estimated_"):
-                raise RuntimeError(f"estimated field {k} immutable; write actual_* instead")
+                raise RuntimeError(
+                    f"estimated field {k} immutable; write actual_* instead"
+                )
             doc[k] = deepcopy(v)
         doc["_enriched"] = True
         version = doc.get("version", 0)

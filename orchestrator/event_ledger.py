@@ -1,9 +1,7 @@
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, List, Dict
-import uuid
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -21,16 +19,16 @@ class EventLedgerEntry:
     consumer_id: str
     status: ProcessingStatus = ProcessingStatus.PENDING
     received_at: datetime = field(default_factory=datetime.utcnow)
-    processed_at: Optional[datetime] = None
+    processed_at: datetime | None = None
     attempt_count: int = 0
-    last_error: Optional[str] = None
+    last_error: str | None = None
 
 
 class EventLedger:
     def __init__(self, table_name: str = None, dynamodb_resource: any = None):
         self.table_name = table_name or "spot_arbitrage_event_ledger"
         self.dynamodb = dynamodb_resource
-        self._local_cache: Dict[str, Dict[str, EventLedgerEntry]] = {}
+        self._local_cache: dict[str, dict[str, EventLedgerEntry]] = {}
 
     def record(self, event_id: str, consumer_id: str) -> bool:
         key = (event_id, consumer_id)
@@ -114,7 +112,9 @@ class EventLedger:
     def has_processed(self, event_id: str, consumer_id: str) -> bool:
         if self.dynamodb:
             table = self.dynamodb.Table(self.table_name)
-            resp = table.get_item(Key={"event_id": event_id, "consumer_id": consumer_id})
+            resp = table.get_item(
+                Key={"event_id": event_id, "consumer_id": consumer_id}
+            )
             item = resp.get("Item")
             if item:
                 return item.get("status") == "COMPLETED"
@@ -134,7 +134,8 @@ class EventLedger:
         try:
             if self.dynamodb is not None:
                 resp = self.dynamodb.Table(self.table_name).get_item(
-                    Key={"event_id": event_id, "consumer_id": consumer_id})
+                    Key={"event_id": event_id, "consumer_id": consumer_id}
+                )
                 return (resp.get("Item") or {}).get("status") == "FAILED"
             entry = self._local_cache.get(event_id, {}).get(consumer_id)
             return entry is not None and entry.status == ProcessingStatus.FAILED

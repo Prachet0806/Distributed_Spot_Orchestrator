@@ -1,9 +1,10 @@
+import logging
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Callable, Any
-import logging
-import uuid
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +47,14 @@ class FindingStatus(str, Enum):
 
 
 # Findings that gate recovery until ownership is re-established.
-OWNERSHIP_GATE_TYPES = frozenset({
-    MismatchType.SPLIT_BRAIN, MismatchType.UNKNOWN_OWNERSHIP,
-    MismatchType.EPOCH_MISMATCH, MismatchType.SOURCE_STILL_ALIVE_AFTER_FENCE,
-})
+OWNERSHIP_GATE_TYPES = frozenset(
+    {
+        MismatchType.SPLIT_BRAIN,
+        MismatchType.UNKNOWN_OWNERSHIP,
+        MismatchType.EPOCH_MISMATCH,
+        MismatchType.SOURCE_STILL_ALIVE_AFTER_FENCE,
+    }
+)
 
 _STATUS_FLOW = {
     FindingStatus.OPEN: {FindingStatus.ACKNOWLEDGED, FindingStatus.ESCALATED},
@@ -64,7 +69,7 @@ _STATUS_FLOW = {
 class ReconciliationFinding:
     finding_id: str
     job_id: str
-    migration_id: Optional[str]
+    migration_id: str | None
     mismatch_type: MismatchType
     severity: str
     details: dict
@@ -89,7 +94,7 @@ class RemediationRequest:
     parameters: dict
     priority: int
     requested_at: datetime
-    authorized_by: Optional[str] = None
+    authorized_by: str | None = None
 
 
 class ReconciliationManager:
@@ -109,7 +114,7 @@ class ReconciliationManager:
         registry: Any,
         infrastructure_monitor: Any,
         cleanup_executor: Any,
-        remediation_callback: Optional[Callable] = None,
+        remediation_callback: Callable | None = None,
         plan_store: Any = None,
         checkpoint_store: Any = None,
     ):
@@ -122,7 +127,9 @@ class ReconciliationManager:
         self._findings: dict[str, ReconciliationFinding] = {}
 
     # -- entry points --
-    def reconcile(self, trigger: ReconciliationTrigger = ReconciliationTrigger.PERIODIC_SWEEP) -> list[ReconciliationFinding]:
+    def reconcile(
+        self, trigger: ReconciliationTrigger = ReconciliationTrigger.PERIODIC_SWEEP
+    ) -> list[ReconciliationFinding]:
         if isinstance(trigger, str):
             trigger = ReconciliationTrigger(trigger)
         findings = []
@@ -154,13 +161,23 @@ class ReconciliationManager:
         }
         mtype = mapping.get(etype)
         if mtype is not None and job_id:
-            findings.append(self._new_finding(
-                job_id=job_id, migration_id=event.get("migration_id"),
-                mismatch_type=mtype, trigger=ReconciliationTrigger.EVENT_DRIVEN,
-                details=dict(event), execution_epoch=int(event.get("execution_epoch", 0) or 0),
-                severity="HIGH", confidence=0.9,
-                remediation={"type": "RECONCILE_OWNERSHIP",
-                             "reason": etype, "pre_authorized": False}))
+            findings.append(
+                self._new_finding(
+                    job_id=job_id,
+                    migration_id=event.get("migration_id"),
+                    mismatch_type=mtype,
+                    trigger=ReconciliationTrigger.EVENT_DRIVEN,
+                    details=dict(event),
+                    execution_epoch=int(event.get("execution_epoch", 0) or 0),
+                    severity="HIGH",
+                    confidence=0.9,
+                    remediation={
+                        "type": "RECONCILE_OWNERSHIP",
+                        "reason": etype,
+                        "pre_authorized": False,
+                    },
+                )
+            )
         for finding in findings:
             self._findings[finding.finding_id] = finding
             self._process_finding(finding)
@@ -170,19 +187,24 @@ class ReconciliationManager:
     def get_finding(self, finding_id: str) -> ReconciliationFinding:
         return self._findings[finding_id]
 
-    def list_findings(self, status: Optional[FindingStatus] = None) -> list[ReconciliationFinding]:
+    def list_findings(
+        self, status: FindingStatus | None = None
+    ) -> list[ReconciliationFinding]:
         findings = list(self._findings.values())
         if status is not None:
             findings = [f for f in findings if f.status == status]
         return findings
 
-    def transition_finding(self, finding_id: str, to_status: FindingStatus) -> ReconciliationFinding:
+    def transition_finding(
+        self, finding_id: str, to_status: FindingStatus
+    ) -> ReconciliationFinding:
         finding = self._findings[finding_id]
         if isinstance(to_status, str):
             to_status = FindingStatus(to_status)
         if to_status not in _STATUS_FLOW[finding.status]:
             raise RuntimeError(
-                f"Illegal finding transition {finding.status.value}->{to_status.value}")
+                f"Illegal finding transition {finding.status.value}->{to_status.value}"
+            )
         finding.status = to_status
         return finding
 
@@ -197,8 +219,13 @@ class ReconciliationManager:
         list_by_state = getattr(self.registry, "list_by_state", None)
         if callable(list_by_state):
             jobs: list[dict] = []
-            for state in ("RUNNING", "MIGRATING", "RECOVERY_REQUIRED",
-                          "RECONCILIATION_REQUIRED", "RESTART_REQUIRED"):
+            for state in (
+                "RUNNING",
+                "MIGRATING",
+                "RECOVERY_REQUIRED",
+                "RECONCILIATION_REQUIRED",
+                "RESTART_REQUIRED",
+            ):
                 try:
                     jobs.extend(list_by_state(state))
                 except Exception:
@@ -226,41 +253,60 @@ class ReconciliationManager:
         findings = []
         migration_id = job.get("active_migration_id")
         if not migration_id:
-            findings.append(self._new_finding(
-                job_id=job["job_id"], migration_id=None,
-                mismatch_type=MismatchType.DANGLING_MIGRATION_REFERENCE,
-                trigger=ReconciliationTrigger.PERIODIC_SWEEP,
-                details={"registry_state": job.get("state"),
-                         "active_migration_id": None},
-                execution_epoch=int(job.get("execution_epoch", 0) or 0),
-                severity="MEDIUM", confidence=0.9,
-                remediation={"type": "CLEAR_DANGLING_MIGRATION",
-                             "reason": "MIGRATING without active reference",
-                             "pre_authorized": False}))
+            findings.append(
+                self._new_finding(
+                    job_id=job["job_id"],
+                    migration_id=None,
+                    mismatch_type=MismatchType.DANGLING_MIGRATION_REFERENCE,
+                    trigger=ReconciliationTrigger.PERIODIC_SWEEP,
+                    details={
+                        "registry_state": job.get("state"),
+                        "active_migration_id": None,
+                    },
+                    execution_epoch=int(job.get("execution_epoch", 0) or 0),
+                    severity="MEDIUM",
+                    confidence=0.9,
+                    remediation={
+                        "type": "CLEAR_DANGLING_MIGRATION",
+                        "reason": "MIGRATING without active reference",
+                        "pre_authorized": False,
+                    },
+                )
+            )
             return findings
 
         if self.infrastructure_monitor is None:
             return findings
         try:
             infra_state = self.infrastructure_monitor.get_instance_state(
-                job.get("instance_id") or job.get("public_ip") or "")
+                job.get("instance_id") or job.get("public_ip") or ""
+            )
         except Exception:
             return findings
 
         if str(infra_state).upper() == "TERMINATED" and job.get("state") == "MIGRATING":
-            findings.append(self._new_finding(
-                job_id=job["job_id"], migration_id=migration_id,
-                mismatch_type=MismatchType.REGISTRY_INFRASTRUCTURE_MISMATCH,
-                trigger=ReconciliationTrigger.PERIODIC_SWEEP,
-                details={"infra_state": infra_state,
-                         "registry_state": job.get("state")},
-                observed_state={"instance": "TERMINATED"},
-                authoritative_state={"job_state": job.get("state")},
-                execution_epoch=int(job.get("execution_epoch", 0) or 0),
-                severity="HIGH", confidence=0.9,
-                remediation={"type": "RECONCILE_MIGRATION",
-                             "reason": "source terminated mid-migration",
-                             "pre_authorized": False}))
+            findings.append(
+                self._new_finding(
+                    job_id=job["job_id"],
+                    migration_id=migration_id,
+                    mismatch_type=MismatchType.REGISTRY_INFRASTRUCTURE_MISMATCH,
+                    trigger=ReconciliationTrigger.PERIODIC_SWEEP,
+                    details={
+                        "infra_state": infra_state,
+                        "registry_state": job.get("state"),
+                    },
+                    observed_state={"instance": "TERMINATED"},
+                    authoritative_state={"job_state": job.get("state")},
+                    execution_epoch=int(job.get("execution_epoch", 0) or 0),
+                    severity="HIGH",
+                    confidence=0.9,
+                    remediation={
+                        "type": "RECONCILE_MIGRATION",
+                        "reason": "source terminated mid-migration",
+                        "pre_authorized": False,
+                    },
+                )
+            )
         return findings
 
     def _check_running_job(self, job: dict) -> list[ReconciliationFinding]:
@@ -273,25 +319,38 @@ class ReconciliationManager:
         except Exception:
             return findings
         if str(infra_state).upper() == "TERMINATED":
-            findings.append(self._new_finding(
-                job_id=job["job_id"], migration_id=None,
-                mismatch_type=MismatchType.SOURCE_MISSING,
-                trigger=ReconciliationTrigger.PERIODIC_SWEEP,
-                details={"instance_id": instance_id, "infra_state": infra_state,
-                         "epoch": job.get("execution_epoch", 0)},
-                execution_epoch=int(job.get("execution_epoch", 0) or 0),
-                severity="HIGH", confidence=0.95,
-                remediation={"type": "RECOVER_FROM_CHECKPOINT",
-                             "reason": "running job lost its instance",
-                             "pre_authorized": False}))
+            findings.append(
+                self._new_finding(
+                    job_id=job["job_id"],
+                    migration_id=None,
+                    mismatch_type=MismatchType.SOURCE_MISSING,
+                    trigger=ReconciliationTrigger.PERIODIC_SWEEP,
+                    details={
+                        "instance_id": instance_id,
+                        "infra_state": infra_state,
+                        "epoch": job.get("execution_epoch", 0),
+                    },
+                    execution_epoch=int(job.get("execution_epoch", 0) or 0),
+                    severity="HIGH",
+                    confidence=0.95,
+                    remediation={
+                        "type": "RECOVER_FROM_CHECKPOINT",
+                        "reason": "running job lost its instance",
+                        "pre_authorized": False,
+                    },
+                )
+            )
         return findings
 
     def _check_reconciliation_required(self, job: dict) -> list[ReconciliationFinding]:
         # Re-surface unresolved ownership uncertainty until cleared.
-        open_gates = [f for f in self._findings.values()
-                      if f.job_id == job.get("job_id")
-                      and f.mismatch_type in OWNERSHIP_GATE_TYPES
-                      and f.status not in (FindingStatus.RESOLVED, FindingStatus.ESCALATED)]
+        open_gates = [
+            f
+            for f in self._findings.values()
+            if f.job_id == job.get("job_id")
+            and f.mismatch_type in OWNERSHIP_GATE_TYPES
+            and f.status not in (FindingStatus.RESOLVED, FindingStatus.ESCALATED)
+        ]
         return [] if open_gates else []
 
     def _check_orphan_resources(self) -> list[ReconciliationFinding]:
@@ -305,19 +364,30 @@ class ReconciliationManager:
         jobs = {j.get("job_id"): j for j in self._iter_jobs()}
         for plan in active_plans:
             job_id = plan.get("job_id")
-            if job_id not in jobs and plan.get("migration_id") != jobs.get(job_id, {}).get("active_migration_id"):
+            if job_id not in jobs and plan.get("migration_id") != jobs.get(
+                job_id, {}
+            ).get("active_migration_id"):
                 job = jobs.get(job_id, {})
                 if job.get("active_migration_id") != plan.get("migration_id"):
-                    findings.append(self._new_finding(
-                        job_id=job_id, migration_id=plan.get("migration_id"),
-                        mismatch_type=MismatchType.ORPHAN_INSTANCE,
-                        trigger=ReconciliationTrigger.PERIODIC_SWEEP,
-                        details={"plan_id": plan.get("plan_id"),
-                                 "target": plan.get("target_pool_id")},
-                        severity="MEDIUM", confidence=0.7,
-                        remediation={"type": "TERMINATE_ORPHAN_TARGET",
-                                     "reason": "plan active without job ownership",
-                                     "pre_authorized": False}))
+                    findings.append(
+                        self._new_finding(
+                            job_id=job_id,
+                            migration_id=plan.get("migration_id"),
+                            mismatch_type=MismatchType.ORPHAN_INSTANCE,
+                            trigger=ReconciliationTrigger.PERIODIC_SWEEP,
+                            details={
+                                "plan_id": plan.get("plan_id"),
+                                "target": plan.get("target_pool_id"),
+                            },
+                            severity="MEDIUM",
+                            confidence=0.7,
+                            remediation={
+                                "type": "TERMINATE_ORPHAN_TARGET",
+                                "reason": "plan active without job ownership",
+                                "pre_authorized": False,
+                            },
+                        )
+                    )
         return findings
 
     def _check_dangling_migrations(self) -> list[ReconciliationFinding]:
@@ -326,43 +396,65 @@ class ReconciliationManager:
             if job.get("state") not in ("RUNNING", "COMPLETED", "FAILED"):
                 continue
             if job.get("active_migration_id"):
-                findings.append(self._new_finding(
-                    job_id=job["job_id"],
-                    migration_id=job.get("active_migration_id"),
-                    mismatch_type=MismatchType.STALE_MIGRATION,
-                    trigger=ReconciliationTrigger.PERIODIC_SWEEP,
-                    details={"registry_state": job.get("state")},
-                    execution_epoch=int(job.get("execution_epoch", 0) or 0),
-                    severity="MEDIUM", confidence=0.85,
-                    remediation={"type": "CLEAR_STALE_REFERENCE",
-                                 "reason": "terminal/running job holds active migration",
-                                 "pre_authorized": False}))
+                findings.append(
+                    self._new_finding(
+                        job_id=job["job_id"],
+                        migration_id=job.get("active_migration_id"),
+                        mismatch_type=MismatchType.STALE_MIGRATION,
+                        trigger=ReconciliationTrigger.PERIODIC_SWEEP,
+                        details={"registry_state": job.get("state")},
+                        execution_epoch=int(job.get("execution_epoch", 0) or 0),
+                        severity="MEDIUM",
+                        confidence=0.85,
+                        remediation={
+                            "type": "CLEAR_STALE_REFERENCE",
+                            "reason": "terminal/running job holds active migration",
+                            "pre_authorized": False,
+                        },
+                    )
+                )
         return findings
 
     # -- processing --
-    def _new_finding(self, job_id: str, migration_id: Optional[str],
-                     mismatch_type: MismatchType,
-                     trigger: ReconciliationTrigger, details: dict,
-                     severity: str = "MEDIUM", confidence: float = 0.8,
-                     execution_epoch: int = 0,
-                     observed_state: dict = None,
-                     authoritative_state: dict = None,
-                     remediation: dict = None) -> ReconciliationFinding:
+    def _new_finding(
+        self,
+        job_id: str,
+        migration_id: str | None,
+        mismatch_type: MismatchType,
+        trigger: ReconciliationTrigger,
+        details: dict,
+        severity: str = "MEDIUM",
+        confidence: float = 0.8,
+        execution_epoch: int = 0,
+        observed_state: dict = None,
+        authoritative_state: dict = None,
+        remediation: dict = None,
+    ) -> ReconciliationFinding:
         return ReconciliationFinding(
             finding_id=f"REC-{uuid.uuid4().hex[:12]}",
-            job_id=job_id, migration_id=migration_id,
-            mismatch_type=mismatch_type, severity=severity,
-            details=details, detected_at=datetime.utcnow(), trigger=trigger,
-            suggested_action=(ReconciliationAction.AUTO_REMEDIATE
-                              if (remediation or {}).get("pre_authorized")
-                              else ReconciliationAction.REQUEST_REMEDIATION),
-            confidence=confidence, execution_epoch=execution_epoch,
-            observed_state=observed_state or {}, authoritative_state=authoritative_state or {},
+            job_id=job_id,
+            migration_id=migration_id,
+            mismatch_type=mismatch_type,
+            severity=severity,
+            details=details,
+            detected_at=datetime.utcnow(),
+            trigger=trigger,
+            suggested_action=(
+                ReconciliationAction.AUTO_REMEDIATE
+                if (remediation or {}).get("pre_authorized")
+                else ReconciliationAction.REQUEST_REMEDIATION
+            ),
+            confidence=confidence,
+            execution_epoch=execution_epoch,
+            observed_state=observed_state or {},
+            authoritative_state=authoritative_state or {},
             recommended_remediation=remediation or {},
         )
 
     def _process_finding(self, finding: ReconciliationFinding):
-        logger.warning(f"Reconciliation finding: {finding.mismatch_type.value} for job {finding.job_id}")
+        logger.warning(
+            f"Reconciliation finding: {finding.mismatch_type.value} for job {finding.job_id}"
+        )
         try:
             self.transition_finding(finding.finding_id, FindingStatus.ACKNOWLEDGED)
         except Exception:
@@ -386,8 +478,9 @@ class ReconciliationManager:
                 if job.get("state") != "RECONCILIATION_REQUIRED":
                     transition(finding.job_id, "RECONCILIATION_REQUIRED")
         except Exception as exc:
-            logger.error("Reconciliation gate transition failed for %s: %s",
-                         finding.job_id, exc)
+            logger.error(
+                "Reconciliation gate transition failed for %s: %s", finding.job_id, exc
+            )
 
     def _request_remediation(self, finding: ReconciliationFinding):
         try:
@@ -421,13 +514,20 @@ class ReconciliationManager:
             if self.cleanup_executor is None:
                 ok = False
             elif action in ("ABORT_MULTIPART", "DELETE_TEMPORARY"):
-                ok = bool(self.cleanup_executor.cleanup_orphan(
-                    finding.details.get("resource_id"),
-                    finding.details.get("resource_type", "checkpoint")))
+                ok = bool(
+                    self.cleanup_executor.cleanup_orphan(
+                        finding.details.get("resource_id"),
+                        finding.details.get("resource_type", "checkpoint"),
+                    )
+                )
             elif action == "TERMINATE_ORPHAN_TARGET":
-                ok = bool(self.cleanup_executor.cleanup_orphan(
-                    finding.details.get("target") or finding.details.get("resource_id"),
-                    "instance"))
+                ok = bool(
+                    self.cleanup_executor.cleanup_orphan(
+                        finding.details.get("target")
+                        or finding.details.get("resource_id"),
+                        "instance",
+                    )
+                )
             else:
                 self._request_remediation(finding)
                 return
@@ -437,7 +537,8 @@ class ReconciliationManager:
         try:
             self.transition_finding(
                 finding.finding_id,
-                FindingStatus.RESOLVED if ok else FindingStatus.ESCALATED)
+                FindingStatus.RESOLVED if ok else FindingStatus.ESCALATED,
+            )
         except Exception:
             pass
 
@@ -454,4 +555,6 @@ class ReconciliationManager:
             self.transition_finding(finding.finding_id, FindingStatus.ESCALATED)
         except Exception:
             pass
-        logger.error(f"ESCALATION: {finding.mismatch_type.value} for job {finding.job_id} - manual intervention required")
+        logger.error(
+            f"ESCALATION: {finding.mismatch_type.value} for job {finding.job_id} - manual intervention required"
+        )

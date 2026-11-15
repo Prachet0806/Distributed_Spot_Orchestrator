@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional, List
 from enum import Enum
-import uuid
 
 
 class EvidenceSource(str, Enum):
@@ -22,19 +20,19 @@ class CapacityStatus(str, Enum):
 @dataclass
 class PoolGPUProfile:
     required: bool = False
-    vendor: Optional[str] = None
-    model: Optional[str] = None
-    memory_gb: Optional[int] = None
-    compute_capability: Optional[str] = None
+    vendor: str | None = None
+    model: str | None = None
+    memory_gb: int | None = None
+    compute_capability: str | None = None
 
 
 @dataclass
 class PoolRuntimeProfile:
     artifact_digest: str
     architecture: str
-    kernel_version: Optional[str] = None
-    criu_version: Optional[str] = None
-    required_libraries: List[str] = field(default_factory=list)
+    kernel_version: str | None = None
+    criu_version: str | None = None
+    required_libraries: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -46,10 +44,10 @@ class PoolCapacityProfile:
 
 @dataclass
 class PoolPlacementConstraints:
-    allowed_regions: List[str] = field(default_factory=list)
-    allowed_azs: List[str] = field(default_factory=list)
-    affinity: List[str] = field(default_factory=list)
-    anti_affinity: List[str] = field(default_factory=list)
+    allowed_regions: list[str] = field(default_factory=list)
+    allowed_azs: list[str] = field(default_factory=list)
+    affinity: list[str] = field(default_factory=list)
+    anti_affinity: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -61,10 +59,12 @@ class CandidatePool:
     availability_zone: str
     instance_type: str
     architecture: str
-    gpu_profile: Optional[PoolGPUProfile] = None
+    gpu_profile: PoolGPUProfile | None = None
     runtime_profile: PoolRuntimeProfile = field(default_factory=PoolRuntimeProfile)
     capacity_profile: PoolCapacityProfile = field(default_factory=PoolCapacityProfile)
-    placement_constraints: PoolPlacementConstraints = field(default_factory=PoolPlacementConstraints)
+    placement_constraints: PoolPlacementConstraints = field(
+        default_factory=PoolPlacementConstraints
+    )
     created_at: datetime = field(default_factory=datetime.utcnow)
     version: int = 1
     # Track C3: pool lifecycle (ACTIVE→DEGRADED→RETIRING→RETIRED, §7.4.2)
@@ -75,6 +75,7 @@ class CandidatePool:
     def transition_lifecycle(self, target: str) -> str:
         """Advance lifecycle along legal edges; raises on illegal jumps."""
         from orchestrator.pool_lifecycle import transition_lifecycle
+
         self.lifecycle = transition_lifecycle(self.lifecycle, target)
         self.version += 1
         return self.lifecycle
@@ -139,7 +140,7 @@ class CandidatePoolRegistry:
             self._local_cache[pool.pool_id] = pool
         return pool
 
-    def get(self, pool_id: str) -> Optional[CandidatePool]:
+    def get(self, pool_id: str) -> CandidatePool | None:
         if self.dynamodb:
             table = self.dynamodb.Table(self.table_name)
             resp = table.get_item(Key={"pool_id": pool_id})
@@ -149,7 +150,7 @@ class CandidatePoolRegistry:
             return self._local_cache.get(pool_id)
         return None
 
-    def list_all(self) -> List[CandidatePool]:
+    def list_all(self) -> list[CandidatePool]:
         if self.dynamodb:
             table = self.dynamodb.Table(self.table_name)
             items = []
@@ -162,7 +163,9 @@ class CandidatePoolRegistry:
         else:
             return list(self._local_cache.values())
 
-    def update_version(self, pool_id: str, expected_version: int, new_version: int) -> bool:
+    def update_version(
+        self, pool_id: str, expected_version: int, new_version: int
+    ) -> bool:
         if self.dynamodb:
             table = self.dynamodb.Table(self.table_name)
             try:
@@ -170,7 +173,10 @@ class CandidatePoolRegistry:
                     Key={"pool_id": pool_id},
                     UpdateExpression="SET version = :nv",
                     ConditionExpression="version = :ev",
-                    ExpressionAttributeValues={":nv": new_version, ":ev": expected_version},
+                    ExpressionAttributeValues={
+                        ":nv": new_version,
+                        ":ev": expected_version,
+                    },
                 )
                 return True
             except Exception:

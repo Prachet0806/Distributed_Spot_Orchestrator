@@ -1,11 +1,13 @@
 """Track A6: §24.1 deadline computation — allowances, formula, budget."""
+
 from datetime import datetime, timedelta, timezone
 
-from orchestrator.deadlines import (
-    wan_allowance_seconds, compute_absolute_deadline,
-    remaining_budget_seconds,
-)
 from orchestrator.config_loader import load_v2_baseline
+from orchestrator.deadlines import (
+    compute_absolute_deadline,
+    remaining_budget_seconds,
+    wan_allowance_seconds,
+)
 
 
 def test_allowance_pair_specific_and_default():
@@ -19,8 +21,9 @@ def test_allowance_pair_specific_and_default():
 def test_absolute_deadline_formula():
     base = load_v2_baseline()
     t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-    ddl = compute_absolute_deadline(t0, 120.0, "us-east-1", "us-west-2",
-                                    "us-east-1", base)
+    ddl = compute_absolute_deadline(
+        t0, 120.0, "us-east-1", "us-west-2", "us-east-1", base
+    )
     # 120 window − 20 pair allowance − 5 skew.
     assert ddl == t0 + timedelta(seconds=95.0)
 

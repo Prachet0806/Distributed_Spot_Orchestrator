@@ -4,6 +4,7 @@ Vehicles: S21 (duplicate interruption → single recovery), S14 (dispatcher
 dedup, no double-actuation), §24.1 (deadline computed once at ingestion,
 carried immutably — never recomputed from fresh timestamps).
 """
+
 from datetime import datetime, timedelta, timezone
 
 from orchestrator import interruption_ingestion as ing
@@ -39,8 +40,12 @@ def _flag(detected_at=T0, source="imds", instance_id="i-1"):
 
 
 def _job(epoch=0):
-    return {"job_id": "job-1", "state": "RUNNING", "execution_epoch": epoch,
-            "instance_id": "i-1"}
+    return {
+        "job_id": "job-1",
+        "state": "RUNNING",
+        "execution_epoch": epoch,
+        "instance_id": "i-1",
+    }
 
 
 class _Reg:
@@ -72,8 +77,9 @@ def test_distinct_notices_distinct_ids():
     e2 = ing.ingest_interruption(_flag(later), job_id="job-1", baseline=BASELINE)
     assert e1.event_id != e2.event_id
     # Same instant, different instance ⇒ different interruption.
-    e3 = ing.ingest_interruption(_flag(instance_id="i-2"), job_id="job-1",
-                                 baseline=BASELINE)
+    e3 = ing.ingest_interruption(
+        _flag(instance_id="i-2"), job_id="job-1", baseline=BASELINE
+    )
     assert e3.event_id != e1.event_id
 
 
@@ -81,8 +87,9 @@ def test_malformed_flag_returns_none():
     assert ing.ingest_interruption(None, job_id="job-1") is None
     assert ing.ingest_interruption("garbage", job_id="job-1") is None
     assert ing.ingest_interruption({}, job_id="job-1") is None
-    assert ing.ingest_interruption({"detected_at": "not-a-time"},
-                                   job_id="job-1") is None
+    assert (
+        ing.ingest_interruption({"detected_at": "not-a-time"}, job_id="job-1") is None
+    )
     assert ing.ingest_interruption(_flag(), job_id="") is None
     assert ing.parse_flag_doc({"detected_at": "2026-13-99"}) is None
 
@@ -90,10 +97,16 @@ def test_malformed_flag_returns_none():
 # -- deadline computed once at ingestion (§24.1) --
 def test_deadline_uses_detected_at_not_now():
     evt = ing.ingest_interruption(
-        _flag(), job_id="job-1", source_region="us-east-1",
-        target_region="us-west-2", home_region="us-east-1", baseline=BASELINE)
+        _flag(),
+        job_id="job-1",
+        source_region="us-east-1",
+        target_region="us-west-2",
+        home_region="us-east-1",
+        baseline=BASELINE,
+    )
     expected = compute_absolute_deadline(
-        T0, 120.0, "us-east-1", "us-west-2", "us-east-1", BASELINE)
+        T0, 120.0, "us-east-1", "us-west-2", "us-east-1", BASELINE
+    )
     assert expected == T0 + timedelta(seconds=95.0)  # 120 − 20 pair − 5 skew
     assert evt.payload["absolute_deadline"] == expected.isoformat()
     assert evt.effective_at == T0  # ingestion time, not dispatch time
@@ -109,16 +122,16 @@ def test_fresh_event_is_actionable():
 
 
 def test_epoch_mismatch_is_stale():
-    evt = ing.ingest_interruption(_flag(), job_id="job-1", baseline=BASELINE,
-                                  execution_epoch=0)
+    evt = ing.ingest_interruption(
+        _flag(), job_id="job-1", baseline=BASELINE, execution_epoch=0
+    )
     stale, reason = ing.is_stale_event(evt, _job(epoch=1), now=T0)
     assert stale and "epoch-mismatch" in reason
 
 
 def test_expired_deadline_is_stale():
     evt = ing.ingest_interruption(_flag(), job_id="job-1", baseline=BASELINE)
-    stale, reason = ing.is_stale_event(
-        evt, _job(), now=T0 + timedelta(seconds=10_000))
+    stale, reason = ing.is_stale_event(evt, _job(), now=T0 + timedelta(seconds=10_000))
     assert stale and "deadline-exceeded" in reason
 
 
@@ -133,7 +146,8 @@ def test_dispatch_same_event_twice_actuates_once():
     dispatcher = EventDispatcher(event_ledger=EventLedger())
     calls = []
     dispatcher.register_consumer(
-        "SPOT_INTERRUPTION", EventConsumer("emergency-lane", calls.append))
+        "SPOT_INTERRUPTION", EventConsumer("emergency-lane", calls.append)
+    )
     evt = ing.ingest_interruption(_flag(), job_id="job-1", baseline=BASELINE)
     dispatcher.dispatch(evt)
     dispatcher.dispatch(evt)  # redelivery ⇒ ledger gate skips
@@ -143,6 +157,7 @@ def test_dispatch_same_event_twice_actuates_once():
 def test_failed_consumer_retries_on_redelivery_then_skips_when_done():
     """S14: FAILED re-arms exactly one attempt per redispatch; COMPLETED skips."""
     import pytest
+
     dispatcher = EventDispatcher(event_ledger=EventLedger())
     attempts = []
 
@@ -150,10 +165,10 @@ def test_failed_consumer_retries_on_redelivery_then_skips_when_done():
         attempts.append(event.event_id)
         if len(attempts) == 1:
             raise RuntimeError("transient")
-        return None
 
     dispatcher.register_consumer(
-        "SPOT_INTERRUPTION", EventConsumer("emergency-lane", _flaky))
+        "SPOT_INTERRUPTION", EventConsumer("emergency-lane", _flaky)
+    )
     evt = ing.ingest_interruption(_flag(), job_id="job-1", baseline=BASELINE)
     with pytest.raises(RuntimeError):
         dispatcher.dispatch(evt)  # attempt 1 fails, ledger FAILED
@@ -167,9 +182,11 @@ def test_interleaved_types_each_actuate_once():
     dispatcher = EventDispatcher(event_ledger=EventLedger())
     spot_calls, term_calls = [], []
     dispatcher.register_consumer(
-        "SPOT_INTERRUPTION", EventConsumer("emergency-lane", spot_calls.append))
+        "SPOT_INTERRUPTION", EventConsumer("emergency-lane", spot_calls.append)
+    )
     dispatcher.register_consumer(
-        "SOURCE_TERMINATED", EventConsumer("fence-watch", term_calls.append))
+        "SOURCE_TERMINATED", EventConsumer("fence-watch", term_calls.append)
+    )
     spot = ing.ingest_interruption(_flag(), job_id="job-1", baseline=BASELINE)
     term = _source_terminated_event()
     # Arrival order scrambled + duplicates: each (event, consumer) fires once.
@@ -183,10 +200,17 @@ def test_interleaved_types_each_actuate_once():
 def _source_terminated_event():
     now = datetime.now(timezone.utc)
     return Event(
-        event_id="evt-src-term-1", event_type=EventType.SOURCE_TERMINATED,
-        job_id="job-1", execution_epoch=0, migration_id="m-1",
-        correlation_id="evt-src-term-1", occurred_at=now, effective_at=now,
-        producer="test", payload={})
+        event_id="evt-src-term-1",
+        event_type=EventType.SOURCE_TERMINATED,
+        job_id="job-1",
+        execution_epoch=0,
+        migration_id="m-1",
+        correlation_id="evt-src-term-1",
+        occurred_at=now,
+        effective_at=now,
+        producer="test",
+        payload={},
+    )
 
 
 def test_source_terminated_routes_to_reconciliation():
@@ -208,6 +232,9 @@ def test_build_dispatcher_wires_recon_and_late_binds():
     recon = ReconciliationManager(_Reg(), None, None)
     dispatcher.set_reconciliation_manager(recon)
     dispatcher.dispatch(_source_terminated_event())
-    gated = [f for f in recon.list_findings()
-             if f.mismatch_type == MismatchType.SOURCE_STILL_ALIVE_AFTER_FENCE]
+    gated = [
+        f
+        for f in recon.list_findings()
+        if f.mismatch_type == MismatchType.SOURCE_STILL_ALIVE_AFTER_FENCE
+    ]
     assert len(gated) == 1

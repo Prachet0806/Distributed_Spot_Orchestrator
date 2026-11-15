@@ -1,8 +1,10 @@
 # orchestrator/config_loader.py
 import os
-import yaml
 import time
 from pathlib import Path
+
+import yaml
+
 from orchestrator.constants import CONFIG_CACHE_TTL
 
 RUNTIME_CONFIG_PATH = Path("config/runtime.yaml")
@@ -34,26 +36,25 @@ def _validate_config(result):
 def load_runtime_config(force_reload=False):
     """
     Loads runtime configuration for orchestrator components with caching.
-    
+
     Priority:
       1) Environment variables
       2) config/runtime.yaml (if present)
-    
+
     Args:
         force_reload: If True, bypass cache and reload from disk
-    
+
     Returns:
         Dict with runtime configuration
     """
     global _CONFIG_CACHE
-    
+
     now = time.time()
-    
-    # Check cache validity
+
     if not force_reload and _CONFIG_CACHE["data"]:
         # Check if cache is still fresh
         cache_age = now - _CONFIG_CACHE["cached_at"]
-        
+
         if cache_age < CONFIG_CACHE_TTL:
             # Check if file was modified
             if RUNTIME_CONFIG_PATH.exists():
@@ -65,28 +66,35 @@ def load_runtime_config(force_reload=False):
                 # File doesn't exist, cache env-only config
                 if cache_age < CONFIG_CACHE_TTL:
                     return _CONFIG_CACHE["data"]
-    
-    # Load from file
+
     cfg = {}
     file_mtime = 0
-    
+
     if RUNTIME_CONFIG_PATH.exists():
         file_mtime = RUNTIME_CONFIG_PATH.stat().st_mtime
         with open(RUNTIME_CONFIG_PATH) as f:
             cfg = yaml.safe_load(f) or {}
-    
+
     # Env vars take precedence
     checkpoint_bucket = os.getenv("CHECKPOINT_BUCKET") or cfg.get("checkpoint_bucket")
-    checkpoint_kms_key_arn = os.getenv("CHECKPOINT_KMS_KEY_ARN") or cfg.get("checkpoint_kms_key_arn")
+    checkpoint_kms_key_arn = os.getenv("CHECKPOINT_KMS_KEY_ARN") or cfg.get(
+        "checkpoint_kms_key_arn"
+    )
     source_region = os.getenv("SOURCE_REGION") or cfg.get("source_region")
     instance_type = os.getenv("INSTANCE_TYPE") or cfg.get("instance_type")
     ssh_key_name = os.getenv("SSH_KEY_NAME") or cfg.get("ssh_key_name")
-    ssh_private_key_path = os.getenv("SSH_PRIVATE_KEY_PATH") or cfg.get("ssh_private_key_path")
-    ssh_known_hosts_path = os.getenv("SSH_KNOWN_HOSTS_PATH") or cfg.get("ssh_known_hosts_path")
+    ssh_private_key_path = os.getenv("SSH_PRIVATE_KEY_PATH") or cfg.get(
+        "ssh_private_key_path"
+    )
+    ssh_known_hosts_path = os.getenv("SSH_KNOWN_HOSTS_PATH") or cfg.get(
+        "ssh_known_hosts_path"
+    )
     max_spot_price = os.getenv("MAX_SPOT_PRICE") or cfg.get("max_spot_price")
     registry_backend = os.getenv("REGISTRY_BACKEND") or cfg.get("registry_backend")
     dynamodb_table = os.getenv("DYNAMO_TABLE") or cfg.get("dynamodb_table")
-    dynamodb_region = os.getenv("DYNAMO_REGION") or cfg.get("dynamodb_region") or source_region
+    dynamodb_region = (
+        os.getenv("DYNAMO_REGION") or cfg.get("dynamodb_region") or source_region
+    )
     result = {
         "checkpoint_bucket": checkpoint_bucket,
         "checkpoint_kms_key_arn": checkpoint_kms_key_arn,
@@ -101,17 +109,11 @@ def load_runtime_config(force_reload=False):
         "dynamodb_region": dynamodb_region,
         "raw": cfg,
     }
-    
-    # Validate required config keys
+
     result = _validate_config(result)
-    
-    # Update cache
-    _CONFIG_CACHE = {
-        "data": result,
-        "mtime": file_mtime,
-        "cached_at": now
-    }
-    
+
+    _CONFIG_CACHE = {"data": result, "mtime": file_mtime, "cached_at": now}
+
     return result
 
 
@@ -126,8 +128,11 @@ def load_v2_baseline(force_reload=False):
     """
     global _V2_BASELINE_CACHE
     mtime = V2_BASELINE_PATH.stat().st_mtime if V2_BASELINE_PATH.exists() else 0
-    if not force_reload and _V2_BASELINE_CACHE["data"] is not None \
-            and _V2_BASELINE_CACHE["mtime"] == mtime:
+    if (
+        not force_reload
+        and _V2_BASELINE_CACHE["data"] is not None
+        and _V2_BASELINE_CACHE["mtime"] == mtime
+    ):
         return _V2_BASELINE_CACHE["data"]
     if not V2_BASELINE_PATH.exists():
         raise SystemExit("Missing config/v2_baseline.yaml (V2 frozen baseline)")
@@ -135,4 +140,3 @@ def load_v2_baseline(force_reload=False):
         data = yaml.safe_load(f) or {}
     _V2_BASELINE_CACHE = {"data": data, "mtime": mtime}
     return data
-

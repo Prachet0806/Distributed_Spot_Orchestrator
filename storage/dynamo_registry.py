@@ -1,28 +1,38 @@
-import boto3
-from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Attr, Key
-from threading import Lock
-from datetime import datetime
-from storage.registry_contract import validate_job_record
-from storage.backend import encode, decode
-import time
 import logging
+import time
+from datetime import datetime
+from threading import Lock
+
+import boto3
+from boto3.dynamodb.conditions import Attr, Key
+from botocore.exceptions import ClientError
+
+from storage.backend import decode, encode
+from storage.registry_contract import validate_job_record
 
 logger = logging.getLogger(__name__)
 
 # Optional metrics (only imported if available)
 try:
     from orchestrator.metrics import get_metrics
+
     _METRICS_AVAILABLE = True
 except ImportError:
     _METRICS_AVAILABLE = False
-    
+
     def get_metrics():
         """Stub for when metrics not available"""
+
         class StubMetrics:
-            def inc(self, *args, **kwargs): pass
-            def observe(self, *args, **kwargs): pass
-            def set_gauge(self, *args, **kwargs): pass
+            def inc(self, *args, **kwargs):
+                pass
+
+            def observe(self, *args, **kwargs):
+                pass
+
+            def set_gauge(self, *args, **kwargs):
+                pass
+
         return StubMetrics()
 
 
@@ -35,9 +45,22 @@ class DynamoRegistry:
       - Attributes: state, region, pid, public_ip, workload_type, version (N), last_updated (S), etc.
     """
 
-    def __init__(self, table_name: str, region_name: str | None = None, *, dynamodb_resource=None, endpoint_url=None):
+    def __init__(
+        self,
+        table_name: str,
+        region_name: str | None = None,
+        *,
+        dynamodb_resource=None,
+        endpoint_url=None,
+    ):
         self.table_name = table_name
-        self.dynamodb = dynamodb_resource if dynamodb_resource is not None else boto3.resource("dynamodb", region_name=region_name, endpoint_url=endpoint_url)
+        self.dynamodb = (
+            dynamodb_resource
+            if dynamodb_resource is not None
+            else boto3.resource(
+                "dynamodb", region_name=region_name, endpoint_url=endpoint_url
+            )
+        )
         self.table = self.dynamodb.Table(table_name)
         self.lock = Lock()
 
@@ -69,17 +92,19 @@ class DynamoRegistry:
         }
         validate_job_record(item)
         try:
-            self.table.put_item(Item=encode(item), ConditionExpression="attribute_not_exists(job_id)")
+            self.table.put_item(
+                Item=encode(item), ConditionExpression="attribute_not_exists(job_id)"
+            )
             get_metrics().inc("dynamodb_create_success_total")
-            get_metrics().observe("dynamodb_create_duration_seconds", time.time() - start)
+            get_metrics().observe(
+                "dynamodb_create_duration_seconds", time.time() - start
+            )
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 get_metrics().inc("dynamodb_create_conflict_total")
                 raise KeyError(f"job_id {job_id} already exists")
             get_metrics().inc("dynamodb_create_error_total")
             raise RuntimeError(f"Dynamo create failed: {e}")
-
-
 
     def transition(
         self,
@@ -149,9 +174,16 @@ class DynamoRegistry:
             elif active_migration_id is not None and to_state != "MIGRATING":
                 new_active = active_migration_id
 
-            validate_job_record({**current_item, **attrs, "state": to_state,
-                                 "version": new_version, "execution_epoch": new_epoch,
-                                 "active_migration_id": new_active})
+            validate_job_record(
+                {
+                    **current_item,
+                    **attrs,
+                    "state": to_state,
+                    "version": new_version,
+                    "execution_epoch": new_epoch,
+                    "active_migration_id": new_active,
+                }
+            )
             names = {"#state": "state"}
             values = {
                 ":state": to_state,
@@ -190,7 +222,9 @@ class DynamoRegistry:
                     ConditionExpression=condition,
                 )
                 get_metrics().inc("dynamodb_update_success_total")
-                get_metrics().observe("dynamodb_update_duration_seconds", time.time() - start)
+                get_metrics().observe(
+                    "dynamodb_update_duration_seconds", time.time() - start
+                )
             except ClientError as e:
                 if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                     get_metrics().inc("dynamodb_update_conflict_total")
@@ -198,39 +232,49 @@ class DynamoRegistry:
                 get_metrics().inc("dynamodb_update_error_total")
                 raise RuntimeError(f"Dynamo update failed: {e}")
             out = dict(current_item)
-            out.update({"state": to_state, "version": new_version,
-                        "execution_epoch": new_epoch,
-                        "active_migration_id": new_active,
-                        "last_updated": values[":last_updated"]})
-            out.update({k: v for k, v in attrs.items()
-                        if k not in ("active_migration_id", "execution_epoch", "version")})
+            out.update(
+                {
+                    "state": to_state,
+                    "version": new_version,
+                    "execution_epoch": new_epoch,
+                    "active_migration_id": new_active,
+                    "last_updated": values[":last_updated"],
+                }
+            )
+            out.update(
+                {
+                    k: v
+                    for k, v in attrs.items()
+                    if k not in ("active_migration_id", "execution_epoch", "version")
+                }
+            )
             return out
 
     def list_by_state(self, state: str, use_gsi: bool = True):
         """
-        List jobs by state. 
-        
+        List jobs by state.
+
         Args:
             state: Job state to filter by
             use_gsi: If True, use GSI query (requires StateIndex). If False, falls back to scan.
-        
+
         Returns:
             List of job items matching the state
-        
-        Note: For production, ensure DynamoDB table has a GSI named 'StateIndex' 
+
+        Note: For production, ensure DynamoDB table has a GSI named 'StateIndex'
               with state as the partition key.
         """
         start = time.time()
         operation = "query" if use_gsi else "scan"
-        
+
         try:
             items = []
-            
+
             if use_gsi:
                 # Use GSI query - 100x faster and cheaper than scan
                 query_kwargs = {
                     "IndexName": "StateIndex",
-                    "KeyConditionExpression": Key("state").eq(state)
+                    "KeyConditionExpression": Key("state").eq(state),
                 }
                 while True:
                     resp = self.table.query(**query_kwargs)
@@ -249,9 +293,11 @@ class DynamoRegistry:
                         scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
                     else:
                         break
-            
+
             get_metrics().inc(f"dynamodb_{operation}_success_total")
-            get_metrics().observe(f"dynamodb_{operation}_duration_seconds", time.time() - start)
+            get_metrics().observe(
+                f"dynamodb_{operation}_duration_seconds", time.time() - start
+            )
             get_metrics().set_gauge(f"dynamodb_{operation}_items_returned", len(items))
             return [validate_job_record(decode(item)) for item in items]
         except ClientError as e:
@@ -262,9 +308,8 @@ class DynamoRegistry:
                     f"StateIndex GSI not found. Create it with: "
                     f"aws dynamodb update-table --table-name {self.table_name} "
                     f"--attribute-definitions AttributeName=state,AttributeType=S "
-                    f"--global-secondary-index-updates '[{{\"Create\":{{\"IndexName\":\"StateIndex\","
-                    f"\"KeySchema\":[{{\"AttributeName\":\"state\",\"KeyType\":\"HASH\"}}],"
-                    f"\"Projection\":{{\"ProjectionType\":\"ALL\"}}}}}}]'"
+                    f'--global-secondary-index-updates \'[{{"Create":{{"IndexName":"StateIndex",'
+                    f'"KeySchema":[{{"AttributeName":"state","KeyType":"HASH"}}],'
+                    f'"Projection":{{"ProjectionType":"ALL"}}}}}}]\''
                 )
             raise RuntimeError(f"Dynamo list_by_state failed: {e}")
-

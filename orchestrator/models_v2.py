@@ -1,13 +1,14 @@
 # orchestrator/models_v2.py — V2 domain contracts (Protocols #1, #3, #7–#11).
 """V2 domain contracts for plans, execution records, and evidence."""
+
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 
 class RecoveryDecisionKind(str, Enum):
@@ -105,7 +106,7 @@ class PlanStep:
     type: PlanStepType
     depends_on: list[str] = field(default_factory=list)
     operation_type: str = ""
-    operation_id: Optional[str] = None  # assigned at issue by Coordinator (ULID)
+    operation_id: str | None = None  # assigned at issue by Coordinator (ULID)
     timeout_seconds: float = 60.0
     deadline_behavior: str = "FAIL_ON_EXCEED"  # FENCE: COMPLETE_FENCING
     max_attempts: int = 3
@@ -144,22 +145,22 @@ class MigrationPlanV2:
     regime: str  # ARBITRAGE | PROACTIVE | EMERGENCY
     source_pool_id: str
     target_pool_id: str
-    checkpoint_id: Optional[str] = None
-    candidate_assessment_version: Optional[str] = None
+    checkpoint_id: str | None = None
+    candidate_assessment_version: str | None = None
     created_at: str = ""
     expires_at: str = ""
-    absolute_deadline: Optional[str] = None
+    absolute_deadline: str | None = None
     input_snapshot_versions: dict = field(default_factory=dict)
     policy_versions: dict = field(default_factory=dict)
     model_versions: dict = field(default_factory=dict)
     authorization_reference: str = ""
     planner_version: str = "v2"
-    supersedes_plan_id: Optional[str] = None
+    supersedes_plan_id: str | None = None
     steps: list[PlanStep] = field(default_factory=list)
     plan_hash: str = ""
     execution_epoch: int = 0
 
-    def is_expired(self, now: Optional[datetime] = None) -> bool:
+    def is_expired(self, now: datetime | None = None) -> bool:
         if not self.expires_at:
             return False
         ts = now or datetime.utcnow()
@@ -211,7 +212,9 @@ def canonical_plan_dict(plan: MigrationPlanV2) -> dict:
 
 
 def compute_plan_hash(plan: MigrationPlanV2) -> str:
-    canonical = json.dumps(canonical_plan_dict(plan), sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        canonical_plan_dict(plan), sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -225,9 +228,9 @@ class RecoveryDecision:
     reason_code: str = ""
     failure_code: str = ""
     replan_required: bool = False
-    checkpoint_id: Optional[str] = None
-    lineage_id: Optional[str] = None
-    critical_path_duration_seconds: Optional[float] = None
+    checkpoint_id: str | None = None
+    lineage_id: str | None = None
+    critical_path_duration_seconds: float | None = None
     safety_margin_seconds: float = 30.0
     confidence_level: str = "LOW"
     confidence_basis: dict = field(default_factory=dict)

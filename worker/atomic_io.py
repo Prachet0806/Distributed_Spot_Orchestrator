@@ -1,4 +1,5 @@
 """Atomic worker evidence publication; readers never see partial JSON."""
+
 import json
 import os
 import tempfile

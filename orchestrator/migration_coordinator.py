@@ -1,17 +1,21 @@
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
-from typing import Optional, Callable, Any
 import concurrent.futures
 import logging
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
 
-from orchestrator.migration_planner import MigrationPlan, MigrationState, MigrationPlanner
-from orchestrator.recovery_feasibility import RecoveryFeasibility
+from orchestrator.migration_planner import (
+    MigrationPlan,
+    MigrationPlanner,
+    MigrationState,
+)
 from orchestrator.policy_engine import MigrationRegime
 from orchestrator.step_retry import (
-    CodedError,
     DEFAULT_UNKNOWN_RESOLUTION_BUDGET_SECONDS,
+    CodedError,
     backoff_delay_seconds,
     failure_code_of,
     reject_injection_points,
@@ -37,10 +41,10 @@ class OperationRecord:
     operation_id: str
     step_name: str
     started_at: datetime
-    completed_at: Optional[datetime] = None
+    completed_at: datetime | None = None
     status: str = "RUNNING"  # RUNNING | SUCCEEDED | FAILED | UNKNOWN
     result: Any = None
-    error: Optional[str] = None
+    error: str | None = None
     retries: int = 0
 
 
@@ -57,19 +61,19 @@ class MigrationExecutionState:
     expected_epoch: int = 0  # registry epoch we expect (rotates at fencing)
     deadline_exceeded: bool = False
     abort_requested: bool = False
-    replan_requested: Optional[str] = None
+    replan_requested: str | None = None
     replan_context: dict = field(default_factory=dict)
-    superseded_by: Optional[str] = None
-    target_instance_id: Optional[str] = None
-    target_host: Optional[str] = None
-    target_region: Optional[str] = None
+    superseded_by: str | None = None
+    target_instance_id: str | None = None
+    target_host: str | None = None
+    target_region: str | None = None
     cleanup_deferred: bool = False
-    target_pid: Optional[int] = None
+    target_pid: int | None = None
     target_process_start: str = ""
-    checkpoint_id: Optional[str] = None
+    checkpoint_id: str | None = None
     provisioned: bool = False
     pool_slot_held: bool = False  # Track C3: per-pool concurrency slot
-    source_snapshot: Optional[dict] = None
+    source_snapshot: dict | None = None
 
 
 # MigrationState -> PlanStepType name for plan_store tracking.
@@ -87,10 +91,14 @@ _STATE_STEP_TYPES = {
 }
 
 # Post-fencing states: deadline expiry never interrupts, forward recovery only.
-_POST_FENCE_STATES = frozenset({
-    MigrationState.FENCING, MigrationState.VALIDATING,
-    MigrationState.ACTIVATING, MigrationState.FINALIZING,
-})
+_POST_FENCE_STATES = frozenset(
+    {
+        MigrationState.FENCING,
+        MigrationState.VALIDATING,
+        MigrationState.ACTIVATING,
+        MigrationState.FINALIZING,
+    }
+)
 
 
 class MigrationCoordinator:
@@ -115,39 +123,39 @@ class MigrationCoordinator:
         fencing_timeout_seconds: float = 60.0,
         plan_store: Any = None,
         checkpoint_store: Any = None,
-        monotonic_clock: Optional[Callable[[], float]] = None,
-        fence_invalidate: Optional[Callable[..., Any]] = None,
-        fence_terminate: Optional[Callable[..., Any]] = None,
-        fence_verify: Optional[Callable[..., Any]] = None,
-        readiness_hook: Optional[Callable[..., Any]] = None,
-        snapshot_provider: Optional[Callable[[str, str], Optional[dict]]] = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        fence_invalidate: Callable[..., Any] | None = None,
+        fence_terminate: Callable[..., Any] | None = None,
+        fence_verify: Callable[..., Any] | None = None,
+        readiness_hook: Callable[..., Any] | None = None,
+        snapshot_provider: Callable[[str, str], dict | None] | None = None,
         # §10.8 execution directives (Track C5). `retry_baseline` is the
         # `retry:` block of config/v2_baseline.yaml; `max_step_retries`
         # is an explicit per-coordinator attempt cap.
-        retry_baseline: Optional[dict] = None,
+        retry_baseline: dict | None = None,
         unknown_resolution_budget_seconds: float = DEFAULT_UNKNOWN_RESOLUTION_BUDGET_SECONDS,
         unknown_poll_interval_seconds: float = 1.0,
         test_harness: bool = False,
-        sleep_fn: Optional[Callable[[float], None]] = None,
+        sleep_fn: Callable[[float], None] | None = None,
         # Track C3 double-guard: PoolConcurrencyTracker. Placement peeks at
         # admission; the Coordinator acquires before provisioning and
         # releases at every terminal outcome. None disables the guard.
-        pool_concurrency: Optional[Any] = None,
+        pool_concurrency: Any | None = None,
         # Track B1/I14: append-only AuditStore. FENCE_STARTED is
         # audit-before-irreversible: a failed write blocks fencing.
-        audit_store: Optional[Any] = None,
+        audit_store: Any | None = None,
         # Sprint 2 (Track C2): optional sink receiving per-execution
         # validation context after restore
         # ({migration_id, job_id, execution_epoch, target_host,
         # target_pid}). Feeds Validator L1/L2 transport probes; None
         # disables publication (probes report inconclusive, never stub-pass).
-        execution_context_sink: Optional[Callable[[dict], None]] = None,
+        execution_context_sink: Callable[[dict], None] | None = None,
         # PA-8 (invariant 2): optional pool-definition resolver
         # (target_pool_id -> definition dict). When present AND the
         # provisioner offers provision_from_pool, execution provisions
         # from the candidate definition (region/AMI/SG authoritative).
         # Test/emulation provisioners may resolve pool IDs themselves.
-        pool_definition_provider: Optional[Callable[[str], Optional[dict]]] = None,
+        pool_definition_provider: Callable[[str], dict | None] | None = None,
         operation_store=None,
         actuation_guard=None,
         activation_handler=None,
@@ -190,26 +198,66 @@ class MigrationCoordinator:
         self._readiness_hook = readiness_hook
         self._snapshot_provider = snapshot_provider
 
-        self._execution_state: Optional[MigrationExecutionState] = None
+        self._execution_state: MigrationExecutionState | None = None
         self._state_machine = self._build_state_machine()
         self._start_mono = 0.0
 
     def _build_state_machine(self) -> dict:
         return {
             MigrationState.PLANNED: {"next": MigrationState.PRECHECKING},
-            MigrationState.PRECHECKING: {"next": MigrationState.CHECKPOINTING, "abort": MigrationState.ABORTING},
-            MigrationState.CHECKPOINTING: {"next": MigrationState.PERSISTING, "abort": MigrationState.ABORTING, "retry": MigrationState.CHECKPOINTING},
-            MigrationState.PERSISTING: {"next": MigrationState.PROVISIONING, "abort": MigrationState.ABORTING, "retry": MigrationState.PERSISTING},
-            MigrationState.PROVISIONING: {"next": MigrationState.TRANSFERRING, "abort": MigrationState.ABORTING, "retry": MigrationState.PROVISIONING},
-            MigrationState.TRANSFERRING: {"next": MigrationState.RESTORING, "abort": MigrationState.ABORTING, "retry": MigrationState.TRANSFERRING},
-            MigrationState.RESTORING: {"next": MigrationState.FENCING, "abort": MigrationState.ABORTING, "retry": MigrationState.RESTORING},
+            MigrationState.PRECHECKING: {
+                "next": MigrationState.CHECKPOINTING,
+                "abort": MigrationState.ABORTING,
+            },
+            MigrationState.CHECKPOINTING: {
+                "next": MigrationState.PERSISTING,
+                "abort": MigrationState.ABORTING,
+                "retry": MigrationState.CHECKPOINTING,
+            },
+            MigrationState.PERSISTING: {
+                "next": MigrationState.PROVISIONING,
+                "abort": MigrationState.ABORTING,
+                "retry": MigrationState.PERSISTING,
+            },
+            MigrationState.PROVISIONING: {
+                "next": MigrationState.TRANSFERRING,
+                "abort": MigrationState.ABORTING,
+                "retry": MigrationState.PROVISIONING,
+            },
+            MigrationState.TRANSFERRING: {
+                "next": MigrationState.RESTORING,
+                "abort": MigrationState.ABORTING,
+                "retry": MigrationState.TRANSFERRING,
+            },
+            MigrationState.RESTORING: {
+                "next": MigrationState.FENCING,
+                "abort": MigrationState.ABORTING,
+                "retry": MigrationState.RESTORING,
+            },
             # No abort out of FENCING: an in-progress ownership transition
             # always completes (COMPLETE_FENCING, Protocols #4 §6.6).
-            MigrationState.FENCING: {"next": MigrationState.VALIDATING, "failed": MigrationState.FAILED},
-            MigrationState.VALIDATING: {"next": MigrationState.ACTIVATING, "abort": MigrationState.ABORTING, "retry": MigrationState.RESTORING, "failed": MigrationState.FAILED},
-            MigrationState.ACTIVATING: {"next": MigrationState.FINALIZING, "failed": MigrationState.FAILED},
-            MigrationState.FINALIZING: {"next": MigrationState.SUCCESS, "failed": MigrationState.FAILED},
-            MigrationState.ABORTING: {"next": MigrationState.ABORTED, "cleanup_failed": MigrationState.FAILED},
+            MigrationState.FENCING: {
+                "next": MigrationState.VALIDATING,
+                "failed": MigrationState.FAILED,
+            },
+            MigrationState.VALIDATING: {
+                "next": MigrationState.ACTIVATING,
+                "abort": MigrationState.ABORTING,
+                "retry": MigrationState.RESTORING,
+                "failed": MigrationState.FAILED,
+            },
+            MigrationState.ACTIVATING: {
+                "next": MigrationState.FINALIZING,
+                "failed": MigrationState.FAILED,
+            },
+            MigrationState.FINALIZING: {
+                "next": MigrationState.SUCCESS,
+                "failed": MigrationState.FAILED,
+            },
+            MigrationState.ABORTING: {
+                "next": MigrationState.ABORTED,
+                "cleanup_failed": MigrationState.FAILED,
+            },
             MigrationState.SUCCESS: {},
             MigrationState.ABORTED: {},
             MigrationState.SUPERSEDED: {},
@@ -229,8 +277,8 @@ class MigrationCoordinator:
     def execute_plan(
         self,
         plan: MigrationPlan,
-        on_state_change: Optional[Callable[[MigrationState, MigrationState], None]] = None,
-        dag_steps: Optional[list] = None,
+        on_state_change: Callable[[MigrationState, MigrationState], None] | None = None,
+        dag_steps: list | None = None,
     ) -> MigrationExecutionState:
         # §10.8 rule 6: production plans must not carry fault-injection
         # hooks. Rejected before any state transition or side effect.
@@ -261,16 +309,32 @@ class MigrationCoordinator:
         if getattr(self, "_resuming", False):
             doc = self.plan_store.get_plan(plan.plan_id)
             context = doc.get("execution_context", {})
-            for field in ("checkpoint_id", "target_instance_id", "target_host", "target_region", "target_pid", "target_process_start",
-                          "source_snapshot", "provisioned", "fencing_confirmed", "expected_epoch"):
+            for field in (
+                "checkpoint_id",
+                "target_instance_id",
+                "target_host",
+                "target_region",
+                "target_pid",
+                "target_process_start",
+                "source_snapshot",
+                "provisioned",
+                "fencing_confirmed",
+                "expected_epoch",
+            ):
                 if field in context:
                     setattr(self._execution_state, field, context[field])
             for operation in self.operation_store._docs.all():
-                if operation["request"].get("plan_id") == plan.plan_id and operation["request"].get("step_name") == "fencing" and operation["state"] == "SUCCEEDED":
+                if (
+                    operation["request"].get("plan_id") == plan.plan_id
+                    and operation["request"].get("step_name") == "fencing"
+                    and operation["state"] == "SUCCEEDED"
+                ):
                     self._execution_state.fencing_confirmed = True
                     self._execution_state.expected_epoch = plan.execution_epoch + 1
 
-        logger.info(f"Starting migration {plan.migration_id} for job {plan.job_id} (regime: {plan.regime.value})")
+        logger.info(
+            f"Starting migration {plan.migration_id} for job {plan.job_id} (regime: {plan.regime.value})"
+        )
 
         if plan.is_expired() and not self._execution_state.fencing_confirmed:
             logger.warning(f"Plan {plan.migration_id} expired before execution")
@@ -281,7 +345,8 @@ class MigrationCoordinator:
             # so it would strand the job with zero side effects).
             self._execution_state.replan_requested = "plan-expired"
             self._execution_state.replan_context = {
-                "phase": MigrationState.PLANNED.value}
+                "phase": MigrationState.PLANNED.value
+            }
             self._transition_to(MigrationState.FAILED, "Plan expired")
             current = (self._get_job(plan.job_id) or {}).get("state")
             if current is not None and current != "RUNNING":
@@ -295,12 +360,18 @@ class MigrationCoordinator:
             current = self.registry.get(plan.job_id)
             if getattr(self, "_resuming", False):
                 if current.get("active_migration_id") not in {None, plan.migration_id}:
-                    raise MigrationFailed("resume ownership belongs to another migration")
+                    raise MigrationFailed(
+                        "resume ownership belongs to another migration"
+                    )
                 if current["execution_epoch"] != self._execution_state.expected_epoch:
                     raise MigrationFailed("resume execution epoch mismatch")
             else:
-                self._job_transition_safe(plan, "MIGRATING", expected_epoch=plan.execution_epoch,
-                                          active_migration_id=plan.migration_id)
+                self._job_transition_safe(
+                    plan,
+                    "MIGRATING",
+                    expected_epoch=plan.execution_epoch,
+                    active_migration_id=plan.migration_id,
+                )
             self._transition_to(MigrationState.PRECHECKING, on_state_change)
             self._execute_prechecking()
 
@@ -424,15 +495,25 @@ class MigrationCoordinator:
             dump = getattr(self.checkpoint_manager, "dump", None)
             probe = getattr(self.checkpoint_manager, "get_operation_status", None)
             result = self._run_operation_with_retry(
-                step_type="CHECKPOINT", operation_id=op_id,
-                func=lambda: dump(job_id=plan.job_id, pid=pid, host=host, execution_epoch=plan.execution_epoch, operation_id=op_id),
-                timeout=self.step_timeout_seconds, probe=probe,
+                step_type="CHECKPOINT",
+                operation_id=op_id,
+                func=lambda: dump(
+                    job_id=plan.job_id,
+                    pid=pid,
+                    host=host,
+                    execution_epoch=plan.execution_epoch,
+                    operation_id=op_id,
+                ),
+                timeout=self.step_timeout_seconds,
+                probe=probe,
                 default_code="CRIU_DUMP_FAILED",
             )
             checkpoint_id = getattr(result, "checkpoint_id", plan.migration_id)
             state.checkpoint_id = checkpoint_id
             if state.source_snapshot is None:
-                state.source_snapshot = getattr(result, "snapshot", None) or self._take_snapshot(plan.job_id, "pre")
+                state.source_snapshot = getattr(
+                    result, "snapshot", None
+                ) or self._take_snapshot(plan.job_id, "pre")
             self._complete_operation(op_id, result)
         except OperationUnknownError as e:
             self._fail_operation(op_id, str(e), unknown=True)
@@ -450,9 +531,11 @@ class MigrationCoordinator:
             persist = getattr(self.checkpoint_manager, "persist", None)
             probe = getattr(self.checkpoint_manager, "get_operation_status", None)
             result = self._run_operation_with_retry(
-                step_type="PERSIST", operation_id=op_id,
+                step_type="PERSIST",
+                operation_id=op_id,
                 func=lambda: persist(checkpoint_id, job_id=plan.job_id),
-                timeout=self.step_timeout_seconds, probe=probe,
+                timeout=self.step_timeout_seconds,
+                probe=probe,
                 default_code="CHECKPOINT_PERSIST_FAILED",
             )
             self._complete_operation(op_id, result)
@@ -468,8 +551,11 @@ class MigrationCoordinator:
         state = self._execution_state
         if self.pool_reservations is not None and not state.pool_slot_held:
             definition = self._pool_definition_provider(state.plan.target_pool_id) or {}
-            if not self.pool_reservations.reserve(state.plan.target_pool_id, state.plan.migration_id,
-                    int(definition.get("max_concurrent_migrations", 1))):
+            if not self.pool_reservations.reserve(
+                state.plan.target_pool_id,
+                state.plan.migration_id,
+                int(definition.get("max_concurrent_migrations", 1)),
+            ):
                 raise MigrationFailed("pool reservation capacity unavailable")
             state.pool_slot_held = True
             return
@@ -478,16 +564,23 @@ class MigrationCoordinator:
         if not self._pool_concurrency.admit(state.plan.target_pool_id):
             raise MigrationFailed(
                 f"Pool {state.plan.target_pool_id} at concurrency limit "
-                f"(CAPACITY_UNAVAILABLE)")
+                f"(CAPACITY_UNAVAILABLE)"
+            )
         state.pool_slot_held = True
 
     def _release_pool_slot(self):
         state = self._execution_state
         if state is not None and state.pool_slot_held:
             if self.pool_reservations is not None:
-                if state.current_state not in {MigrationState.SUCCESS, MigrationState.ABORTED, MigrationState.SUPERSEDED}:
+                if state.current_state not in {
+                    MigrationState.SUCCESS,
+                    MigrationState.ABORTED,
+                    MigrationState.SUPERSEDED,
+                }:
                     return  # uncertain resources keep their reservation until reconciliation
-                self.pool_reservations.release(state.plan.target_pool_id, state.plan.migration_id)
+                self.pool_reservations.release(
+                    state.plan.target_pool_id, state.plan.migration_id
+                )
             state.pool_slot_held = False
             try:
                 if self._pool_concurrency is not None:
@@ -503,21 +596,29 @@ class MigrationCoordinator:
         self._acquire_pool_slot()
         op_id = self._start_operation("provisioning")
         try:
-            tags = {"job_id": plan.job_id, "migration_id": plan.migration_id,
-                    "execution_epoch": str(plan.execution_epoch)}
+            tags = {
+                "job_id": plan.job_id,
+                "migration_id": plan.migration_id,
+                "execution_epoch": str(plan.execution_epoch),
+            }
             probe = getattr(self.provisioner, "get_operation_status", None)
             if self._pool_definition_provider is not None:
                 definition = self._pool_definition_provider(plan.target_pool_id)
                 if not definition:
                     raise MigrationFailed("No authoritative target pool definition")
                 call = lambda: self.provisioner.provision_from_pool(
-                    definition, operation_id=op_id, tags=tags)
+                    definition, operation_id=op_id, tags=tags
+                )
             else:
                 call = lambda: self.provisioner.provision_with_operation(
-                    plan.target_pool_id, operation_id=op_id, tags=tags)
+                    plan.target_pool_id, operation_id=op_id, tags=tags
+                )
             result = self._run_operation_with_retry(
-                step_type="PROVISION", operation_id=op_id, func=call,
-                timeout=self.step_timeout_seconds, probe=probe,
+                step_type="PROVISION",
+                operation_id=op_id,
+                func=call,
+                timeout=self.step_timeout_seconds,
+                probe=probe,
                 default_code="PROVISION_FAILED",
             )
             state.target_instance_id = getattr(result, "instance_id", None)
@@ -541,9 +642,17 @@ class MigrationCoordinator:
             probe = getattr(transfer, "get_operation_status", None)
 
             result = self._run_operation_with_retry(
-                step_type="TRANSFER", operation_id=op_id,
-                func=(lambda: self.checkpoint_data_path.download_to_worker(state.checkpoint_id, state.target_host, operation_id=op_id)) if self.checkpoint_data_path is not None else (lambda: transfer.download(state.checkpoint_id)),
-                timeout=self.step_timeout_seconds, probe=probe,
+                step_type="TRANSFER",
+                operation_id=op_id,
+                func=(
+                    lambda: self.checkpoint_data_path.download_to_worker(
+                        state.checkpoint_id, state.target_host, operation_id=op_id
+                    )
+                )
+                if self.checkpoint_data_path is not None
+                else (lambda: transfer.download(state.checkpoint_id)),
+                timeout=self.step_timeout_seconds,
+                probe=probe,
                 default_code="TRANSFER_FAILED",
             )
             self._complete_operation(op_id, result)
@@ -563,22 +672,32 @@ class MigrationCoordinator:
             restore = getattr(self.checkpoint_manager, "restore", None)
             probe = getattr(self.checkpoint_manager, "get_operation_status", None)
             result = self._run_operation_with_retry(
-                step_type="RESTORE", operation_id=op_id,
-                func=lambda: restore(checkpoint_id, host=state.target_host,
-                                     operation_id=op_id),
-                timeout=self.step_timeout_seconds, probe=probe,
+                step_type="RESTORE",
+                operation_id=op_id,
+                func=lambda: restore(
+                    checkpoint_id, host=state.target_host, operation_id=op_id
+                ),
+                timeout=self.step_timeout_seconds,
+                probe=probe,
                 default_code="CRIU_RESTORE_FAILED",
             )
             outcome = getattr(result, "outcome", None) or (
-                "SUCCEEDED" if getattr(result, "success", True) else "FAILED")
+                "SUCCEEDED" if getattr(result, "success", True) else "FAILED"
+            )
             if outcome == "PARTIAL_RESTORE":
-                raise MigrationFailed("Partial restore: target contained, checkpoint intact")
+                raise MigrationFailed(
+                    "Partial restore: target contained, checkpoint intact"
+                )
             if outcome == "UNKNOWN":
                 raise OperationUnknownError("restore reported UNKNOWN")
             if outcome != "SUCCEEDED":
                 raise MigrationFailed(f"Restore reported {outcome}")
-            if not getattr(result, "contained", False) or not getattr(result, "process_id", None):
-                raise MigrationFailed("Restore did not prove target containment and identity")
+            if not getattr(result, "contained", False) or not getattr(
+                result, "process_id", None
+            ):
+                raise MigrationFailed(
+                    "Restore did not prove target containment and identity"
+                )
             state.target_pid = getattr(result, "process_id", None)
             state.target_process_start = getattr(result, "process_start", "")
             self._publish_execution_context()
@@ -595,7 +714,7 @@ class MigrationCoordinator:
                 raise MigrationFailed(f"Restore failed post-fencing: {e}")
             raise MigrationFailed(f"Restore failed: {e}")
 
-    def _audit(self, event_type: str, **fields) -> Optional[dict]:
+    def _audit(self, event_type: str, **fields) -> dict | None:
         """Append a migration-scoped audit record (correlation envelope).
 
         Returns the record, or None when no store is wired. Callers decide
@@ -608,6 +727,7 @@ class MigrationCoordinator:
         if not callable(append):
             return None
         from orchestrator.models_v2 import new_ulid_like
+
         state = self._execution_state
         plan = state.plan if state is not None else None
         record = {
@@ -617,16 +737,20 @@ class MigrationCoordinator:
             "component": "MigrationCoordinator",
         }
         if plan is not None:
-            record.update({
-                "job_id": plan.job_id,
-                "migration_id": plan.migration_id,
-                "execution_epoch": (state.expected_epoch
-                                    if state is not None
-                                    else plan.execution_epoch),
-                "correlation_id": plan.migration_id,
-                "plan_id": getattr(plan, "plan_id", ""),
-                "plan_hash": getattr(plan, "plan_hash", ""),
-            })
+            record.update(
+                {
+                    "job_id": plan.job_id,
+                    "migration_id": plan.migration_id,
+                    "execution_epoch": (
+                        state.expected_epoch
+                        if state is not None
+                        else plan.execution_epoch
+                    ),
+                    "correlation_id": plan.migration_id,
+                    "plan_id": getattr(plan, "plan_id", ""),
+                    "plan_hash": getattr(plan, "plan_hash", ""),
+                }
+            )
         record.update(fields)
         return append(record)
 
@@ -650,21 +774,26 @@ class MigrationCoordinator:
         try:
             self._run_with_timeout(
                 lambda: self._fence_invalidate_hook(plan),
-                timeout=self.fencing_timeout_seconds, op_id=op_id + "-invalidate",
+                timeout=self.fencing_timeout_seconds,
+                op_id=op_id + "-invalidate",
             )
             self._run_with_timeout(
                 lambda: self._fence_terminate_hook(plan),
-                timeout=self.fencing_timeout_seconds, op_id=op_id + "-terminate",
+                timeout=self.fencing_timeout_seconds,
+                op_id=op_id + "-terminate",
             )
             self._run_with_timeout(
                 lambda: self._fence_verify_hook(plan),
-                timeout=self.fencing_timeout_seconds, op_id=op_id + "-verify",
+                timeout=self.fencing_timeout_seconds,
+                op_id=op_id + "-verify",
             )
             # Confirmed fencing = epoch invalidation + verified termination.
             # Rotate the epoch now so the fenced source can never resume as
             # authoritative, even if validation fails afterwards.
             self._job_transition_safe(
-                plan, "MIGRATING", ownership_change=True,
+                plan,
+                "MIGRATING",
+                ownership_change=True,
                 expected_epoch=state.expected_epoch,
                 active_migration_id=plan.migration_id,
             )
@@ -685,9 +814,12 @@ class MigrationCoordinator:
         if self.checkpoint_store is None:
             return {"lineage_valid": False}
         doc = self.checkpoint_store.get(self._execution_state.checkpoint_id)
-        return {**doc, "lineage_valid": doc.get("lineage_id") == plan.job_id
-                and bool(doc.get("integrity_verified"))
-                and int(doc.get("execution_epoch", -1)) == plan.execution_epoch}
+        return {
+            **doc,
+            "lineage_valid": doc.get("lineage_id") == plan.job_id
+            and bool(doc.get("integrity_verified"))
+            and int(doc.get("execution_epoch", -1)) == plan.execution_epoch,
+        }
 
     def _execute_validating(self):
         state = self._execution_state
@@ -697,15 +829,22 @@ class MigrationCoordinator:
             target_snapshot = self._take_snapshot(plan.job_id, "post")
             result = self._run_with_timeout(
                 lambda: self.validator.validate(
-                    plan.migration_id, plan.job_id, plan.execution_epoch + 1,
+                    plan.migration_id,
+                    plan.job_id,
+                    plan.execution_epoch + 1,
                     source_snapshot=state.source_snapshot,
-                    target_snapshot=target_snapshot, expected_epoch=state.expected_epoch,
-                    checkpoint_lineage=self._checkpoint_lineage(plan)),
-                timeout=self.step_timeout_seconds, op_id=op_id,
+                    target_snapshot=target_snapshot,
+                    expected_epoch=state.expected_epoch,
+                    checkpoint_lineage=self._checkpoint_lineage(plan),
+                ),
+                timeout=self.step_timeout_seconds,
+                op_id=op_id,
             )
             if not self._validation_passed(result):
                 if state.fencing_confirmed:
-                    raise MigrationFailed("Validation failed post-fencing: forward recovery only")
+                    raise MigrationFailed(
+                        "Validation failed post-fencing: forward recovery only"
+                    )
                 raise MigrationFailed("Validation failed")
             self._complete_operation(op_id, result)
         except MigrationFailed as exc:
@@ -725,11 +864,19 @@ class MigrationCoordinator:
         if isinstance(result, dict):
             if "passed" in result:
                 return bool(result["passed"])
-            overall = str(result.get("overall_result", result.get("result", ""))).upper()
+            overall = str(
+                result.get("overall_result", result.get("result", ""))
+            ).upper()
             return overall in ("PASSED", "VALID", "SUCCEEDED")
-        overall = getattr(result, "overall_result", None) or getattr(result, "result", None)
+        overall = getattr(result, "overall_result", None) or getattr(
+            result, "result", None
+        )
         if overall is not None:
-            return str(getattr(overall, "value", overall)).upper() in ("PASSED", "VALID", "SUCCEEDED")
+            return str(getattr(overall, "value", overall)).upper() in (
+                "PASSED",
+                "VALID",
+                "SUCCEEDED",
+            )
         if hasattr(result, "success"):
             return bool(result.success)
         return False
@@ -746,14 +893,18 @@ class MigrationCoordinator:
                     raise MigrationFailed("Target process start identity is missing")
                 self.activation_handler(state)
             self._job_transition_safe(
-                plan, "RUNNING",
+                plan,
+                "RUNNING",
                 expected_epoch=state.expected_epoch,
                 clear_active_migration=True,
                 target_pool_id=plan.target_pool_id,
                 target_instance_id=state.target_instance_id,
                 instance_id=state.target_instance_id,
-                public_ip=state.target_host, pid=state.target_pid, process_start=state.target_process_start,
-                region=state.target_region, pool_id=plan.target_pool_id,
+                public_ip=state.target_host,
+                pid=state.target_pid,
+                process_start=state.target_process_start,
+                region=state.target_region,
+                pool_id=plan.target_pool_id,
             )
             self._complete_operation(op_id, {"activated": True})
         except Exception as e:
@@ -767,7 +918,12 @@ class MigrationCoordinator:
         try:
             cleanup = getattr(self.cleanup_executor, "cleanup_migration", None)
             if callable(cleanup):
-                cleanup(plan, state.operations, outcome="SUCCESS", target_instance_id=state.target_instance_id)
+                cleanup(
+                    plan,
+                    state.operations,
+                    outcome="SUCCESS",
+                    target_instance_id=state.target_instance_id,
+                )
             self._complete_operation(op_id, {"finalized": True})
         except Exception as e:
             self._fail_operation(op_id, str(e))
@@ -787,12 +943,17 @@ class MigrationCoordinator:
             or self._state_machine.get(old_state, {}).get("abort") == new_state
             or self._state_machine.get(old_state, {}).get("failed") == new_state
         )
-        if not valid and not (old_state == MigrationState.PLANNED and new_state == MigrationState.PRECHECKING):
+        if not valid and not (
+            old_state == MigrationState.PLANNED
+            and new_state == MigrationState.PRECHECKING
+        ):
             logger.warning(f"Transition {old_state} -> {new_state} may not be standard")
 
         self._execution_state.current_state = new_state
         self._execution_state.state_entered_at = datetime.utcnow()
-        logger.info(f"Migration {self._execution_state.plan.migration_id}: {old_state} -> {new_state}")
+        logger.info(
+            f"Migration {self._execution_state.plan.migration_id}: {old_state} -> {new_state}"
+        )
         self._track_step_transition(old_state, new_state)
 
         if callable(callback):
@@ -815,13 +976,26 @@ class MigrationCoordinator:
                 cur = by_type[old_type].get("state", "PENDING")
                 if cur in ("RUNNING", "PENDING"):
                     self.plan_store.update_step_state(
-                        plan_id, by_type[old_type]["step_id"], cur, "FAILED" if new in (MigrationState.FAILED, MigrationState.ABORTING, MigrationState.ABORTED, MigrationState.SUPERSEDED) else "SUCCEEDED")
+                        plan_id,
+                        by_type[old_type]["step_id"],
+                        cur,
+                        "FAILED"
+                        if new
+                        in (
+                            MigrationState.FAILED,
+                            MigrationState.ABORTING,
+                            MigrationState.ABORTED,
+                            MigrationState.SUPERSEDED,
+                        )
+                        else "SUCCEEDED",
+                    )
             if new_type and new_type in by_type:
                 cur = self.plan_store.get_plan(plan_id)["steps"]
                 cur = next(s for s in cur if s.get("type", "").upper() == new_type)
                 if cur.get("state") == "PENDING":
                     self.plan_store.update_step_state(
-                        plan_id, cur["step_id"], "PENDING", "RUNNING")
+                        plan_id, cur["step_id"], "PENDING", "RUNNING"
+                    )
         except Exception as exc:  # tracking must not break execution
             logger.warning("Plan step tracking skipped: %s", exc)
 
@@ -833,7 +1007,8 @@ class MigrationCoordinator:
         if plan.is_expired() and not self._execution_state.fencing_confirmed:
             self._execution_state.replan_requested = "plan-expired"
             self._execution_state.replan_context = {
-                "phase": self._execution_state.current_state.value}
+                "phase": self._execution_state.current_state.value
+            }
             raise MigrationAborted("Plan expired")
         if plan.regime == MigrationRegime.EMERGENCY:
             self._check_deadline_budget(plan)
@@ -856,19 +1031,41 @@ class MigrationCoordinator:
             return
         durations = {step.name.lower(): step.estimated_seconds for step in plan.steps}
         phase = self._execution_state.current_state.value.lower()
-        order = ["prechecking", "checkpointing", "persisting", "provisioning", "transferring", "restoring", "fencing", "validating", "activating", "finalizing"]
-        pending = order[order.index(phase):] if phase in order else order
+        order = [
+            "prechecking",
+            "checkpointing",
+            "persisting",
+            "provisioning",
+            "transferring",
+            "restoring",
+            "fencing",
+            "validating",
+            "activating",
+            "finalizing",
+        ]
+        pending = order[order.index(phase) :] if phase in order else order
         remaining_work = sum(durations.get(name, 0) or 0 for name in pending)
-        if plan.regime == MigrationRegime.EMERGENCY and "checkpointing" in pending and "provisioning" in pending:
-            remaining_work -= min((durations.get("checkpointing", 0) or 0) + (durations.get("persisting", 0) or 0), durations.get("provisioning", 0) or 0)
+        if (
+            plan.regime == MigrationRegime.EMERGENCY
+            and "checkpointing" in pending
+            and "provisioning" in pending
+        ):
+            remaining_work -= min(
+                (durations.get("checkpointing", 0) or 0)
+                + (durations.get("persisting", 0) or 0),
+                durations.get("provisioning", 0) or 0,
+            )
         required = remaining_work + plan.safety_margin_seconds
         if remaining < required:
             self._execution_state.deadline_exceeded = True
             if self._execution_state.current_state in _POST_FENCE_STATES:
-                logger.warning("Deadline exceeded but in post-fencing phase; continuing")
+                logger.warning(
+                    "Deadline exceeded but in post-fencing phase; continuing"
+                )
                 return
             raise DeadlineExceeded(
-                f"Insufficient deadline budget: {remaining:.0f}s remaining, {required:.0f}s required")
+                f"Insufficient deadline budget: {remaining:.0f}s remaining, {required:.0f}s required"
+            )
 
     def _final_gate(self, plan: MigrationPlan, step: str):
         """Last check before an irreversible step: expiry + deadline + epoch."""
@@ -886,10 +1083,13 @@ class MigrationCoordinator:
                 if current_epoch != want:
                     raise MigrationFailed(
                         f"Epoch drift before {step}: expected={want} "
-                        f"registry={current_epoch}")
+                        f"registry={current_epoch}"
+                    )
         if step == "FENCE" and self.target_containment_probe is not None:
             if not self.target_containment_probe(self._execution_state):
-                raise MigrationFailed("Target is not a contained identity-matched process")
+                raise MigrationFailed(
+                    "Target is not a contained identity-matched process"
+                )
 
     # -- hooks (fail closed) --
     def _verify_candidate_readiness(self, candidate_id: str):
@@ -905,7 +1105,8 @@ class MigrationCoordinator:
         current = job.get("execution_epoch", 0) or 0
         if current != epoch:
             raise MigrationFailed(
-                f"Ownership mismatch for {job_id}: plan epoch {epoch}, registry {current}")
+                f"Ownership mismatch for {job_id}: plan epoch {epoch}, registry {current}"
+            )
 
     def _fence_invalidate_hook(self, plan: MigrationPlan):
         if self._fence_invalidate is not None:
@@ -913,14 +1114,16 @@ class MigrationCoordinator:
             return
         raise MigrationFailed(
             "No fence-invalidate hook configured: refusing to confirm fencing "
-            "from epoch invalidation alone")
+            "from epoch invalidation alone"
+        )
 
     def _fence_terminate_hook(self, plan: MigrationPlan):
         if self._fence_terminate is not None:
             self._fence_terminate(plan)
             return
         raise MigrationFailed(
-            "No fence-terminate hook configured: source termination unverified")
+            "No fence-terminate hook configured: source termination unverified"
+        )
 
     def _fence_verify_hook(self, plan: MigrationPlan):
         if self._fence_verify is not None:
@@ -929,7 +1132,8 @@ class MigrationCoordinator:
                 raise MigrationFailed("Source still alive after fence")
             return
         raise MigrationFailed(
-            "No fence-verify hook configured: fence confirmation refused")
+            "No fence-verify hook configured: fence confirmation refused"
+        )
 
     def _publish_execution_context(self):
         """Publish post-restore validation context to the optional sink.
@@ -942,19 +1146,21 @@ class MigrationCoordinator:
         if sink is None or state is None or state.plan is None:
             return
         try:
-            sink({
-                "migration_id": state.plan.migration_id,
-                "job_id": state.plan.job_id,
-                "execution_epoch": state.expected_epoch,
-                "target_host": state.target_host,
-                "target_contained": True,
-                "target_instance_id": state.target_instance_id,
-                "target_pid": state.target_pid,
-            })
+            sink(
+                {
+                    "migration_id": state.plan.migration_id,
+                    "job_id": state.plan.job_id,
+                    "execution_epoch": state.expected_epoch,
+                    "target_host": state.target_host,
+                    "target_contained": True,
+                    "target_instance_id": state.target_instance_id,
+                    "target_pid": state.target_pid,
+                }
+            )
         except Exception as exc:
             logger.warning("execution context publish failed: %s", exc)
 
-    def _take_snapshot(self, job_id: str, phase: str) -> Optional[dict]:
+    def _take_snapshot(self, job_id: str, phase: str) -> dict | None:
         if self._snapshot_provider is None:
             return None
         try:
@@ -972,8 +1178,13 @@ class MigrationCoordinator:
                 logger.warning("Branch cleanup: target terminate failed: %s", exc)
 
     # -- operations --
-    def _run_with_timeout(self, func: Callable, timeout: float, op_id: str = "",
-                          probe: Optional[Callable] = None) -> Any:
+    def _run_with_timeout(
+        self,
+        func: Callable,
+        timeout: float,
+        op_id: str = "",
+        probe: Callable | None = None,
+    ) -> Any:
         """Enforce step timeouts; ambiguous outcomes resolve or surface UNKNOWN.
 
         On timeout with a probe available, the outcome enters resolution
@@ -982,8 +1193,9 @@ class MigrationCoordinator:
         FAILED raises it as a coded error; exhausted budget raises
         OperationUnknownError (never a blind retry).
         """
-        eff = min(float(timeout or 0) or self.step_timeout_seconds,
-                  self.step_timeout_seconds)
+        eff = min(
+            float(timeout or 0) or self.step_timeout_seconds, self.step_timeout_seconds
+        )
         if self.actuation_guard is not None:
             self.actuation_guard()
         if self.operation_store is not None and op_id:
@@ -995,14 +1207,19 @@ class MigrationCoordinator:
                 payload = recorded.get("result")
                 if isinstance(payload, dict):
                     from types import SimpleNamespace
+
                     return SimpleNamespace(**payload)
                 return payload
             if recorded and recorded["state"] in {"UNKNOWN", "FAILED"}:
                 if recorded["state"] == "FAILED":
-                    raise MigrationFailed(recorded.get("error") or "recorded operation failed")
+                    raise MigrationFailed(
+                        recorded.get("error") or "recorded operation failed"
+                    )
                 if probe is None:
                     raise OperationUnknownError("recorded operation outcome unknown")
-                return self._resolve_unknown(probe, op_id, 0, RuntimeError("restart resolution"))
+                return self._resolve_unknown(
+                    probe, op_id, 0, RuntimeError("restart resolution")
+                )
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         fut = pool.submit(func)
         try:
@@ -1010,26 +1227,33 @@ class MigrationCoordinator:
         except concurrent.futures.TimeoutError as e:
             if probe is None:
                 raise OperationUnknownError(
-                    f"operation {op_id or '?'} timed out after {eff:.0f}s") from e
+                    f"operation {op_id or '?'} timed out after {eff:.0f}s"
+                ) from e
             return self._resolve_unknown(probe, op_id, eff, e)
         finally:
             # Transport enforces command timeouts; a late result remains UNKNOWN.
             pool.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
-    def _probe_outcome(report: Any) -> tuple[str, Any, Optional[str]]:
+    def _probe_outcome(report: Any) -> tuple[str, Any, str | None]:
         """Normalize a probe report → (SUCCEEDED|FAILED|UNKNOWN, payload, code)."""
         if isinstance(report, dict):
             raw = str(report.get("state", report.get("status", "UNKNOWN"))).upper()
             code = report.get("failure_code") or report.get("code")
             payload = report.get("result", report.get("payload", report))
         else:
-            raw = str(getattr(report, "state",
-                              getattr(report, "status",
-                                      getattr(report, "outcome", "UNKNOWN")))).upper()
+            raw = str(
+                getattr(
+                    report,
+                    "state",
+                    getattr(report, "status", getattr(report, "outcome", "UNKNOWN")),
+                )
+            ).upper()
             if raw == "UNKNOWN" and getattr(report, "success", None) is True:
                 raw = "SUCCEEDED"
-            code = getattr(report, "failure_code", None) or getattr(report, "code", None)
+            code = getattr(report, "failure_code", None) or getattr(
+                report, "code", None
+            )
             payload = getattr(report, "result", report)
         if raw in ("SUCCEEDED", "SUCCESS", "OK", "COMPLETED"):
             return "SUCCEEDED", payload, None
@@ -1037,8 +1261,9 @@ class MigrationCoordinator:
             return "FAILED", payload, code or raw
         return "UNKNOWN", payload, None
 
-    def _resolve_unknown(self, probe: Callable, op_id: str,
-                         elapsed: float, cause: BaseException) -> Any:
+    def _resolve_unknown(
+        self, probe: Callable, op_id: str, elapsed: float, cause: BaseException
+    ) -> Any:
         """Poll the executor/provider until the outcome resolves or escalates."""
         deadline = self._monotonic() + self._unknown_budget
         last_report: Any = None
@@ -1053,22 +1278,30 @@ class MigrationCoordinator:
                 logger.info("operation %s UNKNOWN resolved: SUCCEEDED", op_id or "?")
                 return payload
             if outcome == "FAILED":
-                logger.warning("operation %s UNKNOWN resolved: FAILED (%s)",
-                               op_id or "?", code)
-                raise CodedError(code or "OPERATION_FAILED",
-                                 f"operation {op_id or '?'} failed after timeout")
+                logger.warning(
+                    "operation %s UNKNOWN resolved: FAILED (%s)", op_id or "?", code
+                )
+                raise CodedError(
+                    code or "OPERATION_FAILED",
+                    f"operation {op_id or '?'} failed after timeout",
+                )
             self._sleep(self._unknown_poll)
         raise OperationUnknownError(
             f"operation {op_id or '?'} timed out after {elapsed:.0f}s; "
-            f"unresolved after {self._unknown_budget:.0f}s → reconciliation") from cause
+            f"unresolved after {self._unknown_budget:.0f}s → reconciliation"
+        ) from cause
 
     def _retry_spec(self, step_type: str):
-        spec = spec_for(step_type, baseline={"retry": {}} | dict(self._retry_baseline or {}))
+        spec = spec_for(
+            step_type, baseline={"retry": {}} | dict(self._retry_baseline or {})
+        )
         if self.max_step_retries != 3:
             # Honor the explicit per-coordinator upper bound.
             import dataclasses
+
             spec = dataclasses.replace(
-                spec, max_attempts=min(spec.max_attempts, self.max_step_retries))
+                spec, max_attempts=min(spec.max_attempts, self.max_step_retries)
+            )
         return spec
 
     def _retry_budgets_valid(self, plan: MigrationPlan) -> bool:
@@ -1079,14 +1312,18 @@ class MigrationCoordinator:
 
     def _backoff_or_deadline(self, plan: MigrationPlan, delay: float):
         """Sleep for backoff; backoff consumes the effective deadline (rule 3)."""
-        if plan.regime == MigrationRegime.EMERGENCY and plan.absolute_deadline is not None:
+        if (
+            plan.regime == MigrationRegime.EMERGENCY
+            and plan.absolute_deadline is not None
+        ):
             _now = datetime.utcnow()
             if plan.absolute_deadline.tzinfo is not None and _now.tzinfo is None:
                 _now = _now.replace(tzinfo=timezone.utc)
             remaining = (plan.absolute_deadline - _now).total_seconds()
             if delay >= remaining:
                 raise DeadlineExceeded(
-                    f"backoff {delay:.0f}s exceeds remaining deadline {remaining:.0f}s")
+                    f"backoff {delay:.0f}s exceeds remaining deadline {remaining:.0f}s"
+                )
         self._sleep(delay)
 
     def _note_attempt(self, operation_id: str):
@@ -1102,7 +1339,7 @@ class MigrationCoordinator:
         operation_id: str,
         func: Callable[[], Any],
         timeout: float,
-        probe: Optional[Callable] = None,
+        probe: Callable | None = None,
         default_code: str,
     ) -> Any:
         """Execute one step operation with §10.8 retry semantics.
@@ -1118,7 +1355,8 @@ class MigrationCoordinator:
         while True:
             try:
                 return self._run_with_timeout(
-                    func, timeout=timeout, op_id=operation_id, probe=probe)
+                    func, timeout=timeout, op_id=operation_id, probe=probe
+                )
             except OperationUnknownError:
                 raise  # not an attempt; caller routes to reconciliation path
             except Exception as exc:
@@ -1127,18 +1365,31 @@ class MigrationCoordinator:
                 # have no listed code, so they escalate immediately (rule 2).
                 # `default_code` names the failure for logs/audit.
                 code = failure_code_of(exc, None)
-                if not should_retry(spec, failure_code=code,
-                                    attempts_used=attempts,
-                                    budgets_valid=self._retry_budgets_valid(plan)):
+                if not should_retry(
+                    spec,
+                    failure_code=code,
+                    attempts_used=attempts,
+                    budgets_valid=self._retry_budgets_valid(plan),
+                ):
                     if attempts > 1:
-                        logger.info("step %s giving up after %d attempts (%s)",
-                                    step_type, attempts, code or default_code)
+                        logger.info(
+                            "step %s giving up after %d attempts (%s)",
+                            step_type,
+                            attempts,
+                            code or default_code,
+                        )
                     raise
                 self._note_attempt(operation_id)
                 delay = backoff_delay_seconds(spec, attempts)
-                logger.info("step %s attempt %d failed (%s); retrying in %.1fs "
-                            "with operation %s", step_type, attempts, code,
-                            delay, operation_id)
+                logger.info(
+                    "step %s attempt %d failed (%s); retrying in %.1fs "
+                    "with operation %s",
+                    step_type,
+                    attempts,
+                    code,
+                    delay,
+                    operation_id,
+                )
                 self._backoff_or_deadline(plan, delay)
 
     def supersede_and_replan(self, planner: Any, reason: str, **overrides) -> Any:
@@ -1158,33 +1409,51 @@ class MigrationCoordinator:
         self._handle_superseded(reason)
         if state.current_state != MigrationState.SUPERSEDED:
             raise MigrationFailed("superseded source was not safely resumed")
-        logger.info("plan %s superseded by %s (%s)",
-                    state.plan.plan_id, successor.plan_id, reason)
+        logger.info(
+            "plan %s superseded by %s (%s)",
+            state.plan.plan_id,
+            successor.plan_id,
+            reason,
+        )
         return successor
 
     def _start_operation(self, step_name: str) -> str:
         from orchestrator.models_v2 import new_ulid_like
+
         if self.actuation_guard is not None:
             self.actuation_guard()
         op_id = new_ulid_like()
         if self.operation_store is not None:
             plan = self._execution_state.plan
             self.plan_store.get_plan(plan.plan_id)
-            journal = self.operation_store.begin(f"{plan.plan_id}:{step_name}",
-                {"plan_id": plan.plan_id, "job_id": plan.job_id, "step_name": step_name,
-                 "execution_epoch": plan.execution_epoch, "target_pool_id": plan.target_pool_id,
-                 "source_host": plan.source_host, "source_pid": plan.pid})
+            journal = self.operation_store.begin(
+                f"{plan.plan_id}:{step_name}",
+                {
+                    "plan_id": plan.plan_id,
+                    "job_id": plan.job_id,
+                    "step_name": step_name,
+                    "execution_epoch": plan.execution_epoch,
+                    "target_pool_id": plan.target_pool_id,
+                    "source_host": plan.source_host,
+                    "source_pid": plan.pid,
+                },
+            )
             op_id = journal["operation_id"]
             if not journal.get("newly_issued"):
                 if journal["state"] == "ISSUED":
-                    self.operation_store.finish(op_id, "UNKNOWN", error="controller restarted after issue")
+                    self.operation_store.finish(
+                        op_id, "UNKNOWN", error="controller restarted after issue"
+                    )
                 raise OperationUnknownError(
-                    f"{step_name} has an existing {journal['state']} operation; reconcile before retry")
-        self._execution_state.operations.append(OperationRecord(
-            operation_id=op_id,
-            step_name=step_name,
-            started_at=datetime.utcnow(),
-        ))
+                    f"{step_name} has an existing {journal['state']} operation; reconcile before retry"
+                )
+        self._execution_state.operations.append(
+            OperationRecord(
+                operation_id=op_id,
+                step_name=step_name,
+                started_at=datetime.utcnow(),
+            )
+        )
         return op_id
 
     def _complete_operation(self, operation_id: str, result: Any):
@@ -1198,12 +1467,28 @@ class MigrationCoordinator:
                 break
         if self.plan_store is not None:
             state = self._execution_state
-            context = {key: getattr(state, key) for key in ("checkpoint_id", "target_instance_id", "target_host", "target_region", "target_pid", "target_process_start", "source_snapshot", "provisioned", "fencing_confirmed", "expected_epoch")}
+            context = {
+                key: getattr(state, key)
+                for key in (
+                    "checkpoint_id",
+                    "target_instance_id",
+                    "target_host",
+                    "target_region",
+                    "target_pid",
+                    "target_process_start",
+                    "source_snapshot",
+                    "provisioned",
+                    "fencing_confirmed",
+                    "expected_epoch",
+                )
+            }
             self.plan_store.save_execution_context(state.plan.plan_id, context)
 
     def _fail_operation(self, operation_id: str, error: str, unknown: bool = False):
         if self.operation_store is not None:
-            self.operation_store.finish(operation_id, "UNKNOWN" if unknown else "FAILED", error=error)
+            self.operation_store.finish(
+                operation_id, "UNKNOWN" if unknown else "FAILED", error=error
+            )
         for op in self._execution_state.operations:
             if op.operation_id == operation_id:
                 op.completed_at = datetime.utcnow()
@@ -1212,7 +1497,7 @@ class MigrationCoordinator:
                 break
 
     # -- registry bridge --
-    def _get_job(self, job_id: str) -> Optional[dict]:
+    def _get_job(self, job_id: str) -> dict | None:
         try:
             return self.registry.get(job_id)
         except Exception:
@@ -1238,8 +1523,11 @@ class MigrationCoordinator:
         try:
             cleanup = getattr(self.cleanup_executor, "cleanup_migration", None)
             if callable(cleanup):
-                cleanup(state.plan, state.operations,
-                        target_instance_id=state.target_instance_id)
+                cleanup(
+                    state.plan,
+                    state.operations,
+                    target_instance_id=state.target_instance_id,
+                )
         except Exception as exc:
             cleanup_ok = False
             logger.error("Abort cleanup failed: %s", exc)
@@ -1252,14 +1540,18 @@ class MigrationCoordinator:
             source_ok = False
             logger.error("Abort source resume failed: %s", exc)
         try:
-            self._job_transition_safe(state.plan,
-                                      "RUNNING" if cleanup_ok and source_ok
-                                      else "RECOVERY_REQUIRED")
+            self._job_transition_safe(
+                state.plan,
+                "RUNNING" if cleanup_ok and source_ok else "RECOVERY_REQUIRED",
+            )
         except MigrationFailed:
             cleanup_ok = False
         finally:
-            self._transition_to(MigrationState.ABORTED if cleanup_ok and source_ok
-                                else MigrationState.FAILED)
+            self._transition_to(
+                MigrationState.ABORTED
+                if cleanup_ok and source_ok
+                else MigrationState.FAILED
+            )
             self._release_pool_slot()
 
     def _handle_superseded(self, reason: str):
@@ -1273,9 +1565,12 @@ class MigrationCoordinator:
         try:
             cleanup = getattr(self.cleanup_executor, "cleanup_migration", None)
             if callable(cleanup):
-                cleanup(state.plan, state.operations,
-                        safety_critical_only=True,
-                        target_instance_id=state.target_instance_id)
+                cleanup(
+                    state.plan,
+                    state.operations,
+                    safety_critical_only=True,
+                    target_instance_id=state.target_instance_id,
+                )
         except Exception as exc:
             cleanup_ok = False
             logger.error("Superseded cleanup failed: %s", exc)
@@ -1303,7 +1598,9 @@ class MigrationCoordinator:
 
     def _handle_failure(self, reason: str):
         state = self._execution_state
-        post_fencing = state.fencing_confirmed or state.current_state in _POST_FENCE_STATES
+        post_fencing = (
+            state.fencing_confirmed or state.current_state in _POST_FENCE_STATES
+        )
         fencing_phase = state.current_state == MigrationState.FENCING
 
         if fencing_phase:
@@ -1329,8 +1626,11 @@ class MigrationCoordinator:
             try:
                 cleanup = getattr(self.cleanup_executor, "cleanup_migration", None)
                 if callable(cleanup):
-                    cleanup(state.plan, state.operations,
-                            target_instance_id=state.target_instance_id)
+                    cleanup(
+                        state.plan,
+                        state.operations,
+                        target_instance_id=state.target_instance_id,
+                    )
             except Exception as exc:
                 cleanup_ok = False
                 logger.error("Pre-fence target cleanup failed: %s", exc)
@@ -1343,20 +1643,23 @@ class MigrationCoordinator:
                     source_ok = False
                     logger.error("Pre-fence source resume failed: %s", exc)
             try:
-                self._job_transition_safe(state.plan,
-                                          "RUNNING" if cleanup_ok and source_ok
-                                          else "RECOVERY_REQUIRED")
+                self._job_transition_safe(
+                    state.plan,
+                    "RUNNING" if cleanup_ok and source_ok else "RECOVERY_REQUIRED",
+                )
             except MigrationFailed:
                 pass
 
         self._release_pool_slot()
         try:
-            self._audit("MIGRATION_FAILED",
-                        outcome="FAILED",
-                        reason=reason,
-                        fencing_confirmed=state.fencing_confirmed,
-                        replan_requested=state.replan_requested,
-                        replan_context=dict(state.replan_context))
+            self._audit(
+                "MIGRATION_FAILED",
+                outcome="FAILED",
+                reason=reason,
+                fencing_confirmed=state.fencing_confirmed,
+                replan_requested=state.replan_requested,
+                replan_context=dict(state.replan_context),
+            )
         except Exception as exc:
             logger.error("MIGRATION_FAILED audit write failed: %s", exc)
         self._transition_to(MigrationState.FAILED)
@@ -1382,7 +1685,9 @@ class MigrationCoordinator:
     def _handle_deadline_exceeded(self, reason: str):
         state = self._execution_state
         if state.current_state in _POST_FENCE_STATES:
-            logger.warning("Deadline exceeded in post-fencing phase; continuing forward")
+            logger.warning(
+                "Deadline exceeded in post-fencing phase; continuing forward"
+            )
         else:
             # Replan-viable (§25/S04): pre-fence deadline drift can be
             # retried as a successor with fresh evidence and budget.

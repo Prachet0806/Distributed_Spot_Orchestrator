@@ -1,4 +1,5 @@
 """Independent clients share durable state through a real HTTP service."""
+
 import os
 import socket
 import subprocess
@@ -21,17 +22,28 @@ def test_separate_processes_recover_operation_plan_and_artifact(monkeypatch, tmp
     endpoint = f"http://127.0.0.1:{port}"
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
-    env = {**os.environ, "AWS_DEFAULT_REGION": "us-east-1", "AWS_EC2_METADATA_DISABLED": "true",
-           "SPOT_TEST_ENDPOINT": endpoint, "SPOT_TEST_ROOT": str(tmp_path)}
+    env = {
+        **os.environ,
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "SPOT_TEST_ENDPOINT": endpoint,
+        "SPOT_TEST_ROOT": str(tmp_path),
+    }
     try:
         ddb = boto3.resource("dynamodb", region_name="us-east-1", endpoint_url=endpoint)
-        for name, key in (("spot_arbitrage_operations", "operation_key"),
-                          ("spot_arbitrage_plans", "plan_id")):
-            ddb.create_table(TableName=name, KeySchema=[{"AttributeName": key, "KeyType": "HASH"}],
+        for name, key in (
+            ("spot_arbitrage_operations", "operation_key"),
+            ("spot_arbitrage_plans", "plan_id"),
+        ):
+            ddb.create_table(
+                TableName=name,
+                KeySchema=[{"AttributeName": key, "KeyType": "HASH"}],
                 AttributeDefinitions=[{"AttributeName": key, "AttributeType": "S"}],
-                BillingMode="PAY_PER_REQUEST")
-        boto3.client("s3", region_name="us-east-1", endpoint_url=endpoint).create_bucket(
-            Bucket="spot-restart-fixture")
+                BillingMode="PAY_PER_REQUEST",
+            )
+        boto3.client(
+            "s3", region_name="us-east-1", endpoint_url=endpoint
+        ).create_bucket(Bucket="spot-restart-fixture")
         writer = """import os,boto3
 from pathlib import Path
 from storage.operation_store import OperationStore
@@ -63,8 +75,13 @@ manager.download('c',dst=str(destination),expected_checksum=manifest['artifact']
 assert (destination/'core-1.img').read_bytes()==b'core'
 """
         for program in (writer, reader):
-            result = subprocess.run([sys.executable, "-c", program], env=env,
-                                    capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                [sys.executable, "-c", program],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
             assert result.returncode == 0, result.stdout + result.stderr
     finally:
         server.stop()

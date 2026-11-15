@@ -2,20 +2,22 @@
 """Computed once at interruption ingestion by the observation lane, carried
 immutably on the Migration Plan, enforced by the Coordinator against a
 monotonic clock. Never recomputed from fresh timestamps mid-migration."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 
-def _norm(region: Optional[str]) -> str:
+def _norm(region: str | None) -> str:
     return (region or "").strip().lower()
 
 
-def wan_allowance_seconds(source_region: Optional[str],
-                          target_region: Optional[str],
-                          home_region: Optional[str],
-                          baseline: Optional[dict] = None) -> float:
+def wan_allowance_seconds(
+    source_region: str | None,
+    target_region: str | None,
+    home_region: str | None,
+    baseline: dict | None = None,
+) -> float:
     """Per-pair WAN allowance with default fallback (§24.1, ADR-011).
 
     Pairs are unordered (`a/b`); allowances are estimates until Track A6
@@ -32,12 +34,14 @@ def wan_allowance_seconds(source_region: Optional[str],
     return float(pairs.get(key, default))
 
 
-def compute_absolute_deadline(effective_at: datetime,
-                              window_seconds: float,
-                              source_region: Optional[str] = None,
-                              target_region: Optional[str] = None,
-                              home_region: Optional[str] = None,
-                              baseline: Optional[dict] = None) -> datetime:
+def compute_absolute_deadline(
+    effective_at: datetime,
+    window_seconds: float,
+    source_region: str | None = None,
+    target_region: str | None = None,
+    home_region: str | None = None,
+    baseline: dict | None = None,
+) -> datetime:
     """absolute_deadline = effective_at + window − wan − skew (§24.1)."""
     exec_cfg = (baseline or {}).get("execution", {})
     skew = float(exec_cfg.get("ingestion_skew_margin_seconds", 5.0))
@@ -47,8 +51,9 @@ def compute_absolute_deadline(effective_at: datetime,
     return effective_at + timedelta(seconds=float(window_seconds) - wan - skew)
 
 
-def remaining_budget_seconds(absolute_deadline: Optional[datetime],
-                             now: Optional[datetime] = None) -> Optional[float]:
+def remaining_budget_seconds(
+    absolute_deadline: datetime | None, now: datetime | None = None
+) -> float | None:
     if absolute_deadline is None:
         return None
     now = now or datetime.now(timezone.utc)

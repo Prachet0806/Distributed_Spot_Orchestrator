@@ -4,6 +4,7 @@ Every `var.X` referenced must be declared; known-bad references
 (`aws_iam_role.worker_role`) must stay fixed; V2 state resources,
 KMS, and S3 hardening must be present.
 """
+
 import re
 from pathlib import Path
 
@@ -21,13 +22,12 @@ def _vars_declared():
 def _vars_referenced():
     refs = set()
     for path in TF.glob("*.tf"):
-        refs |= set(re.findall(r'var\.([a-z_]+)', path.read_text()))
+        refs |= set(re.findall(r"var\.([a-z_]+)", path.read_text()))
     return refs
 
 
 def test_all_referenced_vars_declared():
-    assert _vars_referenced() <= _vars_declared(), (
-        _vars_referenced() - _vars_declared())
+    assert _vars_referenced() <= _vars_declared(), _vars_referenced() - _vars_declared()
 
 
 def test_role_reference_fixed():
@@ -36,16 +36,32 @@ def test_role_reference_fixed():
 
 
 def test_required_vars_present():
-    for var in ("target_region", "ami_id", "instance_type", "ssh_key_name",
-                "ssh_user", "max_spot_price", "my_ip", "dynamodb_table_name",
-                "kms_key_arn", "environment"):
+    for var in (
+        "target_region",
+        "ami_id",
+        "instance_type",
+        "ssh_key_name",
+        "ssh_user",
+        "max_spot_price",
+        "my_ip",
+        "dynamodb_table_name",
+        "kms_key_arn",
+        "environment",
+    ):
         assert var in _vars_declared(), var
 
 
 def test_state_tables_present():
     dynamo = _read("dynamodb.tf")
-    for table in ("job_registry", "candidate_pools", "plans", "event_ledger",
-                  "checkpoints", "audit", "migration_history"):
+    for table in (
+        "job_registry",
+        "candidate_pools",
+        "plans",
+        "event_ledger",
+        "checkpoints",
+        "audit",
+        "migration_history",
+    ):
         assert f'resource "aws_dynamodb_table" "{table}"' in dynamo, table
     assert '"StateIndex"' in dynamo
     assert '"event_id"' in dynamo and '"consumer_id"' in dynamo  # composite ledger key

@@ -1,14 +1,14 @@
 """Privileged worker code is immutable and checked before command dispatch."""
-import json
+
 import hashlib
-from pathlib import Path
+import json
 
 import pytest
 
 from control_entry import verify_control_tree
-from scripts.install_worker_control import install_control
 from orchestrator.criu_handlers import WRAPPER_PATH
 from orchestrator.worker_bootstrap import control_userdata
+from scripts.install_worker_control import install_control
 
 
 def test_installed_control_tree_is_pinned_and_write_once(tmp_path):
@@ -25,7 +25,8 @@ def test_installed_control_tree_is_pinned_and_write_once(tmp_path):
     assert "ip6tables -I OUTPUT 1 -m owner --uid-owner 62000 -j REJECT" in bootstrap
     assert "control_entry.py spot-monitor" in bootstrap
     assert json.loads((destination / "allowed-workloads.json").read_text())[
-        "allowed_sha256"] == ["sha256:" + hashlib.sha256(script.read_bytes()).hexdigest()]
+        "allowed_sha256"
+    ] == ["sha256:" + hashlib.sha256(script.read_bytes()).hexdigest()]
     assert WRAPPER_PATH == "/opt/spot-worker-control/checkpoint/criu_wrapper.sh"
     assert "--self-check" in control_userdata(0)
     assert "bootstrap_worker_security.sh" in control_userdata(0)
@@ -47,8 +48,14 @@ def test_control_manifest_rejects_path_traversal(tmp_path):
     manifest = destination / "manifest.json"
     document = json.loads(manifest.read_text())
     document["files"]["../escape.py"] = "0" * 64
-    document["digest"] = "sha256:" + hashlib.sha256(json.dumps(
-        document["files"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    document["digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                document["files"], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    )
     manifest.write_text(json.dumps(document))
     with pytest.raises(RuntimeError, match="escapes"):
         verify_control_tree(destination, require_root=False)

@@ -1,7 +1,7 @@
-from typing import Callable, Dict, List, Optional
-from orchestrator.protocol import Event
-from orchestrator.event_ledger import EventLedger
 import logging
+from collections.abc import Callable
+
+from orchestrator.event_ledger import EventLedger
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +21,8 @@ class EventConsumer:
 class EventDispatcher:
     def __init__(self, event_ledger: EventLedger = None):
         self.event_ledger = event_ledger or EventLedger()
-        self.consumers: Dict[str, List[EventConsumer]] = {}
-        self._default_consumers: List[EventConsumer] = []
+        self.consumers: dict[str, list[EventConsumer]] = {}
+        self._default_consumers: list[EventConsumer] = []
 
     def register_consumer(self, event_type: str, consumer: EventConsumer):
         if event_type not in self.consumers:
@@ -33,7 +33,11 @@ class EventDispatcher:
         self._default_consumers.append(consumer)
 
     def dispatch(self, event):
-        event_type = event.event_type.value if hasattr(event.event_type, 'value') else str(event.event_type)
+        event_type = (
+            event.event_type.value
+            if hasattr(event.event_type, "value")
+            else str(event.event_type)
+        )
         consumers = self.consumers.get(event_type, [])
         all_consumers = consumers + self._default_consumers
 
@@ -41,9 +45,13 @@ class EventDispatcher:
             if not consumer.can_handle(event_type):
                 continue
 
-            recorded = self.event_ledger.record_and_check(event.event_id, consumer.consumer_id)
+            recorded = self.event_ledger.record_and_check(
+                event.event_id, consumer.consumer_id
+            )
             if not recorded:
-                logger.debug(f"Event {event.event_id} already processed by {consumer.consumer_id}, skipping")
+                logger.debug(
+                    f"Event {event.event_id} already processed by {consumer.consumer_id}, skipping"
+                )
                 continue
 
             try:
@@ -51,6 +59,10 @@ class EventDispatcher:
                 consumer.handle(event)
                 self.event_ledger.mark_completed(event.event_id, consumer.consumer_id)
             except Exception as e:
-                logger.error(f"Error processing event {event.event_id} by {consumer.consumer_id}: {e}")
-                self.event_ledger.mark_failed(event.event_id, consumer.consumer_id, str(e))
+                logger.error(
+                    f"Error processing event {event.event_id} by {consumer.consumer_id}: {e}"
+                )
+                self.event_ledger.mark_failed(
+                    event.event_id, consumer.consumer_id, str(e)
+                )
                 raise

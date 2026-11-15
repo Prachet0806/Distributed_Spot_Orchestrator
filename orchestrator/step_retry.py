@@ -14,11 +14,13 @@ Rules implemented (normative):
 6. `failure_injection_points`: test-only; production plans carry an empty
    list; the Coordinator rejects non-empty lists unless test harness is set.
 """
+
 from __future__ import annotations
 
 import random
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional
+from typing import Any
 
 # ADR-012 defaults (also pinned in config/v2_baseline.yaml → retry).
 DEFAULT_MAX_ATTEMPTS = 3
@@ -34,7 +36,9 @@ DEFAULT_UNKNOWN_RESOLUTION_BUDGET_SECONDS = 30.0
 DEFAULT_RETRYABLE: dict[str, frozenset] = {
     "CHECKPOINT": frozenset({"CRIU_DUMP_TIMEOUT", "CRIU_DUMP_FAILED"}),
     "PERSIST": frozenset({"CHECKPOINT_PERSIST_FAILED", "CHECKPOINT_TRANSFER_TIMEOUT"}),
-    "PROVISION": frozenset({"PROVISION_FAILED", "CAPACITY_UNAVAILABLE", "OPERATION_TIMEOUT"}),
+    "PROVISION": frozenset(
+        {"PROVISION_FAILED", "CAPACITY_UNAVAILABLE", "OPERATION_TIMEOUT"}
+    ),
     "TRANSFER": frozenset({"TRANSFER_FAILED", "TRANSFER_TIMEOUT"}),
     "RESTORE": frozenset({"CRIU_RESTORE_TIMEOUT", "CRIU_RESTORE_FAILED"}),
     "VALIDATE": frozenset(),
@@ -77,8 +81,9 @@ class CodedError(Exception):
     can apply retryable-code gating. `failure_code` unlisted ⇒ escalate.
     """
 
-    def __init__(self, failure_code: str, message: str = "",
-                 transience: str = "UNKNOWN"):
+    def __init__(
+        self, failure_code: str, message: str = "", transience: str = "UNKNOWN"
+    ):
         super().__init__(message or failure_code)
         self.failure_code = failure_code
         self.transience = transience
@@ -114,41 +119,64 @@ class StepRetrySpec:
 def spec_for(
     step_type: str,
     *,
-    max_attempts: Optional[int] = None,
-    backoff_base_seconds: Optional[float] = None,
-    backoff_max_seconds: Optional[float] = None,
-    retryable_failure_codes: Optional[Iterable[str]] = None,
-    unknown_resolution_budget_seconds: Optional[float] = None,
-    priority: Optional[int] = None,
-    criticality: Optional[str] = None,
-    failure_injection_points: Optional[Iterable[str]] = None,
-    baseline: Optional[dict] = None,
+    max_attempts: int | None = None,
+    backoff_base_seconds: float | None = None,
+    backoff_max_seconds: float | None = None,
+    retryable_failure_codes: Iterable[str] | None = None,
+    unknown_resolution_budget_seconds: float | None = None,
+    priority: int | None = None,
+    criticality: str | None = None,
+    failure_injection_points: Iterable[str] | None = None,
+    baseline: dict | None = None,
 ) -> StepRetrySpec:
     """Build a spec: explicit args > plan-step values > ADR-012/baseline defaults."""
     base = (baseline or {}).get("retry", {}) if baseline else {}
     key = str(step_type).upper()
     return StepRetrySpec(
-        max_attempts=int(max_attempts if max_attempts is not None
-                         else base.get("operation_max_attempts", DEFAULT_MAX_ATTEMPTS)),
-        backoff_base_seconds=float(backoff_base_seconds if backoff_base_seconds is not None
-                                   else base.get("operation_backoff_base_seconds",
-                                                 DEFAULT_BACKOFF_BASE_SECONDS)),
-        backoff_max_seconds=float(backoff_max_seconds if backoff_max_seconds is not None
-                                  else base.get("operation_backoff_max_seconds",
-                                                DEFAULT_BACKOFF_MAX_SECONDS)),
+        max_attempts=int(
+            max_attempts
+            if max_attempts is not None
+            else base.get("operation_max_attempts", DEFAULT_MAX_ATTEMPTS)
+        ),
+        backoff_base_seconds=float(
+            backoff_base_seconds
+            if backoff_base_seconds is not None
+            else base.get(
+                "operation_backoff_base_seconds", DEFAULT_BACKOFF_BASE_SECONDS
+            )
+        ),
+        backoff_max_seconds=float(
+            backoff_max_seconds
+            if backoff_max_seconds is not None
+            else base.get("operation_backoff_max_seconds", DEFAULT_BACKOFF_MAX_SECONDS)
+        ),
         backoff_jitter=float(base.get("backoff_jitter", DEFAULT_BACKOFF_JITTER)),
-        retryable_failure_codes=frozenset(retryable_failure_codes
-                                          if retryable_failure_codes is not None
-                                          else DEFAULT_RETRYABLE.get(key, frozenset())),
+        retryable_failure_codes=frozenset(
+            retryable_failure_codes
+            if retryable_failure_codes is not None
+            else DEFAULT_RETRYABLE.get(key, frozenset())
+        ),
         unknown_resolution_budget_seconds=float(
-            unknown_resolution_budget_seconds if unknown_resolution_budget_seconds is not None
-            else base.get("unknown_resolution_timeout_seconds",
-                          DEFAULT_UNKNOWN_RESOLUTION_BUDGET_SECONDS)),
-        priority=int(priority if priority is not None
-                     else DEFAULT_PRIORITY.get(key, 100)),
-        criticality=str(criticality or ("SAFETY_CRITICAL" if key == "FENCE"
-                                        else "BEST_EFFORT" if key in ("PRECHECK", "FINALIZE", "CLEANUP")
-                                        else "EXECUTION_CRITICAL")),
+            unknown_resolution_budget_seconds
+            if unknown_resolution_budget_seconds is not None
+            else base.get(
+                "unknown_resolution_timeout_seconds",
+                DEFAULT_UNKNOWN_RESOLUTION_BUDGET_SECONDS,
+            )
+        ),
+        priority=int(
+            priority if priority is not None else DEFAULT_PRIORITY.get(key, 100)
+        ),
+        criticality=str(
+            criticality
+            or (
+                "SAFETY_CRITICAL"
+                if key == "FENCE"
+                else "BEST_EFFORT"
+                if key in ("PRECHECK", "FINALIZE", "CLEANUP")
+                else "EXECUTION_CRITICAL"
+            )
+        ),
         failure_injection_points=tuple(failure_injection_points or ()),
     )
 
@@ -156,7 +184,7 @@ def spec_for(
 def should_retry(
     spec: StepRetrySpec,
     *,
-    failure_code: Optional[str],
+    failure_code: str | None,
     attempts_used: int,
     budgets_valid: bool,
 ) -> bool:
@@ -175,7 +203,7 @@ def should_retry(
 def backoff_delay_seconds(
     spec: StepRetrySpec,
     attempts_used: int,
-    rng: Optional[Callable[[float, float], float]] = None,
+    rng: Callable[[float, float], float] | None = None,
 ) -> float:
     """Rule 3: exponential base→max with ±jitter (default 25%).
 
@@ -195,17 +223,23 @@ def reject_injection_points(steps: Iterable[Any], *, test_harness: bool) -> None
     """Rule 6: production plans MUST carry empty failure_injection_points."""
     offenders = []
     for step in steps or []:
-        points = (step.get("failure_injection_points")
-                  if isinstance(step, dict)
-                  else getattr(step, "failure_injection_points", None))
+        points = (
+            step.get("failure_injection_points")
+            if isinstance(step, dict)
+            else getattr(step, "failure_injection_points", None)
+        )
         if points:
-            name = (step.get("step_id", "?") if isinstance(step, dict)
-                    else getattr(step, "step_id", "?"))
+            name = (
+                step.get("step_id", "?")
+                if isinstance(step, dict)
+                else getattr(step, "step_id", "?")
+            )
             offenders.append(str(name))
     if offenders and not test_harness:
         raise ValueError(
             "plan carries failure_injection_points on steps "
-            f"{offenders}; rejected outside test harness (§10.8 rule 6)")
+            f"{offenders}; rejected outside test harness (§10.8 rule 6)"
+        )
 
 
 def _criticality_class(crit: Any) -> int:

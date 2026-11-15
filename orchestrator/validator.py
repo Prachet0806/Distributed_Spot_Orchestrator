@@ -1,8 +1,8 @@
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional, Any, Callable
-from enum import Enum
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +52,11 @@ class ValidationReport:
         """Map onto VALID / INVALID / INCONCLUSIVE (§12.2)."""
         if self.overall_result in (ValidationResult.PASSED, ValidationResult.VALID):
             return ValidationResult.VALID.value
-        if self.overall_result == ValidationResult.FAILED or not self.epoch_match \
-                or not self.lineage_valid:
+        if (
+            self.overall_result == ValidationResult.FAILED
+            or not self.epoch_match
+            or not self.lineage_valid
+        ):
             return ValidationResult.INVALID.value
         return ValidationResult.INCONCLUSIVE.value
 
@@ -83,8 +86,8 @@ class Validator:
         self,
         default_tolerance: dict = None,
         strict_mode: bool = False,
-        infra_probe: Optional[Callable[..., dict]] = None,
-        app_probe: Optional[Callable[..., dict]] = None,
+        infra_probe: Callable[..., dict] | None = None,
+        app_probe: Callable[..., dict] | None = None,
     ):
         self.default_tolerance = default_tolerance or DEFAULT_TOLERANCE_CONTRACT
         if not isinstance(self.default_tolerance.get("metrics"), dict):
@@ -99,29 +102,38 @@ class Validator:
         migration_id: str,
         job_id: str,
         execution_epoch: int,
-        source_snapshot: Optional[dict] = None,
-        target_snapshot: Optional[dict] = None,
-        tolerance_override: Optional[dict] = None,
-        expected_epoch: Optional[int] = None,
-        checkpoint_lineage: Optional[dict] = None,
-        strict_determinism: Optional[bool] = None,
+        source_snapshot: dict | None = None,
+        target_snapshot: dict | None = None,
+        tolerance_override: dict | None = None,
+        expected_epoch: int | None = None,
+        checkpoint_lineage: dict | None = None,
+        strict_determinism: bool | None = None,
     ) -> ValidationReport:
         started_at = datetime.utcnow()
         checks = []
 
         checks.append(self._check_l1_infrastructure(migration_id))
         checks.append(self._check_l2_application(migration_id))
-        checks.append(self._check_l3_state_equivalence(
-            source_snapshot, target_snapshot,
-            tolerance_override or self.default_tolerance))
+        checks.append(
+            self._check_l3_state_equivalence(
+                source_snapshot,
+                target_snapshot,
+                tolerance_override or self.default_tolerance,
+            )
+        )
 
-        want_strict = self.strict_mode if strict_determinism is None else strict_determinism
+        want_strict = (
+            self.strict_mode if strict_determinism is None else strict_determinism
+        )
         if want_strict:
-            checks.append(self._check_l4_strict_determinism(source_snapshot, target_snapshot))
+            checks.append(
+                self._check_l4_strict_determinism(source_snapshot, target_snapshot)
+            )
 
         epoch_match, lineage_valid = True, True
-        checks.append(self._check_ownership(
-            execution_epoch, expected_epoch, checkpoint_lineage))
+        checks.append(
+            self._check_ownership(execution_epoch, expected_epoch, checkpoint_lineage)
+        )
         epoch_check = checks[-1]
         epoch_match = bool(epoch_check.details.get("epoch_match", True))
         lineage_valid = bool(epoch_check.details.get("lineage_valid", True))
@@ -143,15 +155,19 @@ class Validator:
             tolerance_config=tolerance_override or self.default_tolerance,
             epoch_match=epoch_match,
             lineage_valid=lineage_valid,
-            contract_version=(tolerance_override or {}).get("version", self.contract_version),
+            contract_version=(tolerance_override or {}).get(
+                "version", self.contract_version
+            ),
         )
 
-    def to_v2_report(self, report: ValidationReport, checkpoint_id: str = "",
-                     lineage_id: str = ""):
+    def to_v2_report(
+        self, report: ValidationReport, checkpoint_id: str = "", lineage_id: str = ""
+    ):
         """Convert to the models_v2 ValidationReport (VALID/INVALID/INCONCLUSIVE)."""
+        from orchestrator.models_v2 import ValidationLevel as V2Level
         from orchestrator.models_v2 import ValidationReport as V2Report
         from orchestrator.models_v2 import ValidationResult as V2Result
-        from orchestrator.models_v2 import ValidationLevel as V2Level
+
         verdict = report.to_v2_verdict()
         highest = V2Level.L1
         for check in report.checks:
@@ -162,12 +178,16 @@ class Validator:
             if check.passed and check.level == ValidationLevel.L4_STRICT:
                 highest = V2Level.L4
         return V2Report(
-            migration_id=report.migration_id, job_id=report.job_id,
+            migration_id=report.migration_id,
+            job_id=report.job_id,
             execution_epoch=report.execution_epoch,
-            result=V2Result(verdict), level_reached=highest,
-            epoch_match=report.epoch_match, lineage_valid=report.lineage_valid,
+            result=V2Result(verdict),
+            level_reached=highest,
+            epoch_match=report.epoch_match,
+            lineage_valid=report.lineage_valid,
             measurements={c.name: c.details for c in report.checks},
-            contract_version=report.contract_version)
+            contract_version=report.contract_version,
+        )
 
     def _check_l1_infrastructure(self, migration_id: str) -> ValidationCheck:
         started = datetime.utcnow()
@@ -178,7 +198,10 @@ class Validator:
             except Exception as e:
                 details, passed = {"error": str(e)}, False
         else:
-            details = {"inconclusive": True, "error": "No infrastructure probe configured"}
+            details = {
+                "inconclusive": True,
+                "error": "No infrastructure probe configured",
+            }
             passed = False
 
         return ValidationCheck(
@@ -211,9 +234,9 @@ class Validator:
 
     def _check_l3_state_equivalence(
         self,
-        source: Optional[dict],
-        target: Optional[dict],
-        tolerance: Optional[dict],
+        source: dict | None,
+        target: dict | None,
+        tolerance: dict | None,
     ) -> ValidationCheck:
         started = datetime.utcnow()
         tol = tolerance or self.default_tolerance
@@ -227,7 +250,10 @@ class Validator:
                     flat[name] = spec
         else:
             raise ValueError("V2 tolerance contracts require a metrics mapping")
-        details = {"comparisons": {}, "contract_version": tol.get("version", "") if isinstance(tol, dict) else ""}
+        details = {
+            "comparisons": {},
+            "contract_version": tol.get("version", "") if isinstance(tol, dict) else "",
+        }
         passed = True
 
         if source is None or target is None:
@@ -236,8 +262,11 @@ class Validator:
                 name="state_equivalence",
                 level=ValidationLevel.L3_TOLERANCE_BOUNDED,
                 passed=False,
-                details={**details, "error": "Missing source or target snapshot",
-                         "inconclusive": True},
+                details={
+                    **details,
+                    "error": "Missing source or target snapshot",
+                    "inconclusive": True,
+                },
                 duration_seconds=(datetime.utcnow() - started).total_seconds(),
             )
 
@@ -247,7 +276,9 @@ class Validator:
             src_val = source.get(key)
             tgt_val = target.get(key)
             if src_val is not None and tgt_val is not None:
-                if isinstance(src_val, (int, float)) and isinstance(tgt_val, (int, float)):
+                if isinstance(src_val, (int, float)) and isinstance(
+                    tgt_val, (int, float)
+                ):
                     delta = abs(src_val - tgt_val) / max(abs(src_val), 1e-9)
                     within = delta <= tol_val
                     details["comparisons"][key] = {
@@ -274,8 +305,8 @@ class Validator:
 
     def _check_l4_strict_determinism(
         self,
-        source: Optional[dict],
-        target: Optional[dict],
+        source: dict | None,
+        target: dict | None,
     ) -> ValidationCheck:
         started = datetime.utcnow()
         details = {"bitwise_equal": False}
@@ -296,22 +327,27 @@ class Validator:
     def _check_ownership(
         self,
         execution_epoch: int,
-        expected_epoch: Optional[int],
-        lineage: Optional[dict],
+        expected_epoch: int | None,
+        lineage: dict | None,
     ) -> ValidationCheck:
         started = datetime.utcnow()
-        epoch_match = True if expected_epoch is None else (execution_epoch == expected_epoch)
+        epoch_match = (
+            True if expected_epoch is None else (execution_epoch == expected_epoch)
+        )
         lineage_valid = True
         details: dict = {"epoch_match": epoch_match}
         if lineage is not None:
-            lineage_valid = bool(lineage.get("lineage_valid", lineage.get("valid", True)))
+            lineage_valid = bool(
+                lineage.get("lineage_valid", lineage.get("valid", True))
+            )
             details["lineage_valid"] = lineage_valid
             details["lineage_id"] = lineage.get("lineage_id")
         else:
             details["lineage_valid"] = True
         if not epoch_match:
-            details["error"] = (f"epoch mismatch: expected {expected_epoch}, "
-                                f"got {execution_epoch}")
+            details["error"] = (
+                f"epoch mismatch: expected {expected_epoch}, got {execution_epoch}"
+            )
         return ValidationCheck(
             name="ownership",
             level=ValidationLevel.L4_OWNERSHIP,
@@ -320,7 +356,9 @@ class Validator:
             duration_seconds=(datetime.utcnow() - started).total_seconds(),
         )
 
-    def _compute_overall(self, checks: list[ValidationCheck], want_strict: bool) -> ValidationResult:
+    def _compute_overall(
+        self, checks: list[ValidationCheck], want_strict: bool
+    ) -> ValidationResult:
         if not checks:
             return ValidationResult.FAILED
 
@@ -338,10 +376,11 @@ class Validator:
                 # L3 without snapshots, L1 without execution context /
                 # reachable target, L2 without a fresh heartbeat. L4
                 # ownership stays strict: epoch/lineage doubt is INVALID.
-                if level in (ValidationLevel.L1_INFRASTRUCTURE,
-                             ValidationLevel.L2_APPLICATION,
-                             ValidationLevel.L3_TOLERANCE_BOUNDED) and any(
-                        c.details.get("inconclusive") for c in level_checks):
+                if level in (
+                    ValidationLevel.L1_INFRASTRUCTURE,
+                    ValidationLevel.L2_APPLICATION,
+                    ValidationLevel.L3_TOLERANCE_BOUNDED,
+                ) and any(c.details.get("inconclusive") for c in level_checks):
                     return ValidationResult.PARTIAL
                 return ValidationResult.FAILED
 

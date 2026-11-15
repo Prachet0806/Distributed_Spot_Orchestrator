@@ -3,15 +3,17 @@
 Vehicles: S09/S10-adjacent crash-recovery evidence (emulated), IA-1
 (crash ≠ workload failure) unit evidence, C-PLAN step CAS.
 """
-from datetime import datetime, timezone, timedelta
+
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from orchestrator.bootstrap import bootstrap_recovery
 from orchestrator.control_plane_lease import (
-    ControlPlaneLease, LeaseStore,
+    ControlPlaneLease,
+    LeaseStore,
 )
-from storage.plan_store import PlanStore, PlanStepConflictError
+from storage.plan_store import PlanStepConflictError, PlanStore
 
 
 class _Clock:
@@ -92,8 +94,9 @@ def test_lost_lease_fences_holder():
 
 def test_lease_dynamo_uses_conditional_writes():
     table = _FakeTable()
-    store = LeaseStore(dynamodb_resource=_FakeDynamo(
-        spot_arbitrage_control_plane_lease=table))
+    store = LeaseStore(
+        dynamodb_resource=_FakeDynamo(spot_arbitrage_control_plane_lease=table)
+    )
     assert store.acquire("cpr-primary", "cpr-a", "2099-01-01") is True
     assert "ConditionExpression" in table.puts[0]
     assert store.renew("cpr-primary", "cpr-a", 1, "2099-01-01") is True
@@ -105,27 +108,36 @@ def test_lease_dynamo_uses_conditional_writes():
 def test_plan_step_advance_bumps_version_and_guards_hash():
     store = PlanStore()
     from orchestrator.models_v2 import MigrationPlanV2
-    plan = MigrationPlanV2(plan_id="p1", job_id="j", migration_id="m",
-                           regime="ARBITRAGE", source_pool_id="s",
-                           target_pool_id="t", steps=[])
+
+    plan = MigrationPlanV2(
+        plan_id="p1",
+        job_id="j",
+        migration_id="m",
+        regime="ARBITRAGE",
+        source_pool_id="s",
+        target_pool_id="t",
+        steps=[],
+    )
     doc = store.put_plan(plan)
     assert doc["version"] == 0
     # Local step advance path works on typed docs with steps; emulate one.
     store._plans["p1"]["steps"] = [
-        {"step_id": "a", "type": "CHECKPOINT", "state": "PENDING"}]
-    out = store.update_step_state("p1", "a", "PENDING", "RUNNING",
-                                  operation_id="op-1")
+        {"step_id": "a", "type": "CHECKPOINT", "state": "PENDING"}
+    ]
+    out = store.update_step_state("p1", "a", "PENDING", "RUNNING", operation_id="op-1")
     assert out["state"] == "RUNNING"
     assert store._plans["p1"]["version"] == 1
 
 
 def test_plan_step_dynamo_cas_conditions_on_hash_and_version():
     table = _FakeTable()
-    store = PlanStore(dynamodb_resource=_FakeDynamo(
-        spot_arbitrage_plans=table))
+    store = PlanStore(dynamodb_resource=_FakeDynamo(spot_arbitrage_plans=table))
     table.items["p1"] = {
-        "plan_id": "p1", "plan_hash": "h1", "version": 3,
-        "steps": [{"step_id": "a", "type": "CHECKPOINT", "state": "RUNNING"}]}
+        "plan_id": "p1",
+        "plan_hash": "h1",
+        "version": 3,
+        "steps": [{"step_id": "a", "type": "CHECKPOINT", "state": "RUNNING"}],
+    }
     with pytest.raises(PlanStepConflictError):
         store.update_step_state("p1", "a", "PENDING", "SUCCEEDED")
     assert table.updates == []  # refused before any write
@@ -135,11 +147,20 @@ def test_plan_step_dynamo_cas_conditions_on_hash_and_version():
 
 
 # -- bootstrap --
-def _doc(plan_id="plan-1", migration="m-1", job="job-1", steps=(),
-         deadline=None, expired=False):
+def _doc(
+    plan_id="plan-1",
+    migration="m-1",
+    job="job-1",
+    steps=(),
+    deadline=None,
+    expired=False,
+):
     return {
-        "plan_id": plan_id, "migration_id": migration, "job_id": job,
-        "plan_hash": "h", "version": 1,
+        "plan_id": plan_id,
+        "migration_id": migration,
+        "job_id": job,
+        "plan_hash": "h",
+        "version": 1,
         "absolute_deadline": deadline,
         "expires_at": expired,
         "steps": list(steps),
@@ -147,8 +168,7 @@ def _doc(plan_id="plan-1", migration="m-1", job="job-1", steps=(),
 
 
 def _step(sid, stype, state="PENDING", op=None):
-    return {"step_id": sid, "type": stype, "state": state,
-            "operation_id": op}
+    return {"step_id": sid, "type": stype, "state": state, "operation_id": op}
 
 
 class _MemPlanStore:
@@ -156,10 +176,15 @@ class _MemPlanStore:
         self._docs = {d["plan_id"]: d for d in docs}
 
     def list_active(self):
-        return [d for d in self._docs.values()
-                if any(str(s.get("state", "")).upper()
-                       not in ("SUCCEEDED", "FAILED", "SKIPPED")
-                       for s in d.get("steps", []))]
+        return [
+            d
+            for d in self._docs.values()
+            if any(
+                str(s.get("state", "")).upper()
+                not in ("SUCCEEDED", "FAILED", "SKIPPED")
+                for s in d.get("steps", [])
+            )
+        ]
 
 
 class _Lease:
@@ -181,65 +206,98 @@ NOW = datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc)
 
 def test_bootstrap_halts_without_lease():
     store = _MemPlanStore([_doc(steps=[_step("s", "CHECKPOINT")])])
-    rep = bootstrap_recovery(lease=_Lease(held=False), plan_store=store,
-                             now=NOW)
+    rep = bootstrap_recovery(lease=_Lease(held=False), plan_store=store, now=NOW)
     assert rep["halted"] and rep["resumed"] == []
 
 
 def test_bootstrap_resumes_at_frontier_with_budget():
-    doc = _doc(deadline=(NOW + timedelta(minutes=10)).isoformat(), steps=[
-        _step("pre", "PRECHECK", "SUCCEEDED"),
-        _step("chk", "CHECKPOINT", "SUCCEEDED"),
-        _step("prov", "PROVISION", "RUNNING", op="op-1")])
-    rep = bootstrap_recovery(lease=_Lease(), plan_store=_MemPlanStore([doc]),
-                             now=NOW)
+    doc = _doc(
+        deadline=(NOW + timedelta(minutes=10)).isoformat(),
+        steps=[
+            _step("pre", "PRECHECK", "SUCCEEDED"),
+            _step("chk", "CHECKPOINT", "SUCCEEDED"),
+            _step("prov", "PROVISION", "RUNNING", op="op-1"),
+        ],
+    )
+    rep = bootstrap_recovery(lease=_Lease(), plan_store=_MemPlanStore([doc]), now=NOW)
     assert not rep["halted"]
-    assert rep["resumed"] == [{
-        "plan_id": "plan-1", "migration_id": "m-1", "job_id": "job-1",
-        "resume_from_step": "prov", "resume_from_type": "PROVISION",
-        "forward_only": False,
-        "remaining_budget_seconds": pytest.approx(600.0)}]
+    assert rep["resumed"] == [
+        {
+            "plan_id": "plan-1",
+            "migration_id": "m-1",
+            "job_id": "job-1",
+            "resume_from_step": "prov",
+            "resume_from_type": "PROVISION",
+            "forward_only": False,
+            "remaining_budget_seconds": pytest.approx(600.0),
+        }
+    ]
 
 
 def test_bootstrap_post_fence_frontier_is_forward_only():
-    doc = _doc(deadline=(NOW + timedelta(minutes=10)).isoformat(), steps=[
-        _step("r", "RESTORE", "SUCCEEDED"),
-        _step("f", "FENCE", "SUCCEEDED"),
-        _step("v", "VALIDATE", "RUNNING", op="op-v")])
-    rep = bootstrap_recovery(lease=_Lease(), plan_store=_MemPlanStore([doc]),
-                             now=NOW)
+    doc = _doc(
+        deadline=(NOW + timedelta(minutes=10)).isoformat(),
+        steps=[
+            _step("r", "RESTORE", "SUCCEEDED"),
+            _step("f", "FENCE", "SUCCEEDED"),
+            _step("v", "VALIDATE", "RUNNING", op="op-v"),
+        ],
+    )
+    rep = bootstrap_recovery(lease=_Lease(), plan_store=_MemPlanStore([doc]), now=NOW)
     assert rep["resumed"][0]["resume_from_type"] == "VALIDATE"
     assert rep["resumed"][0]["forward_only"] is True
 
 
 def test_bootstrap_resolves_unknown_and_gates_unresolved():
-    doc = _doc(deadline=(NOW + timedelta(minutes=10)).isoformat(), steps=[
-        _step("p", "PROVISION", "UNKNOWN", op="op-ok"),
-        _step("t", "TRANSFER", "PENDING")])
-    doc2 = _doc(plan_id="plan-2", migration="m-2", steps=[
-        _step("c", "CHECKPOINT", "UNKNOWN", op="op-lost")])
+    doc = _doc(
+        deadline=(NOW + timedelta(minutes=10)).isoformat(),
+        steps=[
+            _step("p", "PROVISION", "UNKNOWN", op="op-ok"),
+            _step("t", "TRANSFER", "PENDING"),
+        ],
+    )
+    doc2 = _doc(
+        plan_id="plan-2",
+        migration="m-2",
+        steps=[_step("c", "CHECKPOINT", "UNKNOWN", op="op-lost")],
+    )
 
     def resolve(op_id):
         return "SUCCEEDED" if op_id == "op-ok" else "UNKNOWN"
 
     rep = bootstrap_recovery(
-        lease=_Lease(), plan_store=_MemPlanStore([doc, doc2]),
-        resolve_operation=resolve, now=NOW)
-    assert rep["unknown_resolved"] and rep["unknown_resolved"][0]["operation_id"] == "op-ok"
-    assert rep["unknown_unresolved"] and rep["unknown_unresolved"][0]["operation_id"] == "op-lost"
+        lease=_Lease(),
+        plan_store=_MemPlanStore([doc, doc2]),
+        resolve_operation=resolve,
+        now=NOW,
+    )
+    assert (
+        rep["unknown_resolved"]
+        and rep["unknown_resolved"][0]["operation_id"] == "op-ok"
+    )
+    assert (
+        rep["unknown_unresolved"]
+        and rep["unknown_unresolved"][0]["operation_id"] == "op-lost"
+    )
     # Resolved plan resumes; unresolved plan waits for reconciliation.
     assert [r["plan_id"] for r in rep["resumed"]] == ["plan-1"]
 
 
 def test_bootstrap_abandons_expired_and_reports_orphans():
-    doc = _doc(deadline=(NOW - timedelta(seconds=1)).isoformat(), steps=[
-        _step("c", "CHECKPOINT", "RUNNING")])
+    doc = _doc(
+        deadline=(NOW - timedelta(seconds=1)).isoformat(),
+        steps=[_step("c", "CHECKPOINT", "RUNNING")],
+    )
     rep = bootstrap_recovery(
-        lease=_Lease(), plan_store=_MemPlanStore([doc]),
-        active_refs=[{"job_id": "job-9", "migration_id": "m-ghost",
-                      "execution_epoch": 3}],
-        now=NOW)
+        lease=_Lease(),
+        plan_store=_MemPlanStore([doc]),
+        active_refs=[
+            {"job_id": "job-9", "migration_id": "m-ghost", "execution_epoch": 3}
+        ],
+        now=NOW,
+    )
     assert rep["abandoned"] and rep["abandoned"][0]["reason"] == "DEADLINE_EXCEEDED"
     assert rep["resumed"] == []
-    assert rep["orphans"] == [{"job_id": "job-9", "migration_id": "m-ghost",
-                               "execution_epoch": 3}]
+    assert rep["orphans"] == [
+        {"job_id": "job-9", "migration_id": "m-ghost", "execution_epoch": 3}
+    ]

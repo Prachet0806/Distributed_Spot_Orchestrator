@@ -3,56 +3,94 @@
 Vehicles: I14 (audit-before-irreversible), C-E2E-adjacent terminal audit,
 mandatory FENCE_STARTED/FENCE_CONFIRMED/MIGRATION_* events.
 """
-from tests.support import emulated_validator
+
 import json
 from datetime import datetime
 
-from orchestrator.migration_planner import MigrationPlanner, MigrationState
-from orchestrator.migration_coordinator import MigrationCoordinator
-from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
-from orchestrator.workload_estimator import WorkloadEstimate
 from orchestrator.checkpoint_manager import (
-    CheckpointManager, CheckpointResult, RestoreResult)
+    CheckpointManager,
+    CheckpointResult,
+    RestoreResult,
+)
+from orchestrator.migration_coordinator import MigrationCoordinator
+from orchestrator.migration_planner import MigrationPlanner, MigrationState
+from orchestrator.policy_engine import Decision, MigrationRegime, PolicyDecision
 from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.transfer_manager import TransferManager
+from orchestrator.workload_estimator import WorkloadEstimate
 from storage.audit_store import AuditStore
 from storage.memory_registry import MemoryRegistry
 
 
 def _est():
     return WorkloadEstimate(
-        job_id="job-1", execution_epoch=0, progress=0.5,
-        remaining_runtime_seconds=7200, expected_completion_at=None,
-        prediction_confidence=0.8, checkpoint_size_estimate_bytes=100,
+        job_id="job-1",
+        execution_epoch=0,
+        progress=0.5,
+        remaining_runtime_seconds=7200,
+        expected_completion_at=None,
+        prediction_confidence=0.8,
+        checkpoint_size_estimate_bytes=100,
         checkpoint_duration_estimate_seconds=1.0,
-        estimated_at=datetime.utcnow(), estimator_version="v",
-        model_version="v", observation_snapshot_version="1")
+        estimated_at=datetime.utcnow(),
+        estimator_version="v",
+        model_version="v",
+        observation_snapshot_version="1",
+    )
 
 
 def _decision():
-    return PolicyDecision(decision=Decision.MIGRATE, regime=MigrationRegime.ARBITRAGE,
-                          reason="t", target_candidate_id="pool-t",
-                          confidence=0.9, metadata={})
+    return PolicyDecision(
+        decision=Decision.MIGRATE,
+        regime=MigrationRegime.ARBITRAGE,
+        reason="t",
+        target_candidate_id="pool-t",
+        confidence=0.9,
+        metadata={},
+    )
 
 
 def _registry(tmp_path):
     path = tmp_path / "registry.json"
-    path.write_text(json.dumps({"job-1": {
-        "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
-        "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
-        "execution_epoch": 0, "active_migration_id": None}}))
+    path.write_text(
+        json.dumps(
+            {
+                "job-1": {
+                    "job_id": "job-1",
+                    "state": "RUNNING",
+                    "region": "us-east-1",
+                    "public_ip": "10.0.0.9",
+                    "pid": 4242,
+                    "version": 0,
+                    "execution_epoch": 0,
+                    "active_migration_id": None,
+                }
+            }
+        )
+    )
     return MemoryRegistry(json.loads(path.read_text()))
 
 
 def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
-    return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
-                            duration_seconds=0.01, digest="sha256:audit",
-                            status="LOCAL", job_id=job_id, lineage_id=job_id)
+    return CheckpointResult(
+        checkpoint_id=f"chk-{job_id}",
+        size_bytes=64,
+        duration_seconds=0.01,
+        digest="sha256:audit",
+        status="LOCAL",
+        job_id=job_id,
+        lineage_id=job_id,
+    )
 
 
 def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
-                         duration_seconds=0.01, process_id=4242)
+    return RestoreResult(
+        checkpoint_id=checkpoint_id,
+        success=True,
+        contained=True,
+        duration_seconds=0.01,
+        process_id=4242,
+    )
 
 
 class _Storage:
@@ -70,8 +108,12 @@ class _Validator:
         self._passed = passed
 
     def validate(self, migration_id, job_id, epoch, **kw):
-        return {"passed": self._passed, "migration_id": migration_id,
-                "job_id": job_id, "epoch": epoch}
+        return {
+            "passed": self._passed,
+            "migration_id": migration_id,
+            "job_id": job_id,
+            "epoch": epoch,
+        }
 
 
 class _Cleanup:
@@ -85,22 +127,31 @@ def _coordinator(reg, audit_store, validator=None):
         registry=reg,
         provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
-            storage=_Storage(), dump_handler=_dump, restore_handler=_restore),
+            storage=_Storage(), dump_handler=_dump, restore_handler=_restore
+        ),
         transfer_manager=TransferManager(storage=_Storage()),
         validator=validator or _Validator(),
         cleanup_executor=_Cleanup(),
-        plan_store=None, checkpoint_store=None, audit_store=audit_store,
+        plan_store=None,
+        checkpoint_store=None,
+        audit_store=audit_store,
         fence_invalidate=lambda plan: calls.append("invalidate"),
         fence_terminate=lambda plan: calls.append("terminate"),
         fence_verify=lambda plan: calls.append("verify") or True,
-        step_timeout_seconds=30.0), calls
+        step_timeout_seconds=30.0,
+    ), calls
 
 
 def _plan():
     return MigrationPlanner().create_plan(
-        job_id="job-1", execution_epoch=0, regime=MigrationRegime.ARBITRAGE,
-        policy_decision=_decision(), source_pool_id="pool-s",
-        target_pool_id="pool-t", workload_estimate=_est())
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.ARBITRAGE,
+        policy_decision=_decision(),
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
+        workload_estimate=_est(),
+    )
 
 
 def test_fence_audited_before_hooks_and_completed_on_success(tmp_path):

@@ -1,4 +1,5 @@
 """Fixed entrypoint for root-owned worker control code, launched with -I."""
+
 import hashlib
 import json
 import sys
@@ -15,15 +16,23 @@ def verify_control_tree(root: Path, *, require_root: bool = True) -> str:
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         raise RuntimeError("empty worker control manifest")
-    digest = "sha256:" + hashlib.sha256(
-        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
     if digest != manifest.get("digest"):
         raise RuntimeError("worker control manifest digest mismatch")
     paths = {root, root / "manifest.json"}
     for name in files:
         path = root / name
         paths.add(path)
-        paths.update(parent for parent in path.parents if parent == root or root in parent.parents)
+        paths.update(
+            parent
+            for parent in path.parents
+            if parent == root or root in parent.parents
+        )
     for path in paths:
         if path.is_symlink() or not path.resolve().is_relative_to(root):
             raise RuntimeError("worker control path escapes its root")
@@ -32,7 +41,10 @@ def verify_control_tree(root: Path, *, require_root: bool = True) -> str:
             raise RuntimeError("worker control path is not root-owned and read-only")
     for name, expected in files.items():
         path = root / name
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        if (
+            not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+        ):
             raise RuntimeError(f"worker control file digest mismatch: {name}")
     return digest
 
@@ -46,7 +58,13 @@ def main():
     sys.path.insert(0, str(root))
     if len(sys.argv) > 1:
         action = sys.argv[1]
-        if action in {"launch", "process-control", "verify-artifact", "restore", "spot-monitor"}:
+        if action in {
+            "launch",
+            "process-control",
+            "verify-artifact",
+            "restore",
+            "spot-monitor",
+        }:
             sys.argv.pop(1)
             if action == "launch":
                 from worker.workload_launcher import main as action_main
@@ -60,6 +78,7 @@ def main():
                 from worker.artifact_verify import main as action_main
             return action_main()
     from worker.control_cli import main as control_main
+
     control_main()
 
 

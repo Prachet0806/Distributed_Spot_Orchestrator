@@ -1,10 +1,11 @@
 """Shared strict persistence boundary. Dynamo errors never select local state."""
+
+import math
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-import math
 from threading import RLock
 
 
@@ -37,7 +38,10 @@ def decode(value):
 
 
 def conditional_failure(exc):
-    return getattr(exc, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException"
+    return (
+        getattr(exc, "response", {}).get("Error", {}).get("Code")
+        == "ConditionalCheckFailedException"
+    )
 
 
 class Documents:
@@ -50,7 +54,9 @@ class Documents:
     def get(self, identity):
         with self.lock:
             if self.table is not None:
-                item = self.table.get_item(Key={self.key: identity}, ConsistentRead=True).get("Item")
+                item = self.table.get_item(
+                    Key={self.key: identity}, ConsistentRead=True
+                ).get("Item")
             else:
                 item = self.local.get(identity)
             if item is None:
@@ -76,17 +82,24 @@ class Documents:
             if self.table is not None:
                 kwargs = {"Item": encode(doc)}
                 if create:
-                    kwargs.update(ConditionExpression="attribute_not_exists(#pk)",
-                                  ExpressionAttributeNames={"#pk": self.key})
+                    kwargs.update(
+                        ConditionExpression="attribute_not_exists(#pk)",
+                        ExpressionAttributeNames={"#pk": self.key},
+                    )
                 elif expected_version is not None:
-                    kwargs.update(ConditionExpression="#v = :v", ExpressionAttributeNames={"#v": "version"},
-                                  ExpressionAttributeValues={":v": expected_version})
+                    kwargs.update(
+                        ConditionExpression="#v = :v",
+                        ExpressionAttributeNames={"#v": "version"},
+                        ExpressionAttributeValues={":v": expected_version},
+                    )
                 self.table.put_item(**kwargs)
             else:
                 cur = self.local.get(identity)
                 if create and cur is not None:
                     raise KeyError(identity)
-                if expected_version is not None and (cur is None or cur.get("version") != expected_version):
+                if expected_version is not None and (
+                    cur is None or cur.get("version") != expected_version
+                ):
                     raise RuntimeError("concurrent record update")
             self.local[identity] = decode(encode(doc))
             return decode(doc)

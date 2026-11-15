@@ -11,28 +11,15 @@ with its code. `--min-confidence 100` alone is a useful weaker gate
 (unused imports / provably-dead locals).
 """
 
-# ------------------------------------------------------------------
-# A. Required signatures (framework calls them; never referenced by name)
-# ------------------------------------------------------------------
 do_GET
 log_message
 
-# ------------------------------------------------------------------
-# B. Signature-conformance params (mirror a production interface so
-#    fakes stay drop-in; renaming would break keyword calls)
-# ------------------------------------------------------------------
 timeout
 bucket
 
-# ------------------------------------------------------------------
-# C. Pytest fixtures (used as test parameters; vulture can't see that)
-# ------------------------------------------------------------------
 aws_env
 aws_credentials
 
-# ------------------------------------------------------------------
-# D. Intentional forward scaffolding (owned by Tracks; wire, don't delete)
-# ------------------------------------------------------------------
 placement_engine  # Track C3: target selection wiring
 history_store  # Track B1: HistoryStore reads
 pool_store  # Track B1: PoolRegistry reads
@@ -44,9 +31,6 @@ is_emergency_eligible  # emergency-lane readiness gate
 get_checkpoint  # checkpoint lookup seam
 IMDS_INSTANCE_ID_URL  # live IMDS identity path (D3 cutover)
 
-# ------------------------------------------------------------------
-# E. Future-track seams (E5 feedback, dispatcher growth, cleanup)
-# ------------------------------------------------------------------
 record_step
 record_cleanup
 get_recent
@@ -60,19 +44,12 @@ list_all  # pool registry reads (Track B1 wiring)
 update_version  # pool definition versioning
 MULTIPART_PART_SIZE_BYTES  # documents the ADR-016 64 MB part size; boto manages parts
 
-# ------------------------------------------------------------------
-# F. Protocol/command/event factory + lifecycle APIs (C/Q/E surface)
-# ------------------------------------------------------------------
 create
 mark_running
 mark_succeeded
 mark_unknown
 register
 
-# ------------------------------------------------------------------
-# G. Store / registry / ledger APIs (persistence surface; Dynamo + JSON
-#    backends, tests, and future wiring call these)
-# ------------------------------------------------------------------
 put_plan
 enrich
 list_by_job
@@ -96,10 +73,6 @@ supersede_and_replan
 is_emergency
 get_operation_status
 
-# ------------------------------------------------------------------
-# H. Reconciliation taxonomy + finding/remediation schema (Protocols #11;
-#    V2 taxonomy members for findings)
-# ------------------------------------------------------------------
 MANUAL
 TARGET_UNREACHABLE
 ORPHAN_RESOURCE
@@ -115,9 +88,6 @@ parameters
 requested_at
 authorized_by
 
-# ------------------------------------------------------------------
-# I. Worker/trust/telemetry surface (W1–W5, T1–T4; emulated now, live next)
-# ------------------------------------------------------------------
 EmulatedWorkerTransport
 WorkerController
 handle_command
@@ -129,10 +99,6 @@ refusal_to_finding
 read_progress
 run_preflight
 
-# ------------------------------------------------------------------
-# J. Contract schema fields (dataclass/enum members defined by frozen
-#    specs; write-only today = diagnostic payload, wire — don't delete)
-# ------------------------------------------------------------------
 dimension
 workload_requirements_version
 assessed_at

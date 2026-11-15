@@ -17,11 +17,12 @@ dispatch time (commit-before-dispatch, §7.2 rule 3).
 Stale-checks (Protocols §8.5): consumers MUST evaluate epoch +
 effective time before acting — see `is_stale_event()`.
 """
+
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from orchestrator.deadlines import (
     compute_absolute_deadline,
@@ -53,7 +54,7 @@ _RECON_EVENT_TYPES = {
 }
 
 
-def parse_flag_doc(obj: Any) -> Optional[Dict[str, Any]]:
+def parse_flag_doc(obj: Any) -> dict[str, Any] | None:
     """Validate a spot-flag payload (`worker/spot_interrupt.py` shape).
 
     Returns `{detected_at, source, instance_id?}` with a tz-aware
@@ -94,12 +95,15 @@ def stable_event_id(
     return f"spot-interruption:{job_id}:{instance_id or 'unknown'}:{bucket}"
 
 
-def _window_seconds(baseline: Optional[dict], override: Optional[float]) -> float:
+def _window_seconds(baseline: dict | None, override: float | None) -> float:
     if override is not None:
         return float(override)
     try:
-        return float((baseline or {}).get("execution", {}).get(
-            "emergency_window_seconds", DEFAULT_EMERGENCY_WINDOW_SECONDS))
+        return float(
+            (baseline or {})
+            .get("execution", {})
+            .get("emergency_window_seconds", DEFAULT_EMERGENCY_WINDOW_SECONDS)
+        )
     except (TypeError, ValueError):
         return DEFAULT_EMERGENCY_WINDOW_SECONDS
 
@@ -110,14 +114,14 @@ def ingest_interruption(
     job_id: str,
     execution_epoch: int = 0,
     instance_id: str = "",
-    source_region: Optional[str] = None,
-    target_region: Optional[str] = None,
-    home_region: Optional[str] = None,
-    baseline: Optional[dict] = None,
-    window_seconds: Optional[float] = None,
+    source_region: str | None = None,
+    target_region: str | None = None,
+    home_region: str | None = None,
+    baseline: dict | None = None,
+    window_seconds: float | None = None,
     producer: str = PRODUCER,
-    correlation_id: Optional[str] = None,
-) -> Optional[SpotInterruptionEvent]:
+    correlation_id: str | None = None,
+) -> SpotInterruptionEvent | None:
     """Build the authoritative SpotInterruptionEvent for a flag notice.
 
     Returns None when the flag doc is missing/malformed (evidence-absence:
@@ -133,12 +137,16 @@ def ingest_interruption(
     window = _window_seconds(baseline, window_seconds)
     wan = wan_allowance_seconds(source_region, target_region, home_region, baseline)
     try:
-        skew = float((baseline or {}).get("execution", {}).get(
-            "ingestion_skew_margin_seconds", 5.0))
+        skew = float(
+            (baseline or {})
+            .get("execution", {})
+            .get("ingestion_skew_margin_seconds", 5.0)
+        )
     except (TypeError, ValueError):
         skew = 5.0
     absolute_deadline = compute_absolute_deadline(
-        effective_at, window, source_region, target_region, home_region, baseline)
+        effective_at, window, source_region, target_region, home_region, baseline
+    )
     event_id = stable_event_id(job_id, instance, effective_at)
     noticed_at = datetime.now(timezone.utc)
     # Fidelity: how long the notice sat before the control plane saw it.
@@ -175,9 +183,9 @@ def ingest_interruption(
 
 def is_stale_event(
     event: SpotInterruptionEvent,
-    job: Optional[Dict[str, Any]],
-    now: Optional[datetime] = None,
-) -> Tuple[bool, str]:
+    job: dict[str, Any] | None,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
     """Protocols §8.5 stale-check: epoch + deadline before acting.
 
     Returns (True, reason) when the event MUST be dropped, (False, "fresh")
@@ -188,8 +196,8 @@ def is_stale_event(
     current_epoch = int(job.get("execution_epoch", 0) or 0)
     if int(getattr(event, "execution_epoch", 0) or 0) != current_epoch:
         return True, (
-            f"epoch-mismatch: event={event.execution_epoch} "
-            f"registry={current_epoch}")
+            f"epoch-mismatch: event={event.execution_epoch} registry={current_epoch}"
+        )
     raw_deadline = (event.payload or {}).get("absolute_deadline")
     if raw_deadline:
         try:
@@ -202,7 +210,7 @@ def is_stale_event(
     return False, "fresh"
 
 
-def read_spot_flag(host: str, flag_path: str, log=None) -> Optional[Dict[str, Any]]:
+def read_spot_flag(host: str, flag_path: str, log=None) -> dict[str, Any] | None:
     """Fetch + parse the worker interruption flag over SSH.
 
     Returns the raw flag doc (dict) or None on transport/parse failure.
@@ -214,6 +222,7 @@ def read_spot_flag(host: str, flag_path: str, log=None) -> Optional[Dict[str, An
 
     try:
         from orchestrator.utils import SSHClient
+
         ssh = SSHClient(host)
         ssh.connect()
         try:
@@ -280,7 +289,7 @@ def build_dispatcher(event_ledger: Any, reconciliation: Any = None):
     dispatcher = EventDispatcher(event_ledger=event_ledger)
     # Late-bind cell: main.py constructs reconciliation after the
     # dispatcher; set_reconciliation_manager() fills it before the loop.
-    cell: Dict[str, Any] = {"manager": reconciliation}
+    cell: dict[str, Any] = {"manager": reconciliation}
 
     def _recon_fanout(event):
         manager = cell["manager"]
@@ -293,6 +302,7 @@ def build_dispatcher(event_ledger: Any, reconciliation: Any = None):
 
     for etype in sorted(_RECON_EVENT_TYPES):
         dispatcher.register_consumer(
-            etype, EventConsumer(f"reconciliation-{etype.lower()}", _recon_fanout))
+            etype, EventConsumer(f"reconciliation-{etype.lower()}", _recon_fanout)
+        )
     dispatcher.set_reconciliation_manager = set_manager  # type: ignore[attr-defined]
     return dispatcher

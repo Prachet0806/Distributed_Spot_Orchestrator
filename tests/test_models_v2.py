@@ -1,25 +1,40 @@
 """Phase 1a: V2 domain contracts, transition tables, frozen baseline."""
-from datetime import datetime, timedelta
 
-from orchestrator.models_v2 import (
-    MigrationPlanV2, PlanStep, PlanStepType, RollbackClass,
-    CheckpointRef,
-    canonical_plan_dict, compute_plan_hash, STEP_ROLLBACK,
-)
+from datetime import datetime
+
 from orchestrator.config_loader import load_v2_baseline
+from orchestrator.models_v2 import (
+    STEP_ROLLBACK,
+    MigrationPlanV2,
+    PlanStep,
+    PlanStepType,
+    RollbackClass,
+    canonical_plan_dict,
+    compute_plan_hash,
+)
 from storage.v2_transitions import is_v2_transition_allowed
 
 
 def _plan():
     return MigrationPlanV2(
-        plan_id="p1", job_id="j1", migration_id="m1", regime="ARBITRAGE",
-        source_pool_id="s", target_pool_id="t",
-        created_at="2026-01-01T00:00:00", expires_at="2026-01-01T00:10:00",
+        plan_id="p1",
+        job_id="j1",
+        migration_id="m1",
+        regime="ARBITRAGE",
+        source_pool_id="s",
+        target_pool_id="t",
+        created_at="2026-01-01T00:00:00",
+        expires_at="2026-01-01T00:10:00",
         input_snapshot_versions={"policy": "v3"},
         authorization_reference="dec-1",
-        steps=[PlanStep(step_id="a", type=PlanStepType.CHECKPOINT,
-                        operation_type="CreateCheckpoint",
-                        rollback_class=STEP_ROLLBACK["CHECKPOINT"])],
+        steps=[
+            PlanStep(
+                step_id="a",
+                type=PlanStepType.CHECKPOINT,
+                operation_type="CreateCheckpoint",
+                rollback_class=STEP_ROLLBACK["CHECKPOINT"],
+            )
+        ],
     )
 
 

@@ -1,15 +1,15 @@
 import json
-from worker.atomic_io import write_json
 import os
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+
+from worker.atomic_io import write_json
 from worker.constants import (
-    IMDS_BASE_URL,
-    IMDS_TOKEN_URL,
     IMDS_ACTION_URL,
     IMDS_TOKEN_TTL,
+    IMDS_TOKEN_URL,
     SPOT_INTERRUPT_POLL_INTERVAL,
 )
 
@@ -42,7 +42,9 @@ def _write_interrupt_flag(flag_path, action=None):
     write_json(flag_path, payload)
 
 
-def monitor_spot_interruption(flag_path, poll_interval=SPOT_INTERRUPT_POLL_INTERVAL, stop_event=None, logger=print):
+def monitor_spot_interruption(
+    flag_path, poll_interval=SPOT_INTERRUPT_POLL_INTERVAL, stop_event=None, logger=print
+):
     """
     Poll the IMDS spot interruption notice endpoint and create a flag file
     when a termination is scheduled.
@@ -77,6 +79,7 @@ def monitor_spot_interruption(flag_path, poll_interval=SPOT_INTERRUPT_POLL_INTER
 
 def main():
     from worker.constants import SPOT_INTERRUPT_FLAG
+
     monitor_spot_interruption(SPOT_INTERRUPT_FLAG)
 
 

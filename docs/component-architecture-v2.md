@@ -681,50 +681,73 @@ Rules:
 Interfaces are derived from C/Q/E semantics — no bare method calls crossing component boundaries for side effects.
 
 ```python
-class DynamoRegistry:         # Persistence / authority
+class DynamoRegistry:  # Persistence / authority
     def transition(self, req: TransitionRequest) -> TransitionResult: ...
-    def get(self, job_id) -> JobView: ...                    # query
-    def query_ownership(self, q: GetExecutionOwnershipQuery) -> ExecutionOwnershipResult: ...
+    def get(self, job_id) -> JobView: ...  # query
+    def query_ownership(
+        self, q: GetExecutionOwnershipQuery
+    ) -> ExecutionOwnershipResult: ...
 
-class MigrationCoordinator:   # Execution control
-    def execute(self, plan: MigrationPlan,
-                sink: EventSink) -> MigrationResult: ...     # entry; all internal effects flow as Commands/Events
+
+class MigrationCoordinator:  # Execution control
+    def execute(
+        self, plan: MigrationPlan, sink: EventSink
+    ) -> MigrationResult: ...  # entry; all internal effects flow as Commands/Events
     def cancel(self, op: CancelRequest) -> CancelResult: ...
 
+
 class Planner:
-    def create_plan(self, req: PlanRequest) -> tuple[MigrationPlan, PlanValidationResult]: ...
+    def create_plan(
+        self, req: PlanRequest
+    ) -> tuple[MigrationPlan, PlanValidationResult]: ...
+
 
 class RecoveryPolicy:
-    def decide(self, ctx: RecoveryContext) -> RecoveryDecision: ...   # pure decision
+    def decide(self, ctx: RecoveryContext) -> RecoveryDecision: ...  # pure decision
+
 
 class PolicyEngine:
     def decide(self, ctx: PolicyContext) -> PolicyDecision: ...
+
 
 class Provisioner:
     def execute(self, cmd: ProvisionCommand | TerminateCommand) -> OperationHandle: ...
     def query(self, q: GetOperationStatusQuery) -> OperationStatusResult: ...
 
+
 class CheckpointManager:
     def execute(self, cmd: CheckpointCommand) -> OperationHandle: ...
-    def query_validity(self, q: GetCheckpointValidityQuery) -> CheckpointValidityResult: ...
-    def select_recovery_checkpoint(self, sel: RecoverySelection) -> CheckpointRef | None: ...
+    def query_validity(
+        self, q: GetCheckpointValidityQuery
+    ) -> CheckpointValidityResult: ...
+    def select_recovery_checkpoint(
+        self, sel: RecoverySelection
+    ) -> CheckpointRef | None: ...
+
 
 class TransferManager:
     def execute(self, cmd: TransferCommand) -> OperationHandle: ...
 
+
 class Validator:
     def validate(self, q: ValidateMigrationQuery) -> ValidationReport: ...
+
 
 class ReconciliationManager:
     def reconcile(self, trigger: TriggerContext) -> list[ReconciliationFinding]: ...
     def request_remediation(self, finding_id) -> RemediationRequest: ...
 
+
 class CleanupExecutor:
-    def execute(self, cmd: CleanupCommand) -> OperationResult: ...   # pre-authorized scope only
+    def execute(
+        self, cmd: CleanupCommand
+    ) -> OperationResult: ...  # pre-authorized scope only
+
 
 class EventDispatcher:
-    def publish(self, e: Event) -> None: ...          # ledger-commit then fan-out
+    def publish(self, e: Event) -> None: ...  # ledger-commit then fan-out
     def subscribe(self, consumer_id, types, handler) -> None: ...
+
 
 class ConfigManager:
     def resolve(self, pins: dict[str, str]) -> ResolvedConfig: ...

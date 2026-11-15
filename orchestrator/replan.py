@@ -24,11 +24,12 @@ executions, plan-store/registry transitions for stored plans (Sprint 4).
 The main-loop pre-emption trigger additionally needs plan persistence
 (Track B1: plans are not yet admitted to the Plan Store in `main.py`).
 """
+
 from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any
 
 from orchestrator.migration_coordinator import MigrationExecutionState
 from orchestrator.migration_planner import MigrationPlan, MigrationState
@@ -39,31 +40,35 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_REPLANS = 2
 
 
-def max_replans_from_baseline(baseline: Optional[dict]) -> int:
+def max_replans_from_baseline(baseline: dict | None) -> int:
     """Read the attempt budget from the frozen baseline (ADR-012)."""
     try:
-        return int((baseline or {}).get("retry", {}).get(
-            "max_replans", DEFAULT_MAX_REPLANS))
+        return int(
+            (baseline or {}).get("retry", {}).get("max_replans", DEFAULT_MAX_REPLANS)
+        )
     except (TypeError, ValueError, AttributeError):
         return DEFAULT_MAX_REPLANS
 
 
-def budget_remaining(replan_counts: Dict[str, int], migration_id: str,
-                     max_replans: int = DEFAULT_MAX_REPLANS) -> bool:
+def budget_remaining(
+    replan_counts: dict[str, int],
+    migration_id: str,
+    max_replans: int = DEFAULT_MAX_REPLANS,
+) -> bool:
     """True when another successor attempt may be issued for this attempt."""
     return int(replan_counts.get(migration_id, 0)) < int(max_replans)
 
 
-def note_replan(replan_counts: Dict[str, int], migration_id: str) -> int:
+def note_replan(replan_counts: dict[str, int], migration_id: str) -> int:
     """Record an issued successor; returns the new count (1-based)."""
     replan_counts[migration_id] = int(replan_counts.get(migration_id, 0)) + 1
     return replan_counts[migration_id]
 
 
 def replan_signal_for(
-    exec_state: Optional[MigrationExecutionState],
+    exec_state: MigrationExecutionState | None,
     recovery_replan_required: bool = False,
-) -> Optional[str]:
+) -> str | None:
     """Decide whether a terminal execution warrants a successor plan.
 
     Returns the replan reason, or None when the outcome must stand.
@@ -73,8 +78,7 @@ def replan_signal_for(
     """
     if exec_state is None:
         return None
-    if exec_state.current_state not in (MigrationState.FAILED,
-                                        MigrationState.ABORTED):
+    if exec_state.current_state not in (MigrationState.FAILED, MigrationState.ABORTED):
         return None
     if exec_state.fencing_confirmed:
         return None  # forward-only; a new plan cannot unfence the source
@@ -92,8 +96,8 @@ def preempt_with_emergency(
     workload_estimate: Any,
     policy_decision: Any = None,
     recovery_feasibility: Any = None,
-    absolute_deadline: Optional[datetime] = None,
-    target_pool_id: Optional[str] = None,
+    absolute_deadline: datetime | None = None,
+    target_pool_id: str | None = None,
     fencing_confirmed: bool = False,
 ) -> MigrationPlan:
     """Build the S16 emergency successor for an in-flight arbitrage plan.
@@ -106,11 +110,11 @@ def preempt_with_emergency(
     if fencing_confirmed:
         raise ValueError(
             "refusing emergency pre-emption post-fencing: forward recovery "
-            "only (§25, Protocols #4 §6.3)")
+            "only (§25, Protocols #4 §6.3)"
+        )
     if old_plan.regime == MigrationRegime.EMERGENCY:
-        raise ValueError(
-            "old plan is already EMERGENCY: nothing to pre-empt")
-    overrides: Dict[str, Any] = {
+        raise ValueError("old plan is already EMERGENCY: nothing to pre-empt")
+    overrides: dict[str, Any] = {
         "regime": MigrationRegime.EMERGENCY,
     }
     if absolute_deadline is not None:
@@ -120,7 +124,8 @@ def preempt_with_emergency(
     if target_pool_id is not None:
         overrides["target_pool_id"] = target_pool_id
     return planner.create_successor_plan(
-        old_plan, "emergency-preempts",
+        old_plan,
+        "emergency-preempts",
         workload_estimate=workload_estimate,
         policy_decision=policy_decision or old_plan.policy_decision,
         **overrides,

@@ -1,8 +1,10 @@
 """Filesystem object service for the explicit lab; provides no KMS/IAM proof."""
-from pathlib import Path
+
 import json
 import shutil
 from io import BytesIO
+from pathlib import Path
+
 from botocore.exceptions import ClientError
 
 
@@ -21,10 +23,21 @@ class LocalArtifactClient:
         target = self._path(bucket, key)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
-        target.with_name(target.name + ".metadata").write_text(json.dumps((ExtraArgs or {}).get("Metadata", {})))
+        target.with_name(target.name + ".metadata").write_text(
+            json.dumps((ExtraArgs or {}).get("Metadata", {}))
+        )
 
-    def put_object(self, *, Bucket, Key, Body, IfNoneMatch=None,
-                   ServerSideEncryption=None, SSEKMSKeyId=None, Metadata=None):
+    def put_object(
+        self,
+        *,
+        Bucket,
+        Key,
+        Body,
+        IfNoneMatch=None,
+        ServerSideEncryption=None,
+        SSEKMSKeyId=None,
+        Metadata=None,
+    ):
         target = self._path(Bucket, Key)
         target.parent.mkdir(parents=True, exist_ok=True)
         if IfNoneMatch != "*":
@@ -33,16 +46,22 @@ class LocalArtifactClient:
             with target.open("xb") as output:
                 output.write(Body)
         except FileExistsError as exc:
-            raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject") from exc
-        target.with_name(target.name + ".metadata").write_text(json.dumps(Metadata or {}))
+            raise ClientError(
+                {"Error": {"Code": "PreconditionFailed"}}, "PutObject"
+            ) from exc
+        target.with_name(target.name + ".metadata").write_text(
+            json.dumps(Metadata or {})
+        )
         return {"ETag": '"local"'}
 
     def head_object(self, Bucket, Key):
         path = self._path(Bucket, Key)
         if not path.exists():
             raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
-        return {"Metadata": json.loads(path.with_name(path.name + ".metadata").read_text()),
-                "ContentLength": path.stat().st_size}
+        return {
+            "Metadata": json.loads(path.with_name(path.name + ".metadata").read_text()),
+            "ContentLength": path.stat().st_size,
+        }
 
     def get_object(self, Bucket, Key):
         path = self._path(Bucket, Key)

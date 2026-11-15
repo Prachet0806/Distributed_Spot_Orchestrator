@@ -1,5 +1,7 @@
 """Validation shared by the V2 registry backends; no record upgrades."""
+
 from decimal import Decimal
+
 from storage.v2_transitions import JOB_TRANSITIONS
 
 
@@ -14,7 +16,12 @@ def validate_job_record(record):
         raise ValueError("Only V2 execution records are supported")
     for key in ("version", "execution_epoch"):
         value = record[key]
-        if not isinstance(value, (int, Decimal)) or isinstance(value, bool) or value < 0 or int(value) != value:
+        if (
+            not isinstance(value, (int, Decimal))
+            or isinstance(value, bool)
+            or value < 0
+            or int(value) != value
+        ):
             raise ValueError(f"{key} must be a nonnegative integer")
     active = record["active_migration_id"]
     if active is not None and (not isinstance(active, str) or not active):

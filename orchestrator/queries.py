@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Any
+
 from orchestrator.protocol import Query, QueryType
 
 
@@ -7,7 +8,7 @@ from orchestrator.protocol import Query, QueryType
 class QueryResult:
     success: bool
     data: Any = None
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class QueryHandler:
@@ -20,7 +21,9 @@ class QueryHandler:
     def handle(self, query: Query) -> QueryResult:
         handler = self.handlers.get(query.query_type)
         if not handler:
-            return QueryResult(success=False, error=f"No handler for query type: {query.query_type}")
+            return QueryResult(
+                success=False, error=f"No handler for query type: {query.query_type}"
+            )
         try:
             return QueryResult(success=True, data=handler(query))
         except Exception as e:
@@ -41,16 +44,16 @@ class OperationStatusResult:
     operation_id: str
     state: str
     result: Any = None
-    error: Optional[str] = None
-    completed_at: Optional[str] = None
+    error: str | None = None
+    completed_at: str | None = None
 
 
 @dataclass
 class CheckpointStatusResult:
     checkpoint_id: str
     status: str
-    size_bytes: Optional[int] = None
-    digest: Optional[str] = None
+    size_bytes: int | None = None
+    digest: str | None = None
 
 
 @dataclass
@@ -58,14 +61,14 @@ class ExecutionOwnershipResult:
     job_id: str
     execution_epoch: int
     authoritative_owner: str
-    active_migration_id: Optional[str] = None
+    active_migration_id: str | None = None
 
 
 @dataclass
 class InstanceStateResult:
     instance_id: str
     state: str
-    public_ip: Optional[str] = None
+    public_ip: str | None = None
 
 
 # Query classes

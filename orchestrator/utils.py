@@ -1,37 +1,35 @@
 # orchestrator/utils.py
 import logging
-import subprocess
 import os
-from typing import Optional
+import subprocess
 
 logging.basicConfig(level=logging.INFO)
-
 
 
 class SSHClient:
     """
     SSH client for remote command execution on EC2 instances.
     Uses subprocess with ssh command for simplicity (no extra dependencies).
-    
+
     Security:
     - Enforces host key verification
     - Requires explicit key path
     - Validates inputs
     """
-    
+
     def __init__(
         self,
         host: str,
         user: str = "ubuntu",
-        key_path: Optional[str] = None,
+        key_path: str | None = None,
         port: int = 22,
         timeout: int = 30,
-        known_hosts_path: Optional[str] = None,
+        known_hosts_path: str | None = None,
         strict: bool = False,
     ):
         """
         Initialize SSH client.
-        
+
         Args:
             host: IP address or hostname of remote host
             user: SSH username (default: ubuntu)
@@ -41,7 +39,7 @@ class SSHClient:
             known_hosts_path: Path to known_hosts file (default: ~/.ssh/known_hosts)
             strict: Track D2 — require a pre-pinned known_hosts file and
                 refuse first-connect TOFU instead of accept-new.
-        
+
         Raises:
             ValueError: If host is invalid or key path doesn't exist
         """
@@ -54,12 +52,12 @@ class SSHClient:
             raise ValueError(f"Invalid port: {port}")
         if timeout < 1:
             raise ValueError(f"Invalid timeout: {timeout}")
-        
+
         self.host = host.strip()
         self.user = user.strip()
         self.port = port
         self.timeout = timeout
-        
+
         # Determine SSH key path
         if key_path:
             self.key_path = os.path.expanduser(key_path)
@@ -77,18 +75,20 @@ class SSHClient:
                 if os.path.exists(key):
                     self.key_path = key
                     break
-            
+
             if not self.key_path:
                 raise ValueError(
                     "No SSH key found. Please specify key_path or create a key in ~/.ssh/"
                 )
-        
+
         # Known hosts for host key verification
-        self.known_hosts_path = known_hosts_path or os.path.expanduser("~/.ssh/known_hosts")
+        self.known_hosts_path = known_hosts_path or os.path.expanduser(
+            "~/.ssh/known_hosts"
+        )
         self.strict = strict
-        
+
         self.connected = False
-    
+
     def connect(self):
         """
         Test SSH connectivity (connection is established on first command).
@@ -101,51 +101,60 @@ class SSHClient:
         except Exception as e:
             logging.error(f"Failed to establish SSH connection: {e}")
             raise
-    
+
     def run_command(
         self,
         command: str,
         check: bool = True,
         capture_output: bool = True,
-        timeout_override: Optional[int] = None
+        timeout_override: int | None = None,
     ) -> subprocess.CompletedProcess:
         """
         Execute a remote command via SSH.
-        
+
         Args:
             command: Command to execute on remote host
             check: If True, raise exception on non-zero exit code
             capture_output: If True, capture stdout/stderr
             timeout_override: Override default timeout for this command
-            
+
         Returns:
             CompletedProcess object with stdout, stderr, returncode
-            
+
         Raises:
             ValueError: If command is empty or invalid
             RuntimeError: If SSH fails
         """
         if not command or not isinstance(command, str):
             raise ValueError(f"Invalid command: {command}")
-        
+
         # Build SSH command
         ssh_cmd = ["ssh"]
-        
+
         # Add SSH options - SECURE configuration
         ssh_options = [
-            "-o", "ConnectTimeout=10",  # Connection timeout
-            "-o", "ServerAliveInterval=15",  # Keep connection alive
-            "-o", "ServerAliveCountMax=3",  # Max missed keepalives
-            "-o", "BatchMode=yes",  # Disable password prompts
-            "-o", "LogLevel=ERROR",  # Reduce verbosity
+            "-o",
+            "ConnectTimeout=10",  # Connection timeout
+            "-o",
+            "ServerAliveInterval=15",  # Keep connection alive
+            "-o",
+            "ServerAliveCountMax=3",  # Max missed keepalives
+            "-o",
+            "BatchMode=yes",  # Disable password prompts
+            "-o",
+            "LogLevel=ERROR",  # Reduce verbosity
         ]
-        
+
         # Host key verification - enforce known_hosts check
         if os.path.exists(self.known_hosts_path):
-            ssh_options.extend([
-                "-o", "StrictHostKeyChecking=yes",
-                "-o", f"UserKnownHostsFile={self.known_hosts_path}"
-            ])
+            ssh_options.extend(
+                [
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "-o",
+                    f"UserKnownHostsFile={self.known_hosts_path}",
+                ]
+            )
         elif self.strict:
             # Track D2: pinned deployments rule on first-connect TOFU.
             raise RuntimeError(
@@ -158,55 +167,63 @@ class SSHClient:
                 f"Known hosts file not found: {self.known_hosts_path}. "
                 "First connection will accept host key."
             )
-            ssh_options.extend([
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-o", f"UserKnownHostsFile={self.known_hosts_path}"
-            ])
-        
+            ssh_options.extend(
+                [
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    f"UserKnownHostsFile={self.known_hosts_path}",
+                ]
+            )
+
         # Add SSH key (required)
         ssh_options.extend(["-i", self.key_path])
-        
+
         # Add port
         ssh_options.extend(["-p", str(self.port)])
-        
+
         # Build full command: ssh [options] user@host "command"
         ssh_cmd.extend(ssh_options)
         ssh_cmd.append(f"{self.user}@{self.host}")
         ssh_cmd.append(command)
-        
+
         logging.debug(f"Executing SSH command to {self.user}@{self.host}")
-        
+
         timeout = timeout_override if timeout_override is not None else self.timeout
-        
+
         try:
             result = subprocess.run(
                 ssh_cmd,
                 capture_output=capture_output,
                 text=True,
                 timeout=timeout,
-                check=check
+                check=check,
             )
-            
+
             if result.returncode != 0 and check:
                 error_msg = result.stderr if result.stderr else "Unknown error"
                 raise RuntimeError(
                     f"SSH command failed (exit code {result.returncode}): {error_msg}"
                 )
-            
+
             if capture_output and result.stdout:
-                logging.debug(f"Command output: {result.stdout[:200]}")  # Log first 200 chars
-            
+                logging.debug(
+                    f"Command output: {result.stdout[:200]}"
+                )  # Log first 200 chars
+
             return result
-            
+
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"SSH command timed out after {timeout} seconds")
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"SSH command failed: {e.stderr if e.stderr else str(e)}")
+            raise RuntimeError(
+                f"SSH command failed: {e.stderr if e.stderr else str(e)}"
+            )
         except FileNotFoundError:
             raise RuntimeError(
                 "SSH command not found. Ensure OpenSSH client is installed."
             )
-    
+
     def close(self):
         """
         Close SSH connection (no-op for subprocess-based implementation).

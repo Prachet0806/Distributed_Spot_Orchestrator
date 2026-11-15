@@ -20,36 +20,40 @@ stub-pass (I7/I15). NOTE (live backlog): the sink currently publishes the
 provisioner `instance_id` as `target_host`; instance-id → IP resolution
 (EC2 describe) lands with the live provisioner path (Track A5/C2).
 """
+
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
-from orchestrator.worker_telemetry import WorkerTelemetryReader, heartbeat_liveness
+from orchestrator.worker_telemetry import WorkerTelemetryReader
 
 logger = logging.getLogger(__name__)
 
 PROBE_VERSION = "transport-v1"
 
 
-def make_context_provider(store: Dict[str, Dict[str, Any]]):
+def make_context_provider(store: dict[str, dict[str, Any]]):
     """Build a `(migration_id) -> ctx | None` reader over a mutable map.
 
     The map is filled by the Coordinator's `execution_context_sink` at
     restore time; keyed by `migration_id` (unique per attempt).
     """
-    def _provider(migration_id: Optional[str]) -> Optional[Dict[str, Any]]:
+
+    def _provider(migration_id: str | None) -> dict[str, Any] | None:
         if not migration_id:
             return None
         ctx = store.get(migration_id)
         return dict(ctx) if ctx is not None else None
+
     return _provider
 
 
 def make_infra_probe(
     transport_factory: Callable[[str], Any],
-    context_provider: Optional[Callable[[Optional[str]], Optional[Dict[str, Any]]]] = None,
+    context_provider: Callable[[str | None], dict[str, Any] | None] | None = None,
     timeout: float = 30.0,
 ):
     """L1 probe: restored process alive on the target host.
@@ -58,38 +62,61 @@ def make_infra_probe(
     `(migration_id=None, **kw) -> details`, where `details["passed"]`
     decides the check and `details["inconclusive"]` marks evidence-absence.
     """
-    def _probe(migration_id: Optional[str] = None, **_kw) -> Dict[str, Any]:
+
+    def _probe(migration_id: str | None = None, **_kw) -> dict[str, Any]:
         ctx = context_provider(migration_id) if callable(context_provider) else None
         if not ctx:
-            return {"passed": False, "inconclusive": True,
-                    "error": "no-execution-context", "probe": PROBE_VERSION}
+            return {
+                "passed": False,
+                "inconclusive": True,
+                "error": "no-execution-context",
+                "probe": PROBE_VERSION,
+            }
         host, pid = ctx.get("target_host"), ctx.get("target_pid")
         if not host:
-            return {"passed": False, "inconclusive": True,
-                    "error": "no-target-host", "probe": PROBE_VERSION}
+            return {
+                "passed": False,
+                "inconclusive": True,
+                "error": "no-target-host",
+                "probe": PROBE_VERSION,
+            }
         if pid is None:
-            return {"passed": False, "inconclusive": True,
-                    "error": "no-target-pid", "probe": PROBE_VERSION}
+            return {
+                "passed": False,
+                "inconclusive": True,
+                "error": "no-target-pid",
+                "probe": PROBE_VERSION,
+            }
         try:
             res = transport_factory(host).run_command(
-                f"ps -p {int(pid)}", timeout=timeout)
+                f"ps -p {int(pid)}", timeout=timeout
+            )
         except Exception as exc:
             # Fail-closed: an unreachable target is not a healthy target.
-            return {"passed": False, "target_reachable": False,
-                    "process_running": False, "error": str(exc),
-                    "probe": PROBE_VERSION}
+            return {
+                "passed": False,
+                "target_reachable": False,
+                "process_running": False,
+                "error": str(exc),
+                "probe": PROBE_VERSION,
+            }
         running = int((res or {}).get("returncode", 1)) == 0
-        return {"passed": running, "target_reachable": True,
-                "process_running": running, "pid": int(pid),
-                "probe": PROBE_VERSION}
+        return {
+            "passed": running,
+            "target_reachable": True,
+            "process_running": running,
+            "pid": int(pid),
+            "probe": PROBE_VERSION,
+        }
+
     return _probe
 
 
 def make_app_probe(
     transport_factory: Callable[[str], Any],
-    context_provider: Optional[Callable[[Optional[str]], Optional[Dict[str, Any]]]] = None,
+    context_provider: Callable[[str | None], dict[str, Any] | None] | None = None,
     workspace_root: str = "/opt/job_workspace",
-    clock: Optional[Callable[[], datetime]] = None,
+    clock: Callable[[], datetime] | None = None,
     timeout: float = 15.0,
 ):
     """L2 probe: workload responding per T1 heartbeat freshness.
@@ -100,37 +127,61 @@ def make_app_probe(
     """
     _clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def _probe(migration_id: Optional[str] = None, **_kw) -> Dict[str, Any]:
+    def _probe(migration_id: str | None = None, **_kw) -> dict[str, Any]:
         ctx = context_provider(migration_id) if callable(context_provider) else None
         if not ctx or not ctx.get("target_host"):
-            return {"passed": False, "inconclusive": True,
-                    "error": "no-execution-context", "probe": PROBE_VERSION}
+            return {
+                "passed": False,
+                "inconclusive": True,
+                "error": "no-execution-context",
+                "probe": PROBE_VERSION,
+            }
         if ctx.get("target_contained"):
             host, pid = ctx.get("target_host"), ctx.get("target_pid")
             try:
-                result = transport_factory(host).run_command(f"ps -o stat= -p {int(pid)}", timeout=timeout)
-                stopped = result.get("returncode") == 0 and result.get("stdout", "").strip().startswith(("T", "t"))
-                return {"passed": stopped, "workload_contained": stopped, "probe": PROBE_VERSION,
-                        "inconclusive": not stopped}
+                result = transport_factory(host).run_command(
+                    f"ps -o stat= -p {int(pid)}", timeout=timeout
+                )
+                stopped = result.get("returncode") == 0 and result.get(
+                    "stdout", ""
+                ).strip().startswith(("T", "t"))
+                return {
+                    "passed": stopped,
+                    "workload_contained": stopped,
+                    "probe": PROBE_VERSION,
+                    "inconclusive": not stopped,
+                }
             except Exception as exc:
                 return {"passed": False, "inconclusive": True, "error": str(exc)}
         try:
             reader = WorkerTelemetryReader(
                 transport_factory(ctx["target_host"]),
-                workspace_root=workspace_root, clock=_clock)
+                workspace_root=workspace_root,
+                clock=_clock,
+            )
             verdict = reader.liveness()
         except Exception as exc:
-            return {"passed": False, "inconclusive": True,
-                    "error": f"telemetry-read-failed: {exc}",
-                    "probe": PROBE_VERSION}
+            return {
+                "passed": False,
+                "inconclusive": True,
+                "error": f"telemetry-read-failed: {exc}",
+                "probe": PROBE_VERSION,
+            }
         if verdict.get("readiness") == "READY":
-            return {"passed": True, "workload_responding": True,
-                    "liveness": verdict.get("liveness"),
-                    "age_seconds": verdict.get("age_seconds"),
-                    "probe": PROBE_VERSION}
-        return {"passed": False, "inconclusive": True,
-                "workload_responding": False,
+            return {
+                "passed": True,
+                "workload_responding": True,
                 "liveness": verdict.get("liveness"),
                 "age_seconds": verdict.get("age_seconds"),
-                "probe": PROBE_VERSION}
+                "probe": PROBE_VERSION,
+            }
+        return {
+            "passed": False,
+            "inconclusive": True,
+            "workload_responding": False,
+            "liveness": verdict.get("liveness"),
+            "age_seconds": verdict.get("age_seconds"),
+            "probe": PROBE_VERSION,
+        }
+
     return _probe

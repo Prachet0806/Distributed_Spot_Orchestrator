@@ -1,5 +1,7 @@
 """V2 emulation registry rejects retired states and record shapes."""
+
 import pytest
+
 from storage.memory_registry import MemoryRegistry
 
 
@@ -9,8 +11,9 @@ def test_v2_create_transition_and_copy_isolation():
     record = reg.get("j")
     record["state"] = "FAILED"
     assert reg.get("j")["state"] == "RUNNING"
-    out = reg.transition("j", "MIGRATING", expected_version=0,
-                         expected_epoch=0, active_migration_id="m")
+    out = reg.transition(
+        "j", "MIGRATING", expected_version=0, expected_epoch=0, active_migration_id="m"
+    )
     assert out["version"] == 1 and out["execution_epoch"] == 0
     with pytest.raises(RuntimeError, match="Optimistic lock"):
         reg.transition("j", "RUNNING", expected_version=0)
@@ -21,7 +24,9 @@ def test_v2_create_transition_and_copy_isolation():
     assert reg.list_by_state("RUNNING") == [out]
 
 
-@pytest.mark.parametrize("state", ["CHECKPOINTING", "UPLOADING", "PROVISIONING", "TERMINATED"])
+@pytest.mark.parametrize(
+    "state", ["CHECKPOINTING", "UPLOADING", "PROVISIONING", "TERMINATED"]
+)
 def test_retired_states_rejected(state):
     reg = MemoryRegistry()
     reg.create("j", state="RUNNING")

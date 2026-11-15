@@ -1,10 +1,9 @@
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Any
-import uuid
-import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +49,13 @@ class MigrationRecord:
     source_candidate_id: str
     target_candidate_id: str
     started_at: datetime
-    completed_at: Optional[datetime] = None
-    total_duration_seconds: Optional[float] = None
+    completed_at: datetime | None = None
+    total_duration_seconds: float | None = None
     policy_decision: dict = field(default_factory=dict)
     cost_analysis: dict = field(default_factory=dict)
     feasibility: dict = field(default_factory=dict)
     steps: list[dict] = field(default_factory=list)
-    failure_reason: Optional[str] = None
+    failure_reason: str | None = None
     cleanup_status: str = "PENDING"
     estimator_version: str = ""
     risk_model_version: str = ""
@@ -70,7 +69,9 @@ class MigrationHistory:
         self.storage = storage
         self._records: list[MigrationRecord] = []
 
-    def record_start(self, plan: Any, policy_decision: Any, cost_analysis: Any, feasibility: Any) -> str:
+    def record_start(
+        self, plan: Any, policy_decision: Any, cost_analysis: Any, feasibility: Any
+    ) -> str:
         record = MigrationRecord(
             migration_id=plan.migration_id,
             job_id=plan.job_id,
@@ -87,16 +88,32 @@ class MigrationHistory:
                 "confidence": policy_decision.confidence,
             },
             cost_analysis={
-                "expected_total_cost": cost_analysis.cost_breakdown.expected_total_cost if cost_analysis else None,
-                "expected_savings": cost_analysis.cost_breakdown.expected_savings if cost_analysis else None,
-                "completion_time_delta": cost_analysis.cost_breakdown.completion_time_delta_seconds if cost_analysis else None,
-            } if cost_analysis else {},
+                "expected_total_cost": cost_analysis.cost_breakdown.expected_total_cost
+                if cost_analysis
+                else None,
+                "expected_savings": cost_analysis.cost_breakdown.expected_savings
+                if cost_analysis
+                else None,
+                "completion_time_delta": cost_analysis.cost_breakdown.completion_time_delta_seconds
+                if cost_analysis
+                else None,
+            }
+            if cost_analysis
+            else {},
             feasibility={
                 "status": feasibility.status.value if feasibility else None,
-                "critical_path_seconds": feasibility.critical_path_seconds if feasibility else None,
-                "confidence": feasibility.feasibility_confidence if feasibility else None,
-            } if feasibility else {},
-            estimator_version=plan.steps[0].__dict__.get("estimator_version", "") if plan.steps else "",
+                "critical_path_seconds": feasibility.critical_path_seconds
+                if feasibility
+                else None,
+                "confidence": feasibility.feasibility_confidence
+                if feasibility
+                else None,
+            }
+            if feasibility
+            else {},
+            estimator_version=plan.steps[0].__dict__.get("estimator_version", "")
+            if plan.steps
+            else "",
             risk_model_version="",
             policy_config_version="",
         )
@@ -105,28 +122,42 @@ class MigrationHistory:
             self.storage.save(record)
         return record.migration_id
 
-    def record_step(self, migration_id: str, step_name: str, status: str, result: Any = None, error: str = None, duration: float = 0):
+    def record_step(
+        self,
+        migration_id: str,
+        step_name: str,
+        status: str,
+        result: Any = None,
+        error: str = None,
+        duration: float = 0,
+    ):
         record = self._get(migration_id)
         if record:
             stored, schema = _normalize_step_result(result)
-            record.steps.append({
-                "step": step_name,
-                "status": status,
-                "result": stored,
-                "result_schema": schema,
-                "error": error,
-                "duration_seconds": duration,
-                "timestamp": datetime.utcnow().isoformat(),
-            })
+            record.steps.append(
+                {
+                    "step": step_name,
+                    "status": status,
+                    "result": stored,
+                    "result_schema": schema,
+                    "error": error,
+                    "duration_seconds": duration,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+            )
             if self.storage:
                 self.storage.save(record)
 
-    def record_completion(self, migration_id: str, outcome: MigrationOutcome, failure_reason: str = None):
+    def record_completion(
+        self, migration_id: str, outcome: MigrationOutcome, failure_reason: str = None
+    ):
         record = self._get(migration_id)
         if record:
             record.outcome = MigrationOutcome(outcome)
             record.completed_at = datetime.utcnow()
-            record.total_duration_seconds = (record.completed_at - record.started_at).total_seconds()
+            record.total_duration_seconds = (
+                record.completed_at - record.started_at
+            ).total_seconds()
             record.failure_reason = failure_reason
             if self.storage:
                 self.storage.save(record)
@@ -138,7 +169,7 @@ class MigrationHistory:
             if self.storage:
                 self.storage.save(record)
 
-    def _get(self, migration_id: str) -> Optional[MigrationRecord]:
+    def _get(self, migration_id: str) -> MigrationRecord | None:
         for r in self._records:
             if r.migration_id == migration_id:
                 return r
@@ -158,16 +189,24 @@ class MigrationHistory:
                 continue
             ckpt = next((s for s in r.steps if s["step"] == "checkpointing"), {})
             ckpt_res = _step_result_dict(ckpt)
-            out.append({
-                "migration_id": r.migration_id,
-                "actual_checkpoint_size": ckpt_res.get("size_bytes"),
-                "actual_checkpoint_duration": ckpt.get("duration_seconds"),
-                "actual_provision_duration": next((s for s in r.steps if s["step"] == "provisioning"), {}).get("duration_seconds"),
-                "actual_transfer_duration": next((s for s in r.steps if s["step"] == "transferring"), {}).get("duration_seconds"),
-                "actual_restore_duration": next((s for s in r.steps if s["step"] == "restoring"), {}).get("duration_seconds"),
-                "outcome": r.outcome.value,
-                "regime": r.regime,
-            })
+            out.append(
+                {
+                    "migration_id": r.migration_id,
+                    "actual_checkpoint_size": ckpt_res.get("size_bytes"),
+                    "actual_checkpoint_duration": ckpt.get("duration_seconds"),
+                    "actual_provision_duration": next(
+                        (s for s in r.steps if s["step"] == "provisioning"), {}
+                    ).get("duration_seconds"),
+                    "actual_transfer_duration": next(
+                        (s for s in r.steps if s["step"] == "transferring"), {}
+                    ).get("duration_seconds"),
+                    "actual_restore_duration": next(
+                        (s for s in r.steps if s["step"] == "restoring"), {}
+                    ).get("duration_seconds"),
+                    "outcome": r.outcome.value,
+                    "regime": r.regime,
+                }
+            )
         return out
 
     def get_feedback_for_risk_model(self) -> list[dict]:
@@ -175,8 +214,13 @@ class MigrationHistory:
         return [
             {
                 "regime": r.regime,
-                "interruption_occurred": r.outcome == MigrationOutcome.FAILED and r.failure_reason and "interrupt" in r.failure_reason.lower(),
-                "provisioning_succeeded": any(s["step"] == "provisioning" and s["status"] == "SUCCEEDED" for s in r.steps),
+                "interruption_occurred": r.outcome == MigrationOutcome.FAILED
+                and r.failure_reason
+                and "interrupt" in r.failure_reason.lower(),
+                "provisioning_succeeded": any(
+                    s["step"] == "provisioning" and s["status"] == "SUCCEEDED"
+                    for s in r.steps
+                ),
                 "duration_seconds": r.total_duration_seconds,
                 "cost_actual": None,
             }

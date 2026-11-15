@@ -1,14 +1,12 @@
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from enum import Enum
-from typing import Optional, List
-import time
 import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 
-from orchestrator.cost_risk_evaluator import CostAnalysis, RecoveryCostAnalysis
-from orchestrator.recovery_feasibility import RecoveryFeasibility
 from orchestrator.candidate_compatibility import CompatibilityAssessment
 from orchestrator.candidate_readiness import ReadinessAssessment
+from orchestrator.cost_risk_evaluator import CostAnalysis, RecoveryCostAnalysis
+from orchestrator.recovery_feasibility import RecoveryFeasibility
 from orchestrator.workload_estimator import WorkloadEstimate
 
 
@@ -72,12 +70,12 @@ class PolicyDecision:
     decision: Decision
     regime: MigrationRegime
     reason: str
-    target_candidate_id: Optional[str]
+    target_candidate_id: str | None
     confidence: float
     metadata: dict
     decision_id: str = ""
     policy_version: str = "v3"
-    expires_at: Optional[datetime] = None
+    expires_at: datetime | None = None
 
     def __post_init__(self):
         if not self.decision_id:
@@ -93,8 +91,8 @@ class ArbitragePolicy:
         stay_analysis: CostAnalysis,
         candidate_analyses: list[CostAnalysis],
         workload_estimate: WorkloadEstimate,
-        compatibility_assessments: List[CompatibilityAssessment],
-        readiness_assessments: List[ReadinessAssessment],
+        compatibility_assessments: list[CompatibilityAssessment],
+        readiness_assessments: list[ReadinessAssessment],
         job_context: dict,
         favorable_observations: int = 99,
         cooldown_remaining_seconds: float = 0.0,
@@ -110,7 +108,9 @@ class ArbitragePolicy:
                 policy_version=self.config.policy_version,
             )
 
-        best = min(candidate_analyses, key=lambda x: x.cost_breakdown.expected_total_cost)
+        best = min(
+            candidate_analyses, key=lambda x: x.cost_breakdown.expected_total_cost
+        )
         workload_type = job_context.get("workload_type", "medium").lower()
         remaining = workload_estimate.remaining_runtime_seconds or 0
 
@@ -139,14 +139,12 @@ class ArbitragePolicy:
         threshold = self.config.workload_thresholds.get(workload_type, 0.12)
         threshold = max(threshold, self.config.min_savings_margin)
 
-        savings_ratio = (
-            best.cost_breakdown.expected_savings
-            / max(stay_analysis.cost_breakdown.expected_total_cost, 0.001)
+        savings_ratio = best.cost_breakdown.expected_savings / max(
+            stay_analysis.cost_breakdown.expected_total_cost, 0.001
         )
 
-        completion_overhead = (
-            best.cost_breakdown.completion_time_delta_seconds
-            / max(remaining or 1, 1)
+        completion_overhead = best.cost_breakdown.completion_time_delta_seconds / max(
+            remaining or 1, 1
         )
 
         # 20% hard ceiling (ADR-006).
@@ -165,12 +163,18 @@ class ArbitragePolicy:
             )
 
         # ADR-007 MEDIUM band: net_benefit >= max(2*migration_cost, 20%*remaining_savings).
-        if remaining and self.config.short_runtime_seconds <= remaining < self.config.medium_runtime_seconds:
+        if (
+            remaining
+            and self.config.short_runtime_seconds
+            <= remaining
+            < self.config.medium_runtime_seconds
+        ):
             migration_cost = best.cost_breakdown.total_migration_cost
             remaining_savings = max(
                 stay_analysis.cost_breakdown.expected_total_cost
-                - best.cost_breakdown.candidate_cost_per_hour
-                * (remaining / 3600) if hasattr(best.cost_breakdown, "candidate_cost_per_hour") else 0.0,
+                - best.cost_breakdown.candidate_cost_per_hour * (remaining / 3600)
+                if hasattr(best.cost_breakdown, "candidate_cost_per_hour")
+                else 0.0,
                 0.0,
             )
             net_benefit = best.cost_breakdown.expected_savings
@@ -214,23 +218,34 @@ class ArbitragePolicy:
                 policy_version=self.config.policy_version,
             )
 
-        if (
-            best.cost_breakdown.expected_savings > 0
-            and savings_ratio >= threshold
-        ):
+        if best.cost_breakdown.expected_savings > 0 and savings_ratio >= threshold:
             compat = next(
-                (c for c in compatibility_assessments if c.pool_id == best.target_pool_id),
+                (
+                    c
+                    for c in compatibility_assessments
+                    if c.pool_id == best.target_pool_id
+                ),
                 None,
             )
             ready = next(
                 (r for r in readiness_assessments if r.pool_id == best.target_pool_id),
                 None,
             )
-            if compat and ready and compat.status.value == "COMPATIBLE" and ready.status.value == "READY":
+            if (
+                compat
+                and ready
+                and compat.status.value == "COMPATIBLE"
+                and ready.status.value == "READY"
+            ):
                 conf = min(
                     float(best.confidence),
                     float(workload_estimate.prediction_confidence or 0.0),
-                    1.0 if (compat.dimensions and compat.dimensions[0].status.value == "COMPATIBLE") else 0.0,
+                    1.0
+                    if (
+                        compat.dimensions
+                        and compat.dimensions[0].status.value == "COMPATIBLE"
+                    )
+                    else 0.0,
                 )
                 return PolicyDecision(
                     decision=Decision.MIGRATE,
@@ -270,8 +285,8 @@ class ProactivePolicy:
         stay_analysis: CostAnalysis,
         candidate_analyses: list[CostAnalysis],
         workload_estimate: WorkloadEstimate,
-        compat_assessments: List[CompatibilityAssessment],
-        ready_assessments: List[ReadinessAssessment],
+        compat_assessments: list[CompatibilityAssessment],
+        ready_assessments: list[ReadinessAssessment],
         risk_context: dict,
     ) -> PolicyDecision:
         current_risk = risk_context.get("interruption_probability", 0.0)
@@ -282,7 +297,10 @@ class ProactivePolicy:
                 reason="risk_below_threshold",
                 target_candidate_id=None,
                 confidence=0.8,
-                metadata={"current_risk": current_risk, "threshold": self.config.risk_threshold},
+                metadata={
+                    "current_risk": current_risk,
+                    "threshold": self.config.risk_threshold,
+                },
             )
 
         if not candidate_analyses:
@@ -307,7 +325,11 @@ class ProactivePolicy:
                 metadata={},
             )
 
-        ready_analyses = [a for a in candidate_analyses if a.target_pool_id in {r.pool_id for r in ready_candidates}]
+        ready_analyses = [
+            a
+            for a in candidate_analyses
+            if a.target_pool_id in {r.pool_id for r in ready_candidates}
+        ]
 
         if not ready_analyses:
             return PolicyDecision(
@@ -351,8 +373,8 @@ class RecoveryPolicy:
         compat_assessment=None,
         ready_assessment=None,
         checkpoint_durable: bool = False,
-        checkpoint_id: Optional[str] = None,
-        lineage_id: Optional[str] = None,
+        checkpoint_id: str | None = None,
+        lineage_id: str | None = None,
         reconciliation_context: str = "NONE",
         policy_version: str = "v3",
     ):
@@ -362,48 +384,62 @@ class RecoveryPolicy:
         if reconciliation_context in ("OWNERSHIP_UNCERTAIN", "SPLIT_BRAIN"):
             return V2RecoveryDecision(
                 decision_id=f"rec-{uuid.uuid4().hex[:12]}",
-                job_id=job_id, migration_id=migration_id,
+                job_id=job_id,
+                migration_id=migration_id,
                 execution_epoch=execution_epoch,
                 decision=RecoveryDecisionKind.FAILED,
                 reason_code="RECONCILIATION_REQUIRED",
                 failure_code="OWNERSHIP_UNCERTAIN",
                 replan_required=False,
-                checkpoint_id=checkpoint_id, lineage_id=lineage_id,
+                checkpoint_id=checkpoint_id,
+                lineage_id=lineage_id,
                 confidence_level="LOW",
                 confidence_basis={"gate": "reconciliation"},
                 policy_version=policy_version,
             )
-        status = getattr(getattr(recovery_feasibility, "status", None), "value", None) \
-            or str(getattr(recovery_feasibility, "status", "INSUFFICIENT_EVIDENCE"))
-        conf = float(getattr(recovery_feasibility, "feasibility_confidence", 0.0) or 0.0)
+        status = getattr(
+            getattr(recovery_feasibility, "status", None), "value", None
+        ) or str(getattr(recovery_feasibility, "status", "INSUFFICIENT_EVIDENCE"))
+        conf = float(
+            getattr(recovery_feasibility, "feasibility_confidence", 0.0) or 0.0
+        )
         if status == "FEASIBLE" and conf >= self.config.min_feasibility_confidence:
             if compat_assessment is not None and ready_assessment is not None:
-                if not (compat_assessment.status.value == "COMPATIBLE"
-                        and ready_assessment.status.value == "READY"):
+                if not (
+                    compat_assessment.status.value == "COMPATIBLE"
+                    and ready_assessment.status.value == "READY"
+                ):
                     return V2RecoveryDecision(
                         decision_id=f"rec-{uuid.uuid4().hex[:12]}",
-                        job_id=job_id, migration_id=migration_id,
+                        job_id=job_id,
+                        migration_id=migration_id,
                         execution_epoch=execution_epoch,
                         decision=RecoveryDecisionKind.FAILED,
                         reason_code="NO_VIABLE_CANDIDATE",
                         failure_code="CANDIDATE_NOT_READY",
                         replan_required=True,
-                        checkpoint_id=checkpoint_id, lineage_id=lineage_id,
+                        checkpoint_id=checkpoint_id,
+                        lineage_id=lineage_id,
                         confidence_level="MEDIUM",
                         policy_version=policy_version,
                     )
             cp = getattr(recovery_feasibility, "critical_path_seconds", None)
             return V2RecoveryDecision(
                 decision_id=f"rec-{uuid.uuid4().hex[:12]}",
-                job_id=job_id, migration_id=migration_id,
+                job_id=job_id,
+                migration_id=migration_id,
                 execution_epoch=execution_epoch,
-                decision=RecoveryDecisionKind.RETRY_RESTORE if checkpoint_durable
+                decision=RecoveryDecisionKind.RETRY_RESTORE
+                if checkpoint_durable
                 else RecoveryDecisionKind.FORWARD_RECOVERY,
                 reason_code="feasible_recovery",
                 replan_required=False,
-                checkpoint_id=checkpoint_id, lineage_id=lineage_id,
+                checkpoint_id=checkpoint_id,
+                lineage_id=lineage_id,
                 critical_path_duration_seconds=cp,
-                safety_margin_seconds=float(getattr(recovery_feasibility, "safety_margin_seconds", 30.0) or 30.0),
+                safety_margin_seconds=float(
+                    getattr(recovery_feasibility, "safety_margin_seconds", 30.0) or 30.0
+                ),
                 confidence_level="HIGH" if conf >= 0.8 else "MEDIUM",
                 confidence_basis={"feasibility_confidence": conf},
                 policy_version=policy_version,
@@ -411,12 +447,14 @@ class RecoveryPolicy:
         if status == "INSUFFICIENT_EVIDENCE" and self.config.allow_cold_restart:
             return V2RecoveryDecision(
                 decision_id=f"rec-{uuid.uuid4().hex[:12]}",
-                job_id=job_id, migration_id=migration_id,
+                job_id=job_id,
+                migration_id=migration_id,
                 execution_epoch=execution_epoch,
                 decision=RecoveryDecisionKind.COLD_RESTART,
                 reason_code="cold_restart_fallback",
                 replan_required=True,
-                checkpoint_id=None, lineage_id=lineage_id,
+                checkpoint_id=None,
+                lineage_id=lineage_id,
                 confidence_level="LOW",
                 policy_version=policy_version,
             )
@@ -429,17 +467,20 @@ class RecoveryPolicy:
             reason = "recovery_infeasible"
         return V2RecoveryDecision(
             decision_id=f"rec-{uuid.uuid4().hex[:12]}",
-            job_id=job_id, migration_id=migration_id,
+            job_id=job_id,
+            migration_id=migration_id,
             execution_epoch=execution_epoch,
             decision=RecoveryDecisionKind.FAILED,
             reason_code=reason,
-            failure_code=str(getattr(recovery_feasibility, "infeasible_reason", "") or "INFEASIBLE"),
+            failure_code=str(
+                getattr(recovery_feasibility, "infeasible_reason", "") or "INFEASIBLE"
+            ),
             replan_required=False,
-            checkpoint_id=checkpoint_id, lineage_id=lineage_id,
+            checkpoint_id=checkpoint_id,
+            lineage_id=lineage_id,
             confidence_level="LOW",
             policy_version=policy_version,
         )
-
 
 
 class PolicyEngine:
@@ -459,10 +500,10 @@ class PolicyEngine:
         stay_analysis: CostAnalysis,
         candidate_analyses: list[CostAnalysis],
         workload_estimate: WorkloadEstimate,
-        compat_assessments: List[CompatibilityAssessment],
-        ready_assessments: List[ReadinessAssessment],
-        recovery_feasibility: Optional[RecoveryFeasibility] = None,
-        recovery_cost: Optional[RecoveryCostAnalysis] = None,
+        compat_assessments: list[CompatibilityAssessment],
+        ready_assessments: list[ReadinessAssessment],
+        recovery_feasibility: RecoveryFeasibility | None = None,
+        recovery_cost: RecoveryCostAnalysis | None = None,
         checkpoint_durable: bool = False,
         job_context: dict = None,
         risk_context: dict = None,
@@ -490,15 +531,22 @@ class PolicyEngine:
                 compat_assessment=compat_assessments[0] if compat_assessments else None,
                 ready_assessment=ready_assessments[0] if ready_assessments else None,
                 checkpoint_durable=checkpoint_durable,
-                reconciliation_context=job_context.get("reconciliation_context", "NONE"),
+                reconciliation_context=job_context.get(
+                    "reconciliation_context", "NONE"
+                ),
             )
             executable = recovery.decision.value in {
-                "RETRY_RESTORE", "FORWARD_RECOVERY", "COLD_RESTART"}
+                "RETRY_RESTORE",
+                "FORWARD_RECOVERY",
+                "COLD_RESTART",
+            }
             return PolicyDecision(
                 decision=Decision.RECOVER if executable else Decision.ABANDON,
-                regime=regime, reason=recovery.reason_code,
+                regime=regime,
+                reason=recovery.reason_code,
                 target_candidate_id=compat_assessments[0].pool_id
-                if executable and compat_assessments else None,
+                if executable and compat_assessments
+                else None,
                 confidence=recovery_feasibility.feasibility_confidence,
                 metadata={"recovery_decision": recovery.decision.value},
             )

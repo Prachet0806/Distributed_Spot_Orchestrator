@@ -4,8 +4,7 @@ Vehicles: S15 (REPLAN → successor via supersedes_plan_id), S16
 (emergency supersedes pre-fence arbitrage), S04 (deadline exhausted
 pre-fence → abort/replan path), C-PLAN (hash/pins across links).
 """
-from storage.audit_store import AuditStore
-from tests.support import emulated_validator
+
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -13,51 +12,90 @@ import pytest
 
 from orchestrator import replan as replan_mod
 from orchestrator.checkpoint_manager import (
-    CheckpointManager, CheckpointResult, RestoreResult)
+    CheckpointManager,
+    CheckpointResult,
+    RestoreResult,
+)
 from orchestrator.migration_coordinator import MigrationCoordinator
 from orchestrator.migration_planner import MigrationPlanner, MigrationState
-from orchestrator.policy_engine import PolicyDecision, Decision, MigrationRegime
+from orchestrator.policy_engine import Decision, MigrationRegime, PolicyDecision
 from orchestrator.provisioner import EmulatedProvisioner
 from orchestrator.transfer_manager import TransferManager
 from orchestrator.workload_estimator import WorkloadEstimate
+from storage.audit_store import AuditStore
 from storage.checkpoint_store import CheckpointStore
 from storage.memory_registry import MemoryRegistry
 
 
 def _est(remaining=7200):
     return WorkloadEstimate(
-        job_id="job-1", execution_epoch=0, progress=0.5,
-        remaining_runtime_seconds=remaining, expected_completion_at=None,
-        prediction_confidence=0.8, checkpoint_size_estimate_bytes=100,
+        job_id="job-1",
+        execution_epoch=0,
+        progress=0.5,
+        remaining_runtime_seconds=remaining,
+        expected_completion_at=None,
+        prediction_confidence=0.8,
+        checkpoint_size_estimate_bytes=100,
         checkpoint_duration_estimate_seconds=1.0,
-        estimated_at=datetime.utcnow(), estimator_version="v",
-        model_version="v", observation_snapshot_version="1")
+        estimated_at=datetime.utcnow(),
+        estimator_version="v",
+        model_version="v",
+        observation_snapshot_version="1",
+    )
 
 
 def _decision(regime=MigrationRegime.ARBITRAGE, target="pool-t"):
-    return PolicyDecision(decision=Decision.MIGRATE, regime=regime,
-                          reason="t", target_candidate_id=target,
-                          confidence=0.9, metadata={})
+    return PolicyDecision(
+        decision=Decision.MIGRATE,
+        regime=regime,
+        reason="t",
+        target_candidate_id=target,
+        confidence=0.9,
+        metadata={},
+    )
 
 
 def _registry(tmp_path):
     path = tmp_path / "registry.json"
-    path.write_text(json.dumps({"job-1": {
-        "job_id": "job-1", "state": "RUNNING", "region": "us-east-1",
-        "public_ip": "10.0.0.9", "pid": 4242, "version": 0,
-        "execution_epoch": 0, "active_migration_id": None}}))
+    path.write_text(
+        json.dumps(
+            {
+                "job-1": {
+                    "job_id": "job-1",
+                    "state": "RUNNING",
+                    "region": "us-east-1",
+                    "public_ip": "10.0.0.9",
+                    "pid": 4242,
+                    "version": 0,
+                    "execution_epoch": 0,
+                    "active_migration_id": None,
+                }
+            }
+        )
+    )
     return MemoryRegistry(json.loads(path.read_text()))
 
 
 def _dump(job_id, pid, host, timeout=300.0, operation_id=None):
-    return CheckpointResult(checkpoint_id=f"chk-{job_id}", size_bytes=64,
-                            duration_seconds=0.01, digest="sha256:replan",
-                            status="LOCAL", job_id=job_id, lineage_id=job_id)
+    return CheckpointResult(
+        checkpoint_id=f"chk-{job_id}",
+        size_bytes=64,
+        duration_seconds=0.01,
+        digest="sha256:replan",
+        status="LOCAL",
+        job_id=job_id,
+        lineage_id=job_id,
+    )
 
 
 def _restore(checkpoint_id, host=None, timeout=300.0, operation_id=None):
-    return RestoreResult(checkpoint_id=checkpoint_id, success=True, contained=True,
-                         duration_seconds=0.01, process_id=4242)
+    return RestoreResult(
+        checkpoint_id=checkpoint_id,
+        success=True,
+        contained=True,
+        duration_seconds=0.01,
+        process_id=4242,
+    )
 
 
 class _Storage:
@@ -72,8 +110,12 @@ class _Storage:
 
 class _Validator:
     def validate(self, migration_id, job_id, epoch, **kw):
-        return {"passed": True, "migration_id": migration_id,
-                "job_id": job_id, "epoch": epoch}
+        return {
+            "passed": True,
+            "migration_id": migration_id,
+            "job_id": job_id,
+            "epoch": epoch,
+        }
 
 
 class _Cleanup:
@@ -86,29 +128,44 @@ class _Cleanup:
 
 def _coordinator(reg, store=None):
     calls = []
-    return MigrationCoordinator(audit_store=AuditStore(),
-        registry=reg, provisioner=EmulatedProvisioner(),
+    return MigrationCoordinator(
+        audit_store=AuditStore(),
+        registry=reg,
+        provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(
-            storage=_Storage(), dump_handler=_dump, restore_handler=_restore,
-            checkpoint_store=store),
+            storage=_Storage(),
+            dump_handler=_dump,
+            restore_handler=_restore,
+            checkpoint_store=store,
+        ),
         transfer_manager=TransferManager(storage=_Storage()),
-        validator=_Validator(), cleanup_executor=_Cleanup(),
-        plan_store=None, checkpoint_store=store,
+        validator=_Validator(),
+        cleanup_executor=_Cleanup(),
+        plan_store=None,
+        checkpoint_store=store,
         fence_invalidate=lambda p: calls.append("invalidate"),
         fence_terminate=lambda p: calls.append("terminate"),
         fence_verify=lambda p: calls.append("verify") or True,
         snapshot_provider=lambda jid, phase: {
-            "progress": 0.5, "cpu_utilization_delta": 0.5,
-            "memory_utilization_delta": 0.5, "progress_delta": 0.5},
-        step_timeout_seconds=30.0), calls
+            "progress": 0.5,
+            "cpu_utilization_delta": 0.5,
+            "memory_utilization_delta": 0.5,
+            "progress_delta": 0.5,
+        },
+        step_timeout_seconds=30.0,
+    ), calls
 
 
 def _arbitrage_plan(**kw):
-    params = dict(job_id="job-1", execution_epoch=0,
-                  regime=MigrationRegime.ARBITRAGE,
-                  policy_decision=_decision(),
-                  source_pool_id="pool-s", target_pool_id="pool-t",
-                  workload_estimate=_est())
+    params = dict(
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.ARBITRAGE,
+        policy_decision=_decision(),
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
+        workload_estimate=_est(),
+    )
     params.update(kw)
     return MigrationPlanner().create_plan(**params)
 
@@ -129,11 +186,15 @@ def test_deadline_drift_signals_pre_fence(tmp_path):
     reg = _registry(tmp_path)
     coord, fence_calls = _coordinator(reg)
     plan = MigrationPlanner().create_plan(
-        job_id="job-1", execution_epoch=0, regime=MigrationRegime.EMERGENCY,
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.EMERGENCY,
         policy_decision=_decision(MigrationRegime.EMERGENCY),
-        source_pool_id="pool-s", target_pool_id="pool-t",
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
         workload_estimate=_est(),
-        absolute_deadline=datetime.now(timezone.utc) + timedelta(seconds=30))
+        absolute_deadline=datetime.now(timezone.utc) + timedelta(seconds=30),
+    )
     out = coord.execute_plan(plan)
     assert out.current_state == MigrationState.FAILED
     assert out.replan_requested == "deadline-drift"
@@ -169,19 +230,25 @@ def test_signal_gating_matrix(tmp_path):
     # Recovery replan_required honored pre-fence only.
     out.fencing_confirmed = False
     out.replan_requested = None
-    assert replan_mod.replan_signal_for(
-        out, recovery_replan_required=True) == "recovery-requested-replan"
+    assert (
+        replan_mod.replan_signal_for(out, recovery_replan_required=True)
+        == "recovery-requested-replan"
+    )
     out.fencing_confirmed = True
-    assert replan_mod.replan_signal_for(
-        out, recovery_replan_required=True) is None
+    assert replan_mod.replan_signal_for(out, recovery_replan_required=True) is None
 
 
 def test_aborted_with_signal_replans():
     from orchestrator.migration_coordinator import MigrationExecutionState
+
     state = MigrationExecutionState(
-        plan=_arbitrage_plan(), current_state=MigrationState.ABORTED,
-        state_entered_at=datetime.utcnow(), execution_epoch=0,
-        expected_epoch=0, replan_requested="plan-expired")
+        plan=_arbitrage_plan(),
+        current_state=MigrationState.ABORTED,
+        state_entered_at=datetime.utcnow(),
+        execution_epoch=0,
+        expected_epoch=0,
+        replan_requested="plan-expired",
+    )
     assert replan_mod.replan_signal_for(state) == "plan-expired"
 
 
@@ -209,10 +276,15 @@ def test_s15_expired_plan_replans_to_success(tmp_path):
     planner = MigrationPlanner()
 
     plan = planner.create_plan(
-        job_id="job-1", execution_epoch=0, regime=MigrationRegime.ARBITRAGE,
-        policy_decision=_decision(), source_pool_id="pool-s",
-        target_pool_id="pool-t", workload_estimate=_est(),
-        migration_id="mig-s15")
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.ARBITRAGE,
+        policy_decision=_decision(),
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
+        workload_estimate=_est(),
+        migration_id="mig-s15",
+    )
     plan.pid = 4242
     plan.source_host = "10.0.0.9"
     plan.plan_hash = MigrationPlanner.compute_hash(plan)
@@ -247,15 +319,24 @@ def test_s15_expired_plan_replans_to_success(tmp_path):
 def test_s16_preempt_builds_emergency_successor():
     planner = MigrationPlanner()
     old = planner.create_plan(
-        job_id="job-1", execution_epoch=0, regime=MigrationRegime.ARBITRAGE,
-        policy_decision=_decision(), source_pool_id="pool-s",
-        target_pool_id="pool-t", workload_estimate=_est(),
-        migration_id="mig-s16")
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.ARBITRAGE,
+        policy_decision=_decision(),
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
+        workload_estimate=_est(),
+        migration_id="mig-s16",
+    )
     deadline = datetime.now(timezone.utc) + timedelta(seconds=600)
     successor = replan_mod.preempt_with_emergency(
-        planner, old, workload_estimate=_est(),
+        planner,
+        old,
+        workload_estimate=_est(),
         policy_decision=_decision(MigrationRegime.EMERGENCY),
-        absolute_deadline=deadline, target_pool_id="pool-e")
+        absolute_deadline=deadline,
+        target_pool_id="pool-e",
+    )
     assert successor.regime == MigrationRegime.EMERGENCY
     assert successor.migration_id == old.migration_id
     assert successor.supersedes_plan_id == old.plan_id
@@ -269,42 +350,63 @@ def test_s16_refuses_post_fence_and_non_arbitrage():
     old = _arbitrage_plan()
     with pytest.raises(ValueError, match="post-fencing"):
         replan_mod.preempt_with_emergency(
-            planner, old, workload_estimate=_est(), fencing_confirmed=True)
+            planner, old, workload_estimate=_est(), fencing_confirmed=True
+        )
     emergency = MigrationPlanner().create_plan(
-        job_id="job-1", execution_epoch=0, regime=MigrationRegime.EMERGENCY,
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.EMERGENCY,
         policy_decision=_decision(MigrationRegime.EMERGENCY),
-        source_pool_id="pool-s", target_pool_id="pool-t",
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
         workload_estimate=_est(),
-        absolute_deadline=datetime.now(timezone.utc) + timedelta(seconds=600))
+        absolute_deadline=datetime.now(timezone.utc) + timedelta(seconds=600),
+    )
     with pytest.raises(ValueError, match="already EMERGENCY"):
-        replan_mod.preempt_with_emergency(
-            planner, emergency, workload_estimate=_est())
+        replan_mod.preempt_with_emergency(planner, emergency, workload_estimate=_est())
 
 
 def test_s16_live_supersede_with_regime_override(tmp_path):
     from orchestrator.migration_coordinator import MigrationExecutionState
+
     reg = _registry(tmp_path)
     cleanup = _Cleanup()
-    coord = MigrationCoordinator(audit_store=AuditStore(),
-        registry=reg, provisioner=EmulatedProvisioner(),
+    coord = MigrationCoordinator(
+        audit_store=AuditStore(),
+        registry=reg,
+        provisioner=EmulatedProvisioner(),
         checkpoint_manager=CheckpointManager(storage=_Storage()),
         transfer_manager=TransferManager(storage=_Storage()),
-        validator=_Validator(), cleanup_executor=cleanup)
+        validator=_Validator(),
+        cleanup_executor=cleanup,
+    )
     planner = MigrationPlanner()
     old = planner.create_plan(
-        job_id="job-1", execution_epoch=0, regime=MigrationRegime.ARBITRAGE,
-        policy_decision=_decision(), source_pool_id="pool-s",
-        target_pool_id="pool-t", workload_estimate=_est(),
-        migration_id="mig-live-s16")
+        job_id="job-1",
+        execution_epoch=0,
+        regime=MigrationRegime.ARBITRAGE,
+        policy_decision=_decision(),
+        source_pool_id="pool-s",
+        target_pool_id="pool-t",
+        workload_estimate=_est(),
+        migration_id="mig-live-s16",
+    )
     coord._execution_state = MigrationExecutionState(
-        plan=old, current_state=MigrationState.CHECKPOINTING,
-        state_entered_at=datetime.utcnow(), execution_epoch=0,
-        expected_epoch=0)
+        plan=old,
+        current_state=MigrationState.CHECKPOINTING,
+        state_entered_at=datetime.utcnow(),
+        execution_epoch=0,
+        expected_epoch=0,
+    )
     coord._start_mono = coord._monotonic()
     deadline = datetime.now(timezone.utc) + timedelta(seconds=600)
     successor = coord.supersede_and_replan(
-        planner, "emergency-preempts", workload_estimate=_est(),
-        regime=MigrationRegime.EMERGENCY, absolute_deadline=deadline)
+        planner,
+        "emergency-preempts",
+        workload_estimate=_est(),
+        regime=MigrationRegime.EMERGENCY,
+        absolute_deadline=deadline,
+    )
     assert successor.regime == MigrationRegime.EMERGENCY
     assert successor.supersedes_plan_id == old.plan_id
     assert coord._execution_state.current_state == MigrationState.SUPERSEDED

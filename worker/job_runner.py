@@ -3,7 +3,6 @@ import json
 import os
 import sys
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,15 +12,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from worker.atomic_io import write_json
-from worker.jobs.monte_carlo import run as run_monte_carlo
-from worker.jobs.fixture import run as run_fixture
-from worker.checkpoint_hooks import pre_checkpoint, post_restore
+from worker.checkpoint_hooks import post_restore, pre_checkpoint
 from worker.constants import (
-    SPOT_INTERRUPT_FLAG,
-    READY_FLAG,
-    WORKSPACE_ROOT,
     DEFAULT_MONTE_CARLO_ITERATIONS,
+    READY_FLAG,
+    SPOT_INTERRUPT_FLAG,
+    WORKSPACE_ROOT,
 )
+from worker.jobs.fixture import run as run_fixture
+from worker.jobs.monte_carlo import run as run_monte_carlo
 
 FLAG_PATH = SPOT_INTERRUPT_FLAG
 
@@ -32,8 +31,7 @@ JOBS = {
 
 
 def _write_ready():
-    payload = {"ready_at": datetime.now(timezone.utc).isoformat(),
-               "pid": os.getpid()}
+    payload = {"ready_at": datetime.now(timezone.utc).isoformat(), "pid": os.getpid()}
     Path(READY_FLAG).parent.mkdir(parents=True, exist_ok=True)
     write_json(READY_FLAG, payload)
 
@@ -91,24 +89,27 @@ def main():
     if job_name not in JOBS and not os.getenv("WORKLOAD_SCRIPT"):
         raise ValueError("unsupported workload name")
     job = JOBS.get(job_name)
-    iterations = int(os.getenv("WORKLOAD_ITERATIONS",
-                               DEFAULT_MONTE_CARLO_ITERATIONS))
+    iterations = int(os.getenv("WORKLOAD_ITERATIONS", DEFAULT_MONTE_CARLO_ITERATIONS))
     progress_path = os.getenv(
-        "WORKLOAD_PROGRESS_PATH",
-        os.path.join(WORKSPACE_ROOT, "progress.json"))
+        "WORKLOAD_PROGRESS_PATH", os.path.join(WORKSPACE_ROOT, "progress.json")
+    )
     print(f"Job started with PID {os.getpid()} (job={job_name})")
 
     post_restore(progress_path)
 
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(
-        target=_heartbeat, args=(stop_event,), daemon=True)
+        target=_heartbeat, args=(stop_event,), daemon=True
+    )
     heartbeat_thread.start()
 
     _write_ready()
 
-    kwargs = {"stop_event": stop_event, "interrupt_flag_path": FLAG_PATH,
-              "progress_path": progress_path}
+    kwargs = {
+        "stop_event": stop_event,
+        "interrupt_flag_path": FLAG_PATH,
+        "progress_path": progress_path,
+    }
     if job_name == "monte_carlo":
         kwargs["iterations"] = iterations
     elif job_name == "fixture":
@@ -117,7 +118,11 @@ def main():
     try:
         if os.getenv("WORKLOAD_SCRIPT"):
             import runpy
-            sys.argv = [os.environ["WORKLOAD_SCRIPT"], *json.loads(os.getenv("WORKLOAD_ARGUMENTS", "[]"))]
+
+            sys.argv = [
+                os.environ["WORKLOAD_SCRIPT"],
+                *json.loads(os.getenv("WORKLOAD_ARGUMENTS", "[]")),
+            ]
             result = runpy.run_path(os.environ["WORKLOAD_SCRIPT"], run_name="__main__")
             result = {"script": "completed"}
         else:

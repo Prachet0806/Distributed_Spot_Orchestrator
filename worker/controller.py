@@ -28,11 +28,13 @@ recover, replan, supersede, fence-as-decision, …) are refused with
 UNKNOWN_OPERATION. A local interruption flag is evidence for the control
 plane, never a trigger — this module has no migration entrypoint.
 """
+
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 PRIMITIVE_ACTIONS = ("terminate", "verify", "preflight", "activate")
 
@@ -41,8 +43,9 @@ class ControllerError(RuntimeError):
     """Refused or failed control command (fail-closed, always explicit)."""
 
 
-def boot_identity(instance_id: Optional[str] = None,
-                  admission_epoch: Optional[int] = None) -> Dict[str, Any]:
+def boot_identity(
+    instance_id: str | None = None, admission_epoch: int | None = None
+) -> dict[str, Any]:
     """Resolve the W2 binding: explicit args win, environment is fallback.
 
     Live: `instance_id` comes from the IMDS identity document and
@@ -65,27 +68,29 @@ class WorkerController:
 
     def __init__(
         self,
-        instance_id: Optional[str] = None,
-        admission_epoch: Optional[int] = None,
+        instance_id: str | None = None,
+        admission_epoch: int | None = None,
         executor: Any = None,
-        clock: Optional[Callable[[], datetime]] = None,
-        journal=None, lease_validator=None,
+        clock: Callable[[], datetime] | None = None,
+        journal=None,
+        lease_validator=None,
     ):
         binding = boot_identity(instance_id, admission_epoch)
         self.instance_id: str = binding["instance_id"]
         self.admission_epoch: int = binding["admission_epoch"]
         self._executor = executor
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._replay: Dict[str, Dict[str, Any]] = {}
-        self.refusals: List[Dict[str, Any]] = []
+        self._replay: dict[str, dict[str, Any]] = {}
+        self.refusals: list[dict[str, Any]] = []
         self.journal = journal
         self.lease_validator = lease_validator
         self._requests = {}
-        self.command_log: List[Dict[str, Any]] = []
+        self.command_log: list[dict[str, Any]] = []
 
     # -- W1 lifecycle evidence --
-    def heartbeat(self, job_id: str = "local-job",
-                  pid: Optional[int] = None) -> Dict[str, Any]:
+    def heartbeat(
+        self, job_id: str = "local-job", pid: int | None = None
+    ) -> dict[str, Any]:
         """T1 heartbeat/v1 report (validates via worker_telemetry.parse_heartbeat)."""
         if pid is None:
             pid = os.getpid()
@@ -107,7 +112,7 @@ class WorkerController:
         return hook()
 
     # -- command channel (W2/W3/W4/I8) --
-    def handle_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Authorize + execute one control command. Never raises for
         authorization outcomes: refusals are returned as
         `{"accepted": False, "refusal": {...}}` AND filed in the outbox."""
@@ -115,9 +120,9 @@ class WorkerController:
             return self._refuse("", None, "UNKNOWN_OPERATION")
         operation_id = str(command.get("operation_id", "") or "")
         if command.get("instance_id") != self.instance_id:
-            return self._refuse(operation_id,
-                                command.get("expected_execution_epoch"),
-                                "PAIRING_FAILED")
+            return self._refuse(
+                operation_id, command.get("expected_execution_epoch"), "PAIRING_FAILED"
+            )
         expected = command.get("expected_execution_epoch")
         try:
             expected_epoch = int(expected)
@@ -150,8 +155,9 @@ class WorkerController:
         return result
 
     # -- internals --
-    def _execute(self, action: str, command: Dict[str, Any],
-                 operation_id: str) -> Dict[str, Any]:
+    def _execute(
+        self, action: str, command: dict[str, Any], operation_id: str
+    ) -> dict[str, Any]:
         self.command_log.append(dict(command))
         if self._executor is None:
             raise ControllerError("no primitive executor bound")
@@ -160,31 +166,53 @@ class WorkerController:
             if pid is None:
                 raise ControllerError("terminate needs a pid")
             self._executor.terminate(int(pid))
-            return {"accepted": True, "operation_id": operation_id,
-                    "action": action, "pid": int(pid)}
+            return {
+                "accepted": True,
+                "operation_id": operation_id,
+                "action": action,
+                "pid": int(pid),
+            }
         if action == "verify":
             pid = command.get("pid")
             if pid is None:
                 raise ControllerError("verify needs a pid")
             dead = bool(self._executor.verify(int(pid)))
-            return {"accepted": True, "operation_id": operation_id,
-                    "action": action, "pid": int(pid),
-                    "process_dead": dead}
+            return {
+                "accepted": True,
+                "operation_id": operation_id,
+                "action": action,
+                "pid": int(pid),
+                "process_dead": dead,
+            }
         if action == "preflight":
             out = self._executor.preflight()
-            return {"accepted": True, "operation_id": operation_id,
-                    "action": action, "output": out}
+            return {
+                "accepted": True,
+                "operation_id": operation_id,
+                "action": action,
+                "output": out,
+            }
         if action == "activate":
             pid = command.get("pid")
-            if pid is None or not command.get("process_start") or not command.get("job_id"):
+            if (
+                pid is None
+                or not command.get("process_start")
+                or not command.get("job_id")
+            ):
                 raise ControllerError("activate needs job and process identity")
-            receipt = self._executor.activate(int(pid), int(command["expected_execution_epoch"]))
-            return {"accepted": True, "operation_id": operation_id,
-                    "action": action, "pid": int(pid), "receipt": receipt}
+            receipt = self._executor.activate(
+                int(pid), int(command["expected_execution_epoch"])
+            )
+            return {
+                "accepted": True,
+                "operation_id": operation_id,
+                "action": action,
+                "pid": int(pid),
+                "receipt": receipt,
+            }
         raise ControllerError(f"unreachable action {action!r}")  # pragma: no cover
 
-    def _refuse(self, operation_id: str, expected: Any,
-                reason: str) -> Dict[str, Any]:
+    def _refuse(self, operation_id: str, expected: Any, reason: str) -> dict[str, Any]:
         refusal = {
             "schema": "refusal/v1",
             "instance_id": self.instance_id,
@@ -195,5 +223,9 @@ class WorkerController:
             "observed_at": self._clock().isoformat(),
         }
         self.refusals.append(refusal)
-        return {"accepted": False, "operation_id": operation_id,
-                "reason": reason, "refusal": dict(refusal)}
+        return {
+            "accepted": False,
+            "operation_id": operation_id,
+            "reason": reason,
+            "refusal": dict(refusal),
+        }

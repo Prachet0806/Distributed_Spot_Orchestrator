@@ -6,16 +6,23 @@ State is a single counter persisted to `progress_path` (JSON) every
 approximately the same execution point. CPU-light by default; set
 `work_per_tick` for heavier profiles.
 """
+
 import json
-from datetime import datetime, timezone
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
 
 
-def run(total_ticks=2000, progress_path=None, stop_event=None,
-        interrupt_flag_path=None, work_per_tick=0, persist_every=50,
-        sleep_per_tick=0.001):
+def run(
+    total_ticks=2000,
+    progress_path=None,
+    stop_event=None,
+    interrupt_flag_path=None,
+    work_per_tick=0,
+    persist_every=50,
+    sleep_per_tick=0.001,
+):
     state = {"tick": 0, "accumulator": 0}
     if progress_path and os.path.exists(progress_path):
         try:
@@ -50,15 +57,20 @@ def _persist(progress_path, state):
     directory = os.path.dirname(progress_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory or ".",
-                               prefix=".progress-", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=directory or ".", prefix=".progress-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            payload = dict(state, schema="progress/v1", observed_at=datetime.now(timezone.utc).isoformat(),
-                           job_id=os.getenv("WORKLOAD_JOB_ID", "local-job"),
-                           execution_epoch=int(os.getenv("WORKLOAD_EXECUTION_EPOCH", "0")))
+            payload = dict(
+                state,
+                schema="progress/v1",
+                observed_at=datetime.now(timezone.utc).isoformat(),
+                job_id=os.getenv("WORKLOAD_JOB_ID", "local-job"),
+                execution_epoch=int(os.getenv("WORKLOAD_EXECUTION_EPOCH", "0")),
+            )
             try:
-                with open(os.path.join(os.path.dirname(progress_path), "execution.json")) as identity_file:
+                with open(
+                    os.path.join(os.path.dirname(progress_path), "execution.json")
+                ) as identity_file:
                     identity = json.load(identity_file)
                 for key in ("job_id", "execution_epoch"):
                     payload[key] = identity[key]

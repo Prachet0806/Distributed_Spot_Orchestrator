@@ -1,7 +1,6 @@
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional, Any
 import logging
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +27,27 @@ class TransferManager:
     def _require_storage(self):
         if self.storage is None:
             raise RuntimeError(
-                "No transfer storage configured: refusing to fake a transfer")
+                "No transfer storage configured: refusing to fake a transfer"
+            )
 
-    def upload(self, job_id: str, src: Optional[str] = None,
-               operation_id: Optional[str] = None) -> TransferResult:
+    def upload(
+        self, job_id: str, src: str | None = None, operation_id: str | None = None
+    ) -> TransferResult:
         import time
+
         # I7 executor-side idempotency: redelivery of a completed
         # operation_id returns the recorded result instead of
         # re-uploading bytes (mirrors Provisioner replay).
         if operation_id and operation_id in self._operations:
-            logger.info("Transfer replay %s -> recorded result",
-                        operation_id[:8])
+            logger.info("Transfer replay %s -> recorded result", operation_id[:8])
             return self._operations[operation_id]
         self._require_storage()
         started = time.monotonic()
-        key = self.storage.upload(job_id) if src is None else self.storage.upload(job_id, src=src)
+        key = (
+            self.storage.upload(job_id)
+            if src is None
+            else self.storage.upload(job_id, src=src)
+        )
         result = TransferResult(
             migration_id=job_id,
             bytes_transferred=0,
@@ -53,12 +58,13 @@ class TransferManager:
             self._operations[operation_id] = result
         return result
 
-    def download(self, job_id: str, dst: Optional[str] = None,
-                 operation_id: Optional[str] = None) -> TransferResult:
+    def download(
+        self, job_id: str, dst: str | None = None, operation_id: str | None = None
+    ) -> TransferResult:
         import time
+
         if operation_id and operation_id in self._operations:
-            logger.info("Transfer replay %s -> recorded result",
-                        operation_id[:8])
+            logger.info("Transfer replay %s -> recorded result", operation_id[:8])
             return self._operations[operation_id]
         self._require_storage()
         started = time.monotonic()

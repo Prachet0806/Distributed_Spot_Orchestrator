@@ -1,28 +1,44 @@
 """Phase 4: validator L1-L4 verdicts + reconciliation lifecycle/gate/remediation."""
-from tests.support import emulated_validator
-from datetime import datetime
 
 import pytest
 
-from orchestrator.validator import Validator, ValidationResult, ValidationLevel
 from orchestrator.reconciliation_manager import (
-    ReconciliationManager, ReconciliationTrigger, MismatchType,
-    ReconciliationAction, FindingStatus,
+    FindingStatus,
+    MismatchType,
+    ReconciliationManager,
+    ReconciliationTrigger,
 )
+from orchestrator.validator import ValidationLevel, ValidationResult
+from tests.support import emulated_validator
 
 
 def _snaps():
-    src = {"progress": 0.5, "cpu_utilization_delta": 0.5,
-           "memory_utilization_delta": 0.4, "progress_delta": 0.5}
-    tgt = {"progress": 0.51, "cpu_utilization_delta": 0.52,
-           "memory_utilization_delta": 0.41, "progress_delta": 0.51}
+    src = {
+        "progress": 0.5,
+        "cpu_utilization_delta": 0.5,
+        "memory_utilization_delta": 0.4,
+        "progress_delta": 0.5,
+    }
+    tgt = {
+        "progress": 0.51,
+        "cpu_utilization_delta": 0.52,
+        "memory_utilization_delta": 0.41,
+        "progress_delta": 0.51,
+    }
     return src, tgt
 
 
 def test_valid_restore_passes_l1_l2_l3_and_v2_verdict():
     src, tgt = _snaps()
-    rep = emulated_validator().validate("m1", "j1", 2, src, tgt, expected_epoch=2,
-                               checkpoint_lineage={"lineage_valid": True})
+    rep = emulated_validator().validate(
+        "m1",
+        "j1",
+        2,
+        src,
+        tgt,
+        expected_epoch=2,
+        checkpoint_lineage={"lineage_valid": True},
+    )
     assert rep.overall_result == ValidationResult.PASSED
     assert rep.epoch_match and rep.lineage_valid
     assert rep.to_v2_verdict() == ValidationResult.VALID.value
@@ -55,8 +71,9 @@ def test_epoch_mismatch_fails_despite_healthy_process():
 
 def test_lineage_invalid_fails():
     src, tgt = _snaps()
-    rep = emulated_validator().validate("m1", "j1", 1, src, tgt,
-                               checkpoint_lineage={"lineage_valid": False})
+    rep = emulated_validator().validate(
+        "m1", "j1", 1, src, tgt, checkpoint_lineage={"lineage_valid": False}
+    )
     assert rep.lineage_valid is False
     assert rep.overall_result == ValidationResult.FAILED
 
@@ -68,33 +85,49 @@ def test_strict_l4_opt_in_only():
     rep = emulated_validator().validate("m1", "j1", 1, snap, dict(snap))
     assert not [c for c in rep.checks if c.level == ValidationLevel.L4_STRICT]
     # Opt-in equal → pass; unequal → fail.
-    assert emulated_validator().validate(
-        "m1", "j1", 1, snap, dict(snap),
-        strict_determinism=True).overall_result == ValidationResult.PASSED
-    assert emulated_validator().validate(
-        "m1", "j1", 1, snap, other,
-        strict_determinism=True).overall_result == ValidationResult.FAILED
+    assert (
+        emulated_validator()
+        .validate("m1", "j1", 1, snap, dict(snap), strict_determinism=True)
+        .overall_result
+        == ValidationResult.PASSED
+    )
+    assert (
+        emulated_validator()
+        .validate("m1", "j1", 1, snap, other, strict_determinism=True)
+        .overall_result
+        == ValidationResult.FAILED
+    )
 
 
 def test_versioned_tolerance_contract_shape():
     src, tgt = _snaps()
-    contract = {"version": "tol-7", "minimum_level": "L3",
-                "strict_determinism": False,
-                "metrics": {"cpu_utilization_delta": {"tolerance_type": "RELATIVE", "value": 0.5},
-                            "memory_utilization_delta": {"tolerance_type": "RELATIVE", "value": 0.5},
-                            "progress_delta": {"tolerance_type": "RELATIVE", "value": 0.5}}}
-    rep = emulated_validator().validate("m1", "j1", 1, src, tgt, tolerance_override=contract)
+    contract = {
+        "version": "tol-7",
+        "minimum_level": "L3",
+        "strict_determinism": False,
+        "metrics": {
+            "cpu_utilization_delta": {"tolerance_type": "RELATIVE", "value": 0.5},
+            "memory_utilization_delta": {"tolerance_type": "RELATIVE", "value": 0.5},
+            "progress_delta": {"tolerance_type": "RELATIVE", "value": 0.5},
+        },
+    }
+    rep = emulated_validator().validate(
+        "m1", "j1", 1, src, tgt, tolerance_override=contract
+    )
     assert rep.contract_version == "tol-7"
     assert rep.overall_result == ValidationResult.PASSED
 
 
 def test_failing_probe_fails_l1():
-    v = emulated_validator(infra_probe=lambda **kw: {"passed": False, "target_reachable": False})
+    v = emulated_validator(
+        infra_probe=lambda **kw: {"passed": False, "target_reachable": False}
+    )
     rep = v.validate("m1", "j1", 1, *_snaps())
     assert rep.overall_result == ValidationResult.FAILED
 
     def _boom(**kw):
         raise RuntimeError("probe exploded")
+
     rep2 = emulated_validator(app_probe=_boom).validate("m1", "j1", 1, *_snaps())
     assert rep2.overall_result == ValidationResult.FAILED
 
@@ -135,8 +168,13 @@ class _Cleanup:
 
 
 def _job(job_id="j1", state="RUNNING", epoch=0, active=None, inst="i-1"):
-    return {"job_id": job_id, "state": state, "execution_epoch": epoch,
-            "active_migration_id": active, "instance_id": inst}
+    return {
+        "job_id": job_id,
+        "state": state,
+        "execution_epoch": epoch,
+        "active_migration_id": active,
+        "instance_id": inst,
+    }
 
 
 def test_v2_taxonomy():
@@ -148,8 +186,9 @@ def test_v2_taxonomy():
 def test_finding_lifecycle_and_illegal_rejected():
     reg = _Reg([_job()])
     mgr = ReconciliationManager(reg, None, _Cleanup())
-    found = mgr.report_event({"event_type": "EPOCH_CONFLICT", "job_id": "j1",
-                              "execution_epoch": 0})
+    found = mgr.report_event(
+        {"event_type": "EPOCH_CONFLICT", "job_id": "j1", "execution_epoch": 0}
+    )
     assert len(found) == 1
     fid = found[0].finding_id
     # REQUEST_REMEDIATION path advances OPEN→ACK→REMEDIATING during processing.
@@ -163,17 +202,25 @@ def test_finding_lifecycle_and_illegal_rejected():
 def test_ownership_gate_blocks_job():
     reg = _Reg([_job(state="MIGRATING", active="m1")])
     mgr = ReconciliationManager(reg, None, _Cleanup())
-    mgr.report_event({"event_type": "SPLIT_BRAIN", "job_id": "j1",
-                      "migration_id": "m1", "execution_epoch": 1})
+    mgr.report_event(
+        {
+            "event_type": "SPLIT_BRAIN",
+            "job_id": "j1",
+            "migration_id": "m1",
+            "execution_epoch": 1,
+        }
+    )
     assert ("j1", "RECONCILIATION_REQUIRED") in reg.gated
 
 
 def test_sweep_finds_dangling_stale_and_infra_mismatch():
-    reg = _Reg([
-        _job("j1", state="MIGRATING", active=None, inst="i-1"),   # dangling
-        _job("j2", state="RUNNING", active="m-old", inst="i-2"),  # stale
-        _job("j3", state="MIGRATING", active="m3", inst="i-3"),   # infra gone
-    ])
+    reg = _Reg(
+        [
+            _job("j1", state="MIGRATING", active=None, inst="i-1"),  # dangling
+            _job("j2", state="RUNNING", active="m-old", inst="i-2"),  # stale
+            _job("j3", state="MIGRATING", active="m3", inst="i-3"),  # infra gone
+        ]
+    )
     infra = _Infra({"i-1": "RUNNING", "i-2": "RUNNING", "i-3": "TERMINATED"})
     mgr = ReconciliationManager(reg, infra, _Cleanup())
     found = mgr.reconcile(ReconciliationTrigger.PERIODIC_SWEEP)
@@ -188,10 +235,13 @@ def test_preauthorized_cleanup_resolves_directly():
     cleanup = _Cleanup()
     mgr = ReconciliationManager(reg, None, cleanup)
     finding = mgr._new_finding(
-        job_id="j1", migration_id=None, mismatch_type=MismatchType.ORPHAN_CHECKPOINT,
+        job_id="j1",
+        migration_id=None,
+        mismatch_type=MismatchType.ORPHAN_CHECKPOINT,
         trigger=ReconciliationTrigger.PERIODIC_SWEEP,
         details={"resource_id": "chk-tmp", "resource_type": "checkpoint"},
-        remediation={"type": "DELETE_TEMPORARY", "reason": "t", "pre_authorized": True})
+        remediation={"type": "DELETE_TEMPORARY", "reason": "t", "pre_authorized": True},
+    )
     mgr._findings[finding.finding_id] = finding
     mgr._process_finding(finding)
     assert cleanup.calls == [("chk-tmp", "checkpoint")]
@@ -201,9 +251,9 @@ def test_preauthorized_cleanup_resolves_directly():
 def test_general_remediation_routes_via_callback():
     reg = _Reg([_job()])
     seen = []
-    mgr = ReconciliationManager(reg, None, _Cleanup(),
-                                remediation_callback=seen.append)
-    mgr.report_event({"event_type": "TARGET_LOST", "job_id": "j1",
-                      "migration_id": "m9"})
+    mgr = ReconciliationManager(reg, None, _Cleanup(), remediation_callback=seen.append)
+    mgr.report_event(
+        {"event_type": "TARGET_LOST", "job_id": "j1", "migration_id": "m9"}
+    )
     assert seen and seen[0].finding_id
     assert seen[0].action_type == MismatchType.TARGET_MISSING.value

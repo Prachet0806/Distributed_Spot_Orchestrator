@@ -10,71 +10,101 @@ Guards the three 0%-coverage bugs plus follow-ups:
    feasibility, detection_lag, emergency target remap.
 7. PA-8: coordinator provisions from the pool definition when available.
 """
-from storage.audit_store import AuditStore
+
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from orchestrator.candidate_pool import (
-    CandidatePool, PoolRuntimeProfile, PoolCapacityProfile,
-)
 from orchestrator.candidate_compatibility import (
-    CompatibilityAssessment, CompatibilityStatus, CompatibilityDimensionResult,
+    CompatibilityAssessment,
+    CompatibilityDimensionResult,
     CompatibilityEngine,
-)
-from orchestrator.candidate_readiness import (
-    ReadinessEngine, ReadinessAssessment, ReadinessStatus, ReadinessCheck,
-    CapacityEvidence, CapacityStatus, EvidenceSource,
-    IAMReadiness, NetworkReadiness, StorageReadiness,
+    CompatibilityStatus,
 )
 from orchestrator.candidate_placement import (
-    PlacementEngine, PlacementPolicy, PlacementInput,
+    PlacementEngine,
+    PlacementInput,
+    PlacementPolicy,
 )
-from orchestrator.workload_requirements import WorkloadRequirements, GPURequirement
+from orchestrator.candidate_pool import (
+    CandidatePool,
+    PoolCapacityProfile,
+    PoolRuntimeProfile,
+)
+from orchestrator.candidate_readiness import (
+    CapacityEvidence,
+    CapacityStatus,
+    EvidenceSource,
+    IAMReadiness,
+    NetworkReadiness,
+    ReadinessAssessment,
+    ReadinessCheck,
+    ReadinessEngine,
+    ReadinessStatus,
+    StorageReadiness,
+)
+from orchestrator.migration_history import MigrationHistory
 from orchestrator.recovery_feasibility import (
-    RecoveryFeasibilityEngine, FeasibilityStatus, build_emergency_plan_steps,
+    FeasibilityStatus,
+    RecoveryFeasibilityEngine,
+    build_emergency_plan_steps,
 )
 from orchestrator.workload_estimator import WorkloadEstimate
-from orchestrator.migration_history import MigrationHistory
+from orchestrator.workload_requirements import GPURequirement, WorkloadRequirements
+from storage.audit_store import AuditStore
 from storage.history_store import HistoryStore
 from storage.pool_registry import PoolRegistryStore
 
 
 def _est():
     return WorkloadEstimate(
-        job_id="j1", execution_epoch=0, progress=0.5,
+        job_id="j1",
+        execution_epoch=0,
+        progress=0.5,
         remaining_runtime_seconds=3600,
-        expected_completion_at=None, prediction_confidence=0.8,
-        checkpoint_size_estimate_bytes=10 * 1024 ** 2,
+        expected_completion_at=None,
+        prediction_confidence=0.8,
+        checkpoint_size_estimate_bytes=10 * 1024**2,
         checkpoint_duration_estimate_seconds=10.0,
-        estimated_at=datetime.now(timezone.utc), estimator_version="v",
-        model_version="v", observation_snapshot_version="1",
+        estimated_at=datetime.now(timezone.utc),
+        estimator_version="v",
+        model_version="v",
+        observation_snapshot_version="1",
     )
 
 
 def _compat():
     return CompatibilityAssessment(
-        assessment_id="c1", pool_id="pool-a",
+        assessment_id="c1",
+        pool_id="pool-a",
         workload_requirements_version="1",
         status=CompatibilityStatus.COMPATIBLE,
-        dimensions=[CompatibilityDimensionResult("cpu", CompatibilityStatus.COMPATIBLE)],
+        dimensions=[
+            CompatibilityDimensionResult("cpu", CompatibilityStatus.COMPATIBLE)
+        ],
         assessed_at=datetime.now(timezone.utc),
     )
 
 
 def _ready():
     return ReadinessAssessment(
-        assessment_id="r1", pool_id="pool-a", status=ReadinessStatus.READY,
+        assessment_id="r1",
+        pool_id="pool-a",
+        status=ReadinessStatus.READY,
         checks=[ReadinessCheck("iam", ReadinessStatus.READY)],
         capacity_evidence=CapacityEvidence(
             status=CapacityStatus.AVAILABLE,
             source=EvidenceSource.HISTORICAL_PROVISIONING,
-            observed_at=datetime.now(timezone.utc), confidence=0.9,
-            provisioning_success_rate=0.9, sample_count=10),
+            observed_at=datetime.now(timezone.utc),
+            confidence=0.9,
+            provisioning_success_rate=0.9,
+            sample_count=10,
+        ),
         iam_readiness=IAMReadiness(True, True, True, True),
         network_readiness=NetworkReadiness(True, True, True, True),
         storage_readiness=StorageReadiness(True, True, True),
-        artifact_available=True, runtime_ready=True,
+        artifact_available=True,
+        runtime_ready=True,
     )
 
 
@@ -82,18 +112,28 @@ def test_first_tick_builds_pools():
     """Reproduces main.py per-job loop pool construction (Bug #1)."""
     # main.py must expose these names (import guard against NameError).
     import orchestrator.main as main_mod
-    for name in ("PoolRuntimeProfile", "PoolCapacityProfile",
-                 "CapacityEvidence", "CapacityStatus", "EvidenceSource"):
+
+    for name in (
+        "PoolRuntimeProfile",
+        "PoolCapacityProfile",
+        "CapacityEvidence",
+        "CapacityStatus",
+        "EvidenceSource",
+    ):
         assert hasattr(main_mod, name), f"main.py missing import: {name}"
 
     # Exact construction block from the loop — must not raise.
     pool = CandidatePool(
         pool_id="pool-us-east-1-c6i.large",
-        provider="aws", account_id="123456789", region="us-east-1",
-        availability_zone="us-east-1a", instance_type="c6i.large",
+        provider="aws",
+        account_id="123456789",
+        region="us-east-1",
+        availability_zone="us-east-1a",
+        instance_type="c6i.large",
         architecture="x86_64",
         runtime_profile=PoolRuntimeProfile(
-            artifact_digest="sha256:abc123", architecture="x86_64"),
+            artifact_digest="sha256:abc123", architecture="x86_64"
+        ),
         capacity_profile=PoolCapacityProfile(max_instances=10),
     )
     assert pool.region == "us-east-1"
@@ -101,26 +141,36 @@ def test_first_tick_builds_pools():
     evidence = CapacityEvidence(
         status=CapacityStatus.AVAILABLE,
         source=EvidenceSource.HISTORICAL_PROVISIONING,
-        observed_at=datetime.now(timezone.utc), confidence=0.8,
-        provisioning_success_rate=0.9, sample_count=10,
+        observed_at=datetime.now(timezone.utc),
+        confidence=0.8,
+        provisioning_success_rate=0.9,
+        sample_count=10,
     )
     compat = CompatibilityEngine().assess(
         WorkloadRequirements(
-            cpu_architecture="x86_64", min_cpu=1, min_memory_mb=1024,
-            gpu=GPURequirement(required=False), reconnectable=True,
+            cpu_architecture="x86_64",
+            min_cpu=1,
+            min_memory_mb=1024,
+            gpu=GPURequirement(required=False),
+            reconnectable=True,
         ),
         pool,
     )
     assert compat.status.value in ("COMPATIBLE", "INCOMPATIBLE")
     ready = ReadinessEngine().assess(
         WorkloadRequirements(
-            cpu_architecture="x86_64", min_cpu=1, min_memory_mb=1024,
-            gpu=GPURequirement(required=False), reconnectable=True,
-        ), pool,
+            cpu_architecture="x86_64",
+            min_cpu=1,
+            min_memory_mb=1024,
+            gpu=GPURequirement(required=False),
+            reconnectable=True,
+        ),
+        pool,
         iam_ready=IAMReadiness(True, True, True, True),
         network_ready=NetworkReadiness(True, True, True, True),
         storage_ready=StorageReadiness(True, True, True),
-        capacity_evidence=evidence, artifact_available=True,
+        capacity_evidence=evidence,
+        artifact_available=True,
     )
     assert ready.status.value in ("READY", "PREPARABLE", "NOT_READY", "UNKNOWN")
 
@@ -144,18 +194,22 @@ def test_emergency_steps_unknown_checkpoint_yields_insufficient_evidence():
     steps = build_emergency_plan_steps(est)
     ckpt = next(s for s in steps if s.name == "checkpointing")
     assert ckpt.estimated_seconds is None
-    result = RecoveryFeasibilityEngine().evaluate(
-        est, _compat(), _ready(), 30.0, steps)
+    result = RecoveryFeasibilityEngine().evaluate(est, _compat(), _ready(), 30.0, steps)
     # 30s deadline can't fit an unknown critical path (inf) -> not FEASIBLE.
-    assert result.status in (FeasibilityStatus.INFEASIBLE,
-                             FeasibilityStatus.INSUFFICIENT_EVIDENCE)
+    assert result.status in (
+        FeasibilityStatus.INFEASIBLE,
+        FeasibilityStatus.INSUFFICIENT_EVIDENCE,
+    )
 
 
 def _fake_plan(mid="mig-1"):
     return SimpleNamespace(
-        migration_id=mid, job_id="j1", execution_epoch=0,
+        migration_id=mid,
+        job_id="j1",
+        execution_epoch=0,
         regime=SimpleNamespace(value="EMERGENCY"),
-        source_pool_id="pool-a", target_pool_id="pool-b",
+        source_pool_id="pool-a",
+        target_pool_id="pool-b",
         steps=[],
     )
 
@@ -164,7 +218,8 @@ def _fake_decision():
     return SimpleNamespace(
         decision=SimpleNamespace(value="RECOVER"),
         regime=SimpleNamespace(value="EMERGENCY"),
-        reason="test", confidence=0.9,
+        reason="test",
+        confidence=0.9,
     )
 
 
@@ -184,8 +239,10 @@ def test_history_wired_to_durable_store():
     # main.py source must late-bind the durable store (regression pin).
     src = Path("orchestrator/main.py").read_text()
     assert "history.storage = history_store" in src
-    assert "MigrationHistory(storage=history_store)" in src or \
-        "history.storage = history_store" in src
+    assert (
+        "MigrationHistory(storage=history_store)" in src
+        or "history.storage = history_store" in src
+    )
 
 
 def test_placement_wired_and_orders_candidates():
@@ -211,16 +268,21 @@ def test_placement_wired_and_orders_candidates():
             readiness_checks=[{"status": "READY"}],
             cost_analysis={"expected_total_cost": total_cost},
             risk_analysis={"interruption_probability": 0.2},
-            topology={}, capacity_confidence=0.9,
+            topology={},
+            capacity_confidence=0.9,
             pool_lifecycle="ACTIVE",
         )
 
     rec = eng.rank([_inp("r-bad", 9.0), _inp("r-good", 3.0)], regime="ARBITRAGE")
     assert rec.selected_candidate_id == "r-good"
     # Emergency excludes DEGRADED pools.
-    rec_em = eng.rank([
-        _inp("r-degraded", 1.0), _inp("r-active", 5.0),
-    ], regime="EMERGENCY")
+    rec_em = eng.rank(
+        [
+            _inp("r-degraded", 1.0),
+            _inp("r-active", 5.0),
+        ],
+        regime="EMERGENCY",
+    )
     rec_em.ranked_candidates[0].pool_id  # sorted deterministically
     deg = PlacementInput(
         pool_id="r-degraded",
@@ -230,7 +292,8 @@ def test_placement_wired_and_orders_candidates():
         readiness_checks=[{"status": "READY"}],
         cost_analysis={"expected_total_cost": 1.0},
         risk_analysis={"interruption_probability": 0.1},
-        topology={}, capacity_confidence=0.9,
+        topology={},
+        capacity_confidence=0.9,
         pool_lifecycle="DEGRADED",
     )
     rec2 = eng.rank([deg, _inp("r-active", 5.0)], regime="EMERGENCY")
@@ -257,13 +320,17 @@ def test_pool_definitions_persisted():
 def test_history_structured_results_reject_old_shapes():
     """Structured V2 results are preserved; stringified records are rejected."""
     from orchestrator.migration_history import (
-        MigrationHistory, _normalize_step_result, _step_result_dict,
+        MigrationHistory,
+        _normalize_step_result,
+        _step_result_dict,
     )
+
     stored, schema = _normalize_step_result({"size_bytes": 123})
     assert stored == {"size_bytes": 123}
     assert _step_result_dict({"result": stored}) == {"size_bytes": 123}
 
     import pytest
+
     with pytest.raises(TypeError):
         _step_result_dict({"result": "CheckpointResult(x)"})
     with pytest.raises(TypeError):
@@ -271,12 +338,14 @@ def test_history_structured_results_reject_old_shapes():
 
     h = MigrationHistory()
     mid = h.record_start(_fake_plan(), _fake_decision(), None, None)
-    h.record_step(mid, "checkpointing", "SUCCEEDED",
-                  {"size_bytes": 10 * 1024 ** 2}, duration=31.4)
+    h.record_step(
+        mid, "checkpointing", "SUCCEEDED", {"size_bytes": 10 * 1024**2}, duration=31.4
+    )
     from orchestrator.migration_history import MigrationOutcome
+
     h.record_completion(mid, MigrationOutcome.SUCCESS)
     fb = h.get_feedback_for_estimator("j1")[0]
-    assert fb["actual_checkpoint_size"] == 10 * 1024 ** 2
+    assert fb["actual_checkpoint_size"] == 10 * 1024**2
     assert fb["actual_checkpoint_duration"] == 31.4
 
 
@@ -284,6 +353,7 @@ def test_checkpoint_durability_lookup_never_infers():
     """Invariant 5: UNKNOWN durability never becomes TRUE."""
     from orchestrator.main import query_checkpoint_durable
     from storage.checkpoint_store import CheckpointStore
+
     store = CheckpointStore()
     assert query_checkpoint_durable(store, "job-x") is False
     assert query_checkpoint_durable(None, "job-x") is False
@@ -293,14 +363,29 @@ def test_checkpoint_durability_lookup_never_infers():
 
 def test_checkpoint_store_latest_durable():
     """Only DURABLE/VALIDATED checkpoints satisfy the lookup."""
-    from storage.checkpoint_store import CheckpointStore
     from orchestrator.models_v2 import CheckpointRef
+    from storage.checkpoint_store import CheckpointStore
+
     store = CheckpointStore()
-    store.put(CheckpointRef(checkpoint_id="c-local", lineage_id="j1",
-                            sequence=1, execution_epoch=0, durability="LOCAL"))
+    store.put(
+        CheckpointRef(
+            checkpoint_id="c-local",
+            lineage_id="j1",
+            sequence=1,
+            execution_epoch=0,
+            durability="LOCAL",
+        )
+    )
     assert store.latest_durable("j1") is None
-    store.put(CheckpointRef(checkpoint_id="c-dur", lineage_id="j1",
-                            sequence=2, execution_epoch=0, durability="DURABLE"))
+    store.put(
+        CheckpointRef(
+            checkpoint_id="c-dur",
+            lineage_id="j1",
+            sequence=2,
+            execution_epoch=0,
+            durability="DURABLE",
+        )
+    )
     assert store.latest_durable("j1")["checkpoint_id"] == "c-dur"
     assert store.latest_durable("nope") is None
 
@@ -312,18 +397,26 @@ def test_per_candidate_feasibility_wired():
     assert "_survivors" in src
     assert "no feasible emergency candidate" in src
     # Feasibility of the single [0] candidate must be gone.
-    assert "compat_assessments[emergency_pools[0]],\n                    ready_assessments[emergency_pools[0]],\n                    _deadline,\n                    build_emergency_plan_steps" not in src
+    assert (
+        "compat_assessments[emergency_pools[0]],\n                    ready_assessments[emergency_pools[0]],\n                    _deadline,\n                    build_emergency_plan_steps"
+        not in src
+    )
 
 
 def test_detection_lag_recorded():
     """Invariant P0-4: ingestion stamps noticed_at + detection_lag."""
     from datetime import timedelta
+
     from orchestrator.interruption_ingestion import ingest_interruption
+
     past = (datetime.now(timezone.utc) - timedelta(seconds=42)).isoformat()
     evt = ingest_interruption(
         {"detected_at": past, "source": "imds"},
-        job_id="j1", execution_epoch=0, instance_id="i-1",
-        source_region="us-east-1")
+        job_id="j1",
+        execution_epoch=0,
+        instance_id="i-1",
+        source_region="us-east-1",
+    )
     assert evt is not None
     lag = evt.payload["detection_lag_seconds"]
     assert 30.0 < lag < 300.0
@@ -346,22 +439,34 @@ class _DualPathProvisioner:
 
     def provision_with_operation(self, candidate_id, operation_id=None, tags=None):
         from orchestrator.provisioner import ProvisionResult
+
         self.via_direct.append((candidate_id, operation_id))
-        return ProvisionResult(instance_id="i-direct", public_ip="1.1.1.1",
-                               public_dns="h", status="running",
-                               operation_id=operation_id or "")
+        return ProvisionResult(
+            instance_id="i-direct",
+            public_ip="1.1.1.1",
+            public_dns="h",
+            status="running",
+            operation_id=operation_id or "",
+        )
 
     def provision_from_pool(self, definition, operation_id=None, tags=None):
         from orchestrator.provisioner import ProvisionResult
+
         self.via_pool.append((dict(definition), operation_id))
-        return ProvisionResult(instance_id="i-pool", public_ip="2.2.2.2",
-                               public_dns="h", status="running",
-                               operation_id=operation_id or "")
+        return ProvisionResult(
+            instance_id="i-pool",
+            public_ip="2.2.2.2",
+            public_dns="h",
+            status="running",
+            operation_id=operation_id or "",
+        )
 
 
 def _provisioning_coordinator(provisioner, provider):
     from orchestrator.migration_coordinator import MigrationCoordinator
-    return MigrationCoordinator(audit_store=AuditStore(),
+
+    return MigrationCoordinator(
+        audit_store=AuditStore(),
         registry=SimpleNamespace(get=lambda jid: {}, transition=lambda *a, **k: {}),
         provisioner=provisioner,
         checkpoint_manager=SimpleNamespace(),
@@ -375,29 +480,44 @@ def _provisioning_coordinator(provisioner, provider):
 
 def _provisioning_plan(target="us-west-2"):
     from orchestrator.migration_planner import MigrationPlanner
-    from orchestrator.policy_engine import (
-        PolicyDecision, Decision, MigrationRegime)
+    from orchestrator.policy_engine import Decision, MigrationRegime, PolicyDecision
+
     plan = MigrationPlanner().create_plan(
-        job_id="j1", execution_epoch=0, regime=MigrationRegime.ARBITRAGE,
+        job_id="j1",
+        execution_epoch=0,
+        regime=MigrationRegime.ARBITRAGE,
         policy_decision=PolicyDecision(
-            decision=Decision.MIGRATE, regime=MigrationRegime.ARBITRAGE,
-            reason="t", target_candidate_id=target, confidence=0.9,
-            metadata={}),
-        source_pool_id="pool-s", target_pool_id=target,
-        workload_estimate=_est())
+            decision=Decision.MIGRATE,
+            regime=MigrationRegime.ARBITRAGE,
+            reason="t",
+            target_candidate_id=target,
+            confidence=0.9,
+            metadata={},
+        ),
+        source_pool_id="pool-s",
+        target_pool_id=target,
+        workload_estimate=_est(),
+    )
     return plan
 
 
 def test_coordinator_prefers_pool_definition():
     """PA-8/invariant 2: execution uses the pool definition when resolvable."""
     from orchestrator.migration_coordinator import MigrationExecutionState
+
     prov = _DualPathProvisioner()
-    definition = {"pool_id": "pool-us-west-2-t3.micro", "region": "us-west-2",
-                  "ami_id": "ami-xyz", "security_group_id": "sg-1"}
+    definition = {
+        "pool_id": "pool-us-west-2-t3.micro",
+        "region": "us-west-2",
+        "ami_id": "ami-xyz",
+        "security_group_id": "sg-1",
+    }
     coord = _provisioning_coordinator(
-        prov, provider=lambda target: definition if target == "us-west-2" else None)
+        prov, provider=lambda target: definition if target == "us-west-2" else None
+    )
     coord._execution_state = MigrationExecutionState(
-        plan=_provisioning_plan("us-west-2"))
+        plan=_provisioning_plan("us-west-2")
+    )
     coord._execute_provisioning()
     assert len(prov.via_pool) == 1
     assert prov.via_pool[0][0]["ami_id"] == "ami-xyz"
@@ -408,10 +528,17 @@ def test_coordinator_prefers_pool_definition():
 def test_coordinator_refuses_missing_pool_definition():
     """A configured pool provider cannot silently fall back to another path."""
     import pytest
-    from orchestrator.migration_coordinator import MigrationExecutionState, MigrationFailed
+
+    from orchestrator.migration_coordinator import (
+        MigrationExecutionState,
+        MigrationFailed,
+    )
+
     prov = _DualPathProvisioner()
     coord = _provisioning_coordinator(prov, provider=lambda target: None)
-    coord._execution_state = MigrationExecutionState(plan=_provisioning_plan("us-west-2"))
+    coord._execution_state = MigrationExecutionState(
+        plan=_provisioning_plan("us-west-2")
+    )
     with pytest.raises(MigrationFailed, match="authoritative target pool"):
         coord._execute_provisioning()
     assert not prov.via_pool and not prov.via_direct
@@ -432,13 +559,18 @@ import time as _time
 
 def _pending_job(job_id="adm-1", **over):
     job = {
-        "job_id": job_id, "state": "PENDING", "region": "us-east-1",
-        "public_ip": None, "pid": None, "version": 0,
-        "execution_epoch": 0, "workload_type": "batch",
+        "job_id": job_id,
+        "state": "PENDING",
+        "region": "us-east-1",
+        "public_ip": None,
+        "pid": None,
+        "version": 0,
+        "execution_epoch": 0,
+        "workload_type": "batch",
         "workload_contract": {
-            "name": job_id, "script": "job.py",
-            "resources": {"cpu": 1, "memory_mb": 512,
-                          "gpu": False, "storage_gb": 10},
+            "name": job_id,
+            "script": "job.py",
+            "resources": {"cpu": 1, "memory_mb": 512, "gpu": False, "storage_gb": 10},
             "placement": {"regions": ["us-east-1", "us-west-2"]},
         },
     }
@@ -458,6 +590,7 @@ class _PendingRegistry:
 
     def transition(self, job_id, to_state, **attrs):
         from storage.v2_transitions import is_v2_transition_allowed
+
         cur = self.rows[job_id].get("state")
         ok = is_v2_transition_allowed("job", cur, to_state)
         if to_state == cur == "PENDING":
@@ -479,17 +612,27 @@ class _PendingProvisioner:
 
     def provision_from_pool(self, definition, operation_id=None, tags=None):
         from orchestrator.provisioner import ProvisionResult
+
         self.definitions.append(dict(definition))
-        return ProvisionResult(instance_id=self.iid, public_ip=self.ip,
-                               public_dns="h", status="running",
-                               operation_id=operation_id or "")
+        return ProvisionResult(
+            instance_id=self.iid,
+            public_ip=self.ip,
+            public_dns="h",
+            status="running",
+            operation_id=operation_id or "",
+        )
 
     def provision_with_operation(self, candidate_id, operation_id=None, tags=None):
         from orchestrator.provisioner import ProvisionResult
+
         self.direct.append(candidate_id)
-        return ProvisionResult(instance_id=self.iid, public_ip=self.ip,
-                               public_dns="h", status="running",
-                               operation_id=operation_id or "")
+        return ProvisionResult(
+            instance_id=self.iid,
+            public_ip=self.ip,
+            public_dns="h",
+            status="running",
+            operation_id=operation_id or "",
+        )
 
 
 class _PendingLimiter:
@@ -504,26 +647,41 @@ class _PendingLimiter:
 
 
 def _pending_deps(job, **over):
-    from orchestrator.main import _handle_pending_job
     from orchestrator.candidate_compatibility import CompatibilityEngine
     from orchestrator.candidate_placement import PlacementEngine, PlacementPolicy
+    from orchestrator.main import _handle_pending_job
     from storage.pool_registry import PoolRegistryStore
+
     reg = _PendingRegistry(job)
     prov = _PendingProvisioner()
     store = PoolRegistryStore()
     for r in ("us-east-1", "us-west-2"):
-        store.put_pool(f"pool-{r}-t3.micro", {
-            "pool_id": f"pool-{r}-t3.micro", "provider": "aws",
-            "region": r, "ami_id": f"ami-{r}", "lifecycle": "ACTIVE",
-            "runtime_artifact_digest": "sha256:" + "a" * 64}, version=1)
+        store.put_pool(
+            f"pool-{r}-t3.micro",
+            {
+                "pool_id": f"pool-{r}-t3.micro",
+                "provider": "aws",
+                "region": r,
+                "ami_id": f"ami-{r}",
+                "lifecycle": "ACTIVE",
+                "runtime_artifact_digest": "sha256:" + "a" * 64,
+            },
+            version=1,
+        )
     kw = dict(
         prices={"us-east-1": {"price": 0.01}, "us-west-2": {"price": 0.02}},
-        instance_type="t3.micro", pool_store=store,
+        instance_type="t3.micro",
+        pool_store=store,
         compatibility_engine=CompatibilityEngine(),
         placement_engine=PlacementEngine(PlacementPolicy(version="v3")),
-        provisioner=prov, rate_limiter=_PendingLimiter(),
-        registry=reg, transport_for=lambda host: None,
-        pending_attempt={}, tele_attempt={}, now=_time.time(), log=None,
+        provisioner=prov,
+        rate_limiter=_PendingLimiter(),
+        registry=reg,
+        transport_for=lambda host: None,
+        pending_attempt={},
+        tele_attempt={},
+        now=_time.time(),
+        log=None,
     )
     kw.update(over)
     return _handle_pending_job, reg, prov, kw
@@ -558,23 +716,36 @@ def _heartbeat_transport(pid=4242, age_s=5.0):
 
     class _T:
         def run_command(self, command, timeout=60.0):
-            at = (datetime.now(timezone.utc).isoformat())
+            at = datetime.now(timezone.utc).isoformat()
             if age_s is not None:
                 from datetime import timedelta as _td
+
                 at = (datetime.now(timezone.utc) - _td(seconds=age_s)).isoformat()
-            return {"returncode": 0, "stdout": _j.dumps({
-                "schema": "heartbeat/v1", "job_id": "adm-1",
-                "instance_id": "i-adm-1", "execution_epoch": 0,
-                "pid": pid, "observed_at": at})}
+            return {
+                "returncode": 0,
+                "stdout": _j.dumps(
+                    {
+                        "schema": "heartbeat/v1",
+                        "job_id": "adm-1",
+                        "instance_id": "i-adm-1",
+                        "execution_epoch": 0,
+                        "pid": pid,
+                        "observed_at": at,
+                    }
+                ),
+            }
+
     return _T()
 
 
 def test_pending_promotes_on_fresh_heartbeat():
     """Telemetry-discovered PID/host promote PENDING -> RUNNING."""
-    job = _pending_job(public_ip="10.9.9.9", instance_id="i-adm-1",
-                       provisioned_instance_id="i-adm-1")
+    job = _pending_job(
+        public_ip="10.9.9.9", instance_id="i-adm-1", provisioned_instance_id="i-adm-1"
+    )
     handler, reg, prov, kw = _pending_deps(
-        job, transport_for=lambda host: _heartbeat_transport())
+        job, transport_for=lambda host: _heartbeat_transport()
+    )
     handler(reg.get("adm-1"), "adm-1", "us-east-1", **kw)
     row = reg.get("adm-1")
     assert row["state"] == "RUNNING"
@@ -585,10 +756,12 @@ def test_pending_promotes_on_fresh_heartbeat():
 
 def test_pending_stale_never_promotes():
     """Invariant 4: STALE heartbeat keeps the job PENDING."""
-    job = _pending_job(public_ip="10.9.9.9", instance_id="i-adm-1",
-                       provisioned_instance_id="i-adm-1")
+    job = _pending_job(
+        public_ip="10.9.9.9", instance_id="i-adm-1", provisioned_instance_id="i-adm-1"
+    )
     handler, reg, prov, kw = _pending_deps(
-        job, transport_for=lambda host: _heartbeat_transport(age_s=3600.0))
+        job, transport_for=lambda host: _heartbeat_transport(age_s=3600.0)
+    )
     handler(reg.get("adm-1"), "adm-1", "us-east-1", **kw)
     assert reg.get("adm-1")["state"] == "PENDING"
     assert reg.get("adm-1")["pid"] is None
@@ -620,18 +793,22 @@ def test_pending_handler_never_raises():
 
 def test_pending_lifecycle_in_real_registry(tmp_path):
     """PENDING rows move through the strict V2 emulation backend."""
-    from storage.memory_registry import MemoryRegistry
     from orchestrator.admission import JobAdmissionManager, WorkloadContract
+    from storage.memory_registry import MemoryRegistry
+
     p = tmp_path / "registry.json"
     p.write_text(_json.dumps({}))
     reg = MemoryRegistry(_json.loads(p.read_text()))
     res = JobAdmissionManager(default_regions=["us-east-1"]).admit(
-        WorkloadContract(name="e2e-adm", script="job.py",
-                         regions=("us-east-1",)), reg, job_id="e2e-adm")
+        WorkloadContract(name="e2e-adm", script="job.py", regions=("us-east-1",)),
+        reg,
+        job_id="e2e-adm",
+    )
     assert res.verdict == "ADMITTED"
     assert reg.get("e2e-adm")["state"] == "PENDING"
-    reg.transition("e2e-adm", "PENDING", public_ip="10.1.1.1",
-                   provisioned_instance_id="i-1")
+    reg.transition(
+        "e2e-adm", "PENDING", public_ip="10.1.1.1", provisioned_instance_id="i-1"
+    )
     assert reg.get("e2e-adm")["public_ip"] == "10.1.1.1"
     reg.transition("e2e-adm", "RUNNING", pid=4242)
     assert reg.get("e2e-adm")["state"] == "RUNNING"
@@ -647,24 +824,33 @@ def test_multijob_states_include_pending():
 
 def _wiring_plan(job_id="j1", regime="ARBITRAGE", target="us-west-2"):
     from orchestrator.migration_planner import MigrationPlanner
-    from orchestrator.policy_engine import (
-        PolicyDecision, Decision, MigrationRegime)
+    from orchestrator.policy_engine import Decision, MigrationRegime, PolicyDecision
+
     return MigrationPlanner().create_plan(
-        job_id=job_id, execution_epoch=0,
+        job_id=job_id,
+        execution_epoch=0,
         regime=getattr(MigrationRegime, regime),
         policy_decision=PolicyDecision(
-            decision=Decision.MIGRATE, regime=getattr(MigrationRegime, regime),
-            reason="t", target_candidate_id=target, confidence=0.9,
-            metadata={}),
-        source_pool_id="pool-s", target_pool_id=target,
-        workload_estimate=_est())
+            decision=Decision.MIGRATE,
+            regime=getattr(MigrationRegime, regime),
+            reason="t",
+            target_candidate_id=target,
+            confidence=0.9,
+            metadata={},
+        ),
+        source_pool_id="pool-s",
+        target_pool_id=target,
+        workload_estimate=_est(),
+    )
 
 
 def test_plan_admission_and_outcome_hygiene():
     """S16 seam: admitted plans are visible; marked plans leave the active set."""
+    import pytest
+
     from orchestrator.main import _admit_plan_to_store, _mark_plan_outcome
     from storage.plan_store import PlanStore
-    import pytest
+
     store = PlanStore()
     plan = _wiring_plan()
     _admit_plan_to_store(store, plan)
@@ -698,6 +884,7 @@ def test_preemptible_lookup_scoped_to_job_attempt():
     """Lookup never crosses job or migration-attempt boundaries."""
     from orchestrator.main import _admit_plan_to_store
     from storage.plan_store import PlanStore
+
     store = PlanStore()
     plan = _wiring_plan(job_id="j1")
     _admit_plan_to_store(store, plan)
@@ -708,30 +895,45 @@ def test_preemptible_lookup_scoped_to_job_attempt():
 def test_requirements_carry_runtime_drift_identity():
     """Phase B: contract digest/regions/secrets reach compatibility."""
     from orchestrator.main import _requirements_for_job
-    req = _requirements_for_job({
-        "job_id": "drift-1",
-        "workload_contract": {
-            "resources": {"cpu": 1, "memory_mb": 512},
-            "runtime": {"artifact_digest": "sha256:real"},
-            "placement": {"regions": ["us-west-2"]},
-            "required_secret_refs": ["db/password"],
-        },
-    })
+
+    req = _requirements_for_job(
+        {
+            "job_id": "drift-1",
+            "workload_contract": {
+                "resources": {"cpu": 1, "memory_mb": 512},
+                "runtime": {"artifact_digest": "sha256:real"},
+                "placement": {"regions": ["us-west-2"]},
+                "required_secret_refs": ["db/password"],
+            },
+        }
+    )
     assert req.runtime_artifact_digest == "sha256:real"
     assert req.placement.allowed_regions == ["us-west-2"]
     assert req.required_secret_refs == ["db/password"]
     # Drift fails deterministically at compatibility time.
     from orchestrator.candidate_compatibility import CompatibilityEngine
     from orchestrator.candidate_pool import (
-        CandidatePool, PoolRuntimeProfile, PoolCapacityProfile)
+        CandidatePool,
+        PoolCapacityProfile,
+        PoolRuntimeProfile,
+    )
+
     pool = CandidatePool(
-        pool_id="p", provider="aws", account_id="1", region="us-west-2",
-        availability_zone="us-west-2a", instance_type="t3.micro",
+        pool_id="p",
+        provider="aws",
+        account_id="1",
+        region="us-west-2",
+        availability_zone="us-west-2a",
+        instance_type="t3.micro",
         architecture="x86_64",
         runtime_profile=PoolRuntimeProfile(
-            artifact_digest="sha256:stale", architecture="x86_64"),
-        capacity_profile=PoolCapacityProfile(max_instances=10))
-    dims = {d.dimension: d.status.value
-            for d in CompatibilityEngine().assess(req, pool).dimensions}
+            artifact_digest="sha256:stale", architecture="x86_64"
+        ),
+        capacity_profile=PoolCapacityProfile(max_instances=10),
+    )
+    dims = {
+        d.dimension: d.status.value
+        for d in CompatibilityEngine().assess(req, pool).dimensions
+    }
     assert dims["runtime"] == "INCOMPATIBLE"
     assert dims["region_az"] == "COMPATIBLE"

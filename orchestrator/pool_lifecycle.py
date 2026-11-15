@@ -12,12 +12,14 @@ CAPACITY_UNAVAILABLE, never queueing. The guard is doubled: Placement peeks
 (admission-time exclusion) and the Coordinator acquires (execution-time
 refusal) — either layer independently refuses an over-subscribed pool.
 """
+
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import Enum
-from typing import Any, Dict, Iterator, Optional
+from typing import Any
 
 
 class PoolLifecycle(str, Enum):
@@ -57,7 +59,8 @@ def transition_lifecycle(current: Any, target: Any) -> str:
     cur, tgt = normalize_lifecycle(current), normalize_lifecycle(target)
     if tgt != cur and tgt not in LEGAL_TRANSITIONS[cur]:
         raise IllegalLifecycleTransition(
-            f"illegal pool lifecycle transition {cur} → {tgt}")
+            f"illegal pool lifecycle transition {cur} → {tgt}"
+        )
     return tgt
 
 
@@ -86,8 +89,8 @@ class PoolConcurrencyTracker:
 
     def __init__(self, default_max: int = DEFAULT_MAX_CONCURRENT_MIGRATIONS_PER_POOL):
         self._default_max = default_max
-        self._max: Dict[str, int] = {}
-        self._active: Dict[str, int] = {}
+        self._max: dict[str, int] = {}
+        self._active: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def configure(self, pool_id: str, max_concurrent: int) -> None:
@@ -117,7 +120,7 @@ class PoolConcurrencyTracker:
             self._active[pool_id] = self._active.get(pool_id, 0) + 1
             return True
 
-    def release(self, pool_id: Optional[str]) -> None:
+    def release(self, pool_id: str | None) -> None:
         if not pool_id:
             return
         with self._lock:

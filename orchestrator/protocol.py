@@ -1,8 +1,8 @@
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional, Dict
-import uuid
+from typing import Any
 
 
 class OperationState(str, Enum):
@@ -53,8 +53,8 @@ class Command:
     migration_id: str
     correlation_id: str
     issued_at: datetime
-    deadline: Optional[datetime] = None
-    payload: Dict[str, Any] = field(default_factory=dict)
+    deadline: datetime | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(cls, command_type: CommandType, **kwargs) -> "Command":
@@ -109,9 +109,9 @@ class Operation:
     command_id: str
     state: OperationState = OperationState.ISSUED
     started_at: datetime = field(default_factory=datetime.utcnow)
-    completed_at: Optional[datetime] = None
+    completed_at: datetime | None = None
     result: Any = None
-    error: Optional[str] = None
+    error: str | None = None
     retries: int = 0
 
     def mark_running(self):
@@ -139,12 +139,12 @@ class Event:
     event_type: EventType
     job_id: str
     execution_epoch: int
-    migration_id: Optional[str]
+    migration_id: str | None
     correlation_id: str
     occurred_at: datetime
     effective_at: datetime
     producer: str
-    payload: Dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(cls, event_type: EventType, **kwargs) -> "Event":
@@ -227,11 +227,11 @@ class Query:
     query_id: str
     query_type: QueryType
     correlation_id: str
-    job_id: Optional[str] = None
-    migration_id: Optional[str] = None
+    job_id: str | None = None
+    migration_id: str | None = None
     issued_at: datetime = field(default_factory=datetime.utcnow)
-    deadline: Optional[datetime] = None
-    parameters: Dict[str, Any] = field(default_factory=dict)
+    deadline: datetime | None = None
+    parameters: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(cls, query_type: QueryType, **kwargs) -> "Query":
@@ -281,10 +281,10 @@ class GetMigrationPlanQuery(Query):
 class StateTransition:
     entity_id: str
     expected_version: int
-    transition: Dict[str, Any]
+    transition: dict[str, Any]
     actor: str
     timestamp: datetime = field(default_factory=datetime.utcnow)
-    execution_epoch: Optional[int] = None
+    execution_epoch: int | None = None
 
 
 class StateMutationAuthority(str, Enum):

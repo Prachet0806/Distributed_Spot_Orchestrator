@@ -5,7 +5,7 @@ def control_userdata(admission_epoch: int) -> str:
     epoch = int(admission_epoch)
     if epoch < 0:
         raise ValueError("admission epoch must be nonnegative")
-    return f'''#!/bin/bash
+    return f"""#!/bin/bash
 set -euo pipefail
 python3 -I /opt/spot-worker-control/control_entry.py --self-check
 command -v criu >/dev/null
@@ -40,4 +40,4 @@ with os.fdopen(fd, "w", encoding="utf-8") as output:
     os.fsync(output.fileno())
 os.replace(temporary, directory / "identity.json")
 PY
-'''
+"""

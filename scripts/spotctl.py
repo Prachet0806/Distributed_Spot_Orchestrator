@@ -14,6 +14,7 @@ discovery (PA-6/9), pool-backed provisioning (PA-7/8) and telemetry
 READINESS replace the runtime internals progressively without changing
 this UX.
 """
+
 import argparse
 import sys
 
@@ -35,30 +36,44 @@ def _parse_memory_mb(raw):
 def _registry(args):
     from orchestrator.config_loader import load_runtime_config
     from storage.dynamo_registry import DynamoRegistry
+
     cfg = load_runtime_config()
-    return DynamoRegistry(args.table or cfg["dynamodb_table"],
-                          region_name=args.region or cfg["dynamodb_region"])
+    return DynamoRegistry(
+        args.table or cfg["dynamodb_table"],
+        region_name=args.region or cfg["dynamodb_region"],
+    )
 
 
 def _history_store(args):
     import boto3
+
     from orchestrator.config_loader import load_runtime_config
     from storage.history_store import HistoryStore
+
     cfg = load_runtime_config()
-    return HistoryStore(table_name=args.history_table, dynamodb_resource=boto3.resource(
-        "dynamodb", region_name=args.region or cfg["dynamodb_region"]))
+    return HistoryStore(
+        table_name=args.history_table,
+        dynamodb_resource=boto3.resource(
+            "dynamodb", region_name=args.region or cfg["dynamodb_region"]
+        ),
+    )
 
 
 def cmd_run(args):
     from orchestrator.admission import JobAdmissionManager, WorkloadContract
+
     reg = _registry(args)
     regions = [r.strip() for r in (args.regions or "").split(",") if r.strip()]
     if not regions and args.region:
         regions = [args.region]
     contract = WorkloadContract(
-        name=args.name, script=args.script, cpu=args.cpu,
-        memory_mb=_parse_memory_mb(args.memory), gpu=bool(args.gpu),
-        storage_gb=args.storage_gb, regions=tuple(regions),
+        name=args.name,
+        script=args.script,
+        cpu=args.cpu,
+        memory_mb=_parse_memory_mb(args.memory),
+        gpu=bool(args.gpu),
+        storage_gb=args.storage_gb,
+        regions=tuple(regions),
         workload_type=args.workload_type,
         max_recovery_time_s=args.max_recovery_time,
     )
@@ -86,7 +101,9 @@ def cmd_status(args):
     contract = job.get("workload_contract") or {}
     if contract:
         res = contract.get("resources", {})
-        print(f"contract: cpu={res.get('cpu')} mem_mb={res.get('memory_mb')} gpu={res.get('gpu')}")
+        print(
+            f"contract: cpu={res.get('cpu')} mem_mb={res.get('memory_mb')} gpu={res.get('gpu')}"
+        )
 
 
 def _history_rows(args):
@@ -107,12 +124,16 @@ def cmd_history(args):
         if isinstance(outcome, dict):
             outcome = outcome.get("value", "?")
         print(f"--- {doc.get('migration_id')} [{outcome}] regime={doc.get('regime')}")
-        print(f"    {doc.get('source_candidate_id')} -> {doc.get('target_candidate_id')}"
-              f" reason={doc.get('failure_reason') or (doc.get('policy_decision') or {}).get('reason', '')}")
+        print(
+            f"    {doc.get('source_candidate_id')} -> {doc.get('target_candidate_id')}"
+            f" reason={doc.get('failure_reason') or (doc.get('policy_decision') or {}).get('reason', '')}"
+        )
         steps = doc.get("steps") or []
         if steps:
             parts = ", ".join(
-                f"{s.get('step')}:{s.get('duration_seconds')}s/{s.get('status')}" for s in steps)
+                f"{s.get('step')}:{s.get('duration_seconds')}s/{s.get('status')}"
+                for s in steps
+            )
             print(f"    steps: {parts}")
         print(f"    total: {doc.get('total_duration_seconds')}s")
 
@@ -124,9 +145,13 @@ def cmd_cost(args):
         return
     n_ok = sum(1 for d in rows if str(d.get("outcome", "")).endswith("SUCCESS"))
     tot_dur = sum(float(d.get("total_duration_seconds") or 0) for d in rows)
-    est_save = sum(float((d.get("cost_analysis") or {}).get("expected_savings") or 0) for d in rows)
-    print(f"job: {args.name} migrations={len(rows)} success={n_ok} "
-          f"success_rate={n_ok / max(len(rows), 1):.2f}")
+    est_save = sum(
+        float((d.get("cost_analysis") or {}).get("expected_savings") or 0) for d in rows
+    )
+    print(
+        f"job: {args.name} migrations={len(rows)} success={n_ok} "
+        f"success_rate={n_ok / max(len(rows), 1):.2f}"
+    )
     print(f"total_migration_time_s={tot_dur:.1f} estimated_savings={est_save:.4f}")
     print("(actual spend: billing validation scheduled, Track E3)")
 
@@ -140,9 +165,11 @@ def cmd_runtime_publish(args):
     never a migration-time surprise.
     """
     from storage.pool_registry import (
-        load_definitions_file, save_definitions_file,
+        load_definitions_file,
+        save_definitions_file,
         validate_pool_definition,
     )
+
     amis = {}
     for item in args.ami:
         if "=" not in item:
@@ -156,26 +183,30 @@ def cmd_runtime_publish(args):
     for region in regions:
         pool_id = f"pool-{region}-{args.instance_type}"
         cur = dict(defs.get(pool_id, {}))
-        cur.update({
-            "pool_id": pool_id,
-            "provider": cur.get("provider", "aws"),
-            "region": region,
-            "availability_zone": cur.get("availability_zone", f"{region}a"),
-            "instance_type": args.instance_type,
-            "architecture": cur.get("architecture", "x86_64"),
-            "ami_id": amis.get(region, cur.get("ami_id", "")),
-            "security_group_id": cur.get("security_group_id", args.security_group),
-            "iam_profile": cur.get("iam_profile", args.iam_profile),
-            "runtime_artifact_digest": args.digest,
-            "criu_version": args.criu or cur.get("criu_version", ""),
-            "kernel_version": args.kernel or cur.get("kernel_version", ""),
-            "lifecycle": cur.get("lifecycle", "ACTIVE"),
-            "max_concurrent_migrations": cur.get("max_concurrent_migrations", 2),
-        })
+        cur.update(
+            {
+                "pool_id": pool_id,
+                "provider": cur.get("provider", "aws"),
+                "region": region,
+                "availability_zone": cur.get("availability_zone", f"{region}a"),
+                "instance_type": args.instance_type,
+                "architecture": cur.get("architecture", "x86_64"),
+                "ami_id": amis.get(region, cur.get("ami_id", "")),
+                "security_group_id": cur.get("security_group_id", args.security_group),
+                "iam_profile": cur.get("iam_profile", args.iam_profile),
+                "runtime_artifact_digest": args.digest,
+                "criu_version": args.criu or cur.get("criu_version", ""),
+                "kernel_version": args.kernel or cur.get("kernel_version", ""),
+                "lifecycle": cur.get("lifecycle", "ACTIVE"),
+                "max_concurrent_migrations": cur.get("max_concurrent_migrations", 2),
+            }
+        )
         errs = validate_pool_definition(cur)
         if errs:
-            print(f"note: {pool_id} incomplete ({'; '.join(errs)}) — "
-                  f"fill --ami/--security-group for a fully authoritative pool")
+            print(
+                f"note: {pool_id} incomplete ({'; '.join(errs)}) — "
+                f"fill --ami/--security-group for a fully authoritative pool"
+            )
         defs[pool_id] = cur
     save_definitions_file(args.pools_file, defs)
     print(f"published {args.digest} to {len(regions)} pool(s) in {args.pools_file}")
@@ -190,7 +221,9 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("run", help="Admit a job (no PID/IP/AMI flags on this path)")
-    r.add_argument("--name", required=True, help="Job name (job-id derived if --job-id absent)")
+    r.add_argument(
+        "--name", required=True, help="Job name (job-id derived if --job-id absent)"
+    )
     r.add_argument("--job-id", default=None)
     r.add_argument("--script", required=True)
     r.add_argument("--cpu", type=int, default=1)
@@ -213,11 +246,17 @@ def main(argv=None):
     rt = sub.add_parser("runtime", help="Runtime artifact operations")
     rtsub = rt.add_subparsers(dest="runtime_cmd", required=True)
     pub = rtsub.add_parser("publish", help="Register a runtime artifact with pools")
-    pub.add_argument("--digest", required=True, help="Runtime artifact digest (sha256:...)")
+    pub.add_argument(
+        "--digest", required=True, help="Runtime artifact digest (sha256:...)"
+    )
     pub.add_argument("--regions", required=True, help="Comma-separated regions")
     pub.add_argument("--instance-type", default="t3.micro")
-    pub.add_argument("--ami", action="append", default=[],
-                     help="REGION=AMI mapping (repeatable); AMI baking itself stays out-of-band v1")
+    pub.add_argument(
+        "--ami",
+        action="append",
+        default=[],
+        help="REGION=AMI mapping (repeatable); AMI baking itself stays out-of-band v1",
+    )
     pub.add_argument("--security-group", default="")
     pub.add_argument("--iam-profile", default="")
     pub.add_argument("--criu", default="")
@@ -229,8 +268,9 @@ def main(argv=None):
     if args.cmd == "runtime":
         cmd_runtime_publish(args)
         return
-    {"run": cmd_run, "status": cmd_status, "history": cmd_history,
-     "cost": cmd_cost}[args.cmd](args)
+    {"run": cmd_run, "status": cmd_status, "history": cmd_history, "cost": cmd_cost}[
+        args.cmd
+    ](args)
 
 
 if __name__ == "__main__":

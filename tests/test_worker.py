@@ -1,14 +1,17 @@
 """Phase 5: worker workloads, hooks, transports, CRIU handler mapping."""
+
 import json
 import threading
 
+from orchestrator import criu_handlers as handlers
+from worker.checkpoint_hooks import post_restore, pre_checkpoint
 from worker.jobs.fixture import run as fixture_run
 from worker.jobs.monte_carlo import run as mc_run
-from worker.checkpoint_hooks import pre_checkpoint, post_restore
 from worker.transport import (
-    EmulatedWorkerTransport, SSHWorkerTransport, emu_trust_mode,
+    EmulatedWorkerTransport,
+    SSHWorkerTransport,
+    emu_trust_mode,
 )
-from orchestrator import criu_handlers as handlers
 
 
 def test_fixture_progress_and_resume(tmp_path):
@@ -18,16 +21,21 @@ def test_fixture_progress_and_resume(tmp_path):
     # Resume continues; deterministic accumulator across restart.
     r2 = fixture_run(total_ticks=300, progress_path=prog, sleep_per_tick=0)
     assert r2["tick"] == 300
-    assert r2["accumulator"] == fixture_run(
-        total_ticks=300, progress_path=None, sleep_per_tick=0)["accumulator"]
+    assert (
+        r2["accumulator"]
+        == fixture_run(total_ticks=300, progress_path=None, sleep_per_tick=0)[
+            "accumulator"
+        ]
+    )
 
 
 def test_fixture_interrupt_persists(tmp_path):
     prog = str(tmp_path / "progress.json")
     stop = threading.Event()
     stop.set()
-    r = fixture_run(total_ticks=10000, progress_path=prog, stop_event=stop,
-                    sleep_per_tick=0)
+    r = fixture_run(
+        total_ticks=10000, progress_path=prog, stop_event=stop, sleep_per_tick=0
+    )
     assert r["interrupted"] is True
     with open(prog) as f:
         assert json.load(f)["tick"] == r["tick"]
@@ -82,14 +90,14 @@ class _FakeTransport:
 
     def run_command(self, command, timeout=60.0):
         self.commands.append(command)
-        return {"returncode": self.rc, "stdout": self.stdout,
-                "stderr": self.stderr}
+        return {"returncode": self.rc, "stdout": self.stdout, "stderr": self.stderr}
 
     def close(self):
         pass
 
     def fetch_directory(self, remote, local):
         from pathlib import Path
+
         directory = Path(local)
         directory.mkdir(parents=True)
         (directory / "core-123.img").write_bytes(b"checkpoint fixture")
@@ -101,31 +109,47 @@ def test_dump_handler_success_and_failures():
     assert res.status == "LOCAL" and res.job_id == "j"
 
     import pytest
+
     with pytest.raises(RuntimeError):
         handlers.make_dump_handler(_FakeTransport(rc=1, stderr="boom"))(
-            job_id="j", pid=1)
+            job_id="j", pid=1
+        )
     with pytest.raises(TimeoutError):
-        handlers.make_dump_handler(_FakeTransport(rc=2))(
-            job_id="j", pid=1)
+        handlers.make_dump_handler(_FakeTransport(rc=2))(job_id="j", pid=1)
     with pytest.raises(RuntimeError):
-        handlers.make_dump_handler(_FakeTransport(rc=3))(
-            job_id="j", pid=1)
+        handlers.make_dump_handler(_FakeTransport(rc=3))(job_id="j", pid=1)
 
 
 def test_restore_handler_outcome_mapping():
     mk = handlers.make_restore_handler
-    success = json.dumps({"state": "SUCCEEDED", "result": {"process_id": 12345,
-        "process_start": "900", "contained": True}})
+    success = json.dumps(
+        {
+            "state": "SUCCEEDED",
+            "result": {"process_id": 12345, "process_start": "900", "contained": True},
+        }
+    )
     transport = _FakeTransport(rc=0, stdout=success)
     r = mk(transport)(checkpoint_id="c", operation_id="op-1")
     assert r.process_id == 12345 and r.success is True
     assert "restore run --operation-id op-1" in transport.commands[0]
-    assert mk(_FakeTransport(rc=2, stdout='{"state":"UNKNOWN"}'))(
-        checkpoint_id="c", operation_id="op-2").outcome == "UNKNOWN"
-    assert mk(_FakeTransport(rc=3, stdout='{"state":"UNKNOWN"}'))(
-        checkpoint_id="c", operation_id="op-3").outcome == "UNKNOWN"
-    assert mk(_FakeTransport(rc=1, stdout='{"state":"FAILED"}'))(
-        checkpoint_id="c", operation_id="op-4").outcome == "FAILED"
+    assert (
+        mk(_FakeTransport(rc=2, stdout='{"state":"UNKNOWN"}'))(
+            checkpoint_id="c", operation_id="op-2"
+        ).outcome
+        == "UNKNOWN"
+    )
+    assert (
+        mk(_FakeTransport(rc=3, stdout='{"state":"UNKNOWN"}'))(
+            checkpoint_id="c", operation_id="op-3"
+        ).outcome
+        == "UNKNOWN"
+    )
+    assert (
+        mk(_FakeTransport(rc=1, stdout='{"state":"FAILED"}'))(
+            checkpoint_id="c", operation_id="op-4"
+        ).outcome
+        == "FAILED"
+    )
 
 
 def test_verify_and_fence_hooks():
@@ -144,6 +168,13 @@ def test_verify_and_fence_hooks():
 
 def test_wrapper_contract_strings():
     text = open("checkpoint/criu_wrapper.sh").read()
-    for token in ["dump", "restore", "verify", "preflight",
-                  "WORKSPACE_ROOT", "PARTIAL", "inventory.img"]:
+    for token in [
+        "dump",
+        "restore",
+        "verify",
+        "preflight",
+        "WORKSPACE_ROOT",
+        "PARTIAL",
+        "inventory.img",
+    ]:
         assert token in text

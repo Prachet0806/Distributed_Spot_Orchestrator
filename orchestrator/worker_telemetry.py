@@ -17,10 +17,12 @@ construct a WorkerTelemetryReader per source host and feed
 `readiness_liveness()` into the readiness assessment. Until then this
 module is exercised by tests + the emulated path.
 """
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 HEARTBEAT_SCHEMA = "heartbeat/v1"
 PROGRESS_SCHEMA = "progress/v1"
@@ -58,16 +60,15 @@ def _parse_time(value: Any, field: str) -> datetime:
     return ts
 
 
-def _require_schema(obj: Dict[str, Any], schema: str) -> Dict[str, Any]:
+def _require_schema(obj: dict[str, Any], schema: str) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise TelemetryError(f"{schema}: report is not an object")
     if obj.get("schema") != schema:
-        raise TelemetryError(
-            f"expected schema {schema}, got {obj.get('schema')!r}")
+        raise TelemetryError(f"expected schema {schema}, got {obj.get('schema')!r}")
     return obj
 
 
-def parse_heartbeat(obj: Dict[str, Any]) -> Dict[str, Any]:
+def parse_heartbeat(obj: dict[str, Any]) -> dict[str, Any]:
     """Validate a T1 heartbeat/v1 report."""
     doc = _require_schema(obj, HEARTBEAT_SCHEMA)
     for key in ("job_id", "instance_id", "execution_epoch", "pid"):
@@ -79,13 +80,12 @@ def parse_heartbeat(obj: Dict[str, Any]) -> Dict[str, Any]:
         "instance_id": str(doc["instance_id"]),
         "execution_epoch": int(doc["execution_epoch"]),
         "pid": int(doc["pid"]),
-        "observed_at": _parse_time(
-            doc.get("observed_at"), "heartbeat/v1"),
+        "observed_at": _parse_time(doc.get("observed_at"), "heartbeat/v1"),
         "workload": doc.get("workload") or {},
     }
 
 
-def parse_progress(obj: Dict[str, Any]) -> Dict[str, Any]:
+def parse_progress(obj: dict[str, Any]) -> dict[str, Any]:
     """Validate a T2 progress/v1 report (durable progress-file content)."""
     if not isinstance(obj, dict):
         raise TelemetryError("progress/v1: report is not an object")
@@ -95,25 +95,24 @@ def parse_progress(obj: Dict[str, Any]) -> Dict[str, Any]:
         "schema": PROGRESS_SCHEMA,
         "job_id": obj.get("job_id"),
         "execution_epoch": obj.get("execution_epoch"),
-        "observed_at": _parse_time(
-            obj.get("observed_at"),
-            "progress/v1"),
+        "observed_at": _parse_time(obj.get("observed_at"), "progress/v1"),
         "progress": obj.get("progress"),
         "checkpoint_size_bytes": obj.get("checkpoint_size_bytes"),
         "checkpoint_duration_seconds": obj.get("checkpoint_duration_seconds"),
         "observation_confidence": obj.get("observation_confidence"),
-        "raw": {k: v for k, v in obj.items()
-                if k not in ("schema", "observed_at", "at")},
+        "raw": {
+            k: v for k, v in obj.items() if k not in ("schema", "observed_at", "at")
+        },
     }
 
 
-def parse_preflight_kv(text: str, pool_id: str,
-                       instance_id: str = "",
-                       observed_at: Optional[datetime] = None) -> Dict[str, Any]:
+def parse_preflight_kv(
+    text: str, pool_id: str, instance_id: str = "", observed_at: datetime | None = None
+) -> dict[str, Any]:
     """Parse `criu_wrapper.sh preflight` key=value output → T3 report."""
     if not isinstance(text, str) or not text.strip():
         raise TelemetryError("preflight: empty output")
-    kv: Dict[str, str] = {}
+    kv: dict[str, str] = {}
     for line in text.splitlines():
         if "=" in line:
             key, _, value = line.partition("=")
@@ -133,7 +132,7 @@ def parse_preflight_kv(text: str, pool_id: str,
     }
 
 
-def parse_refusal(obj: Dict[str, Any]) -> Dict[str, Any]:
+def parse_refusal(obj: dict[str, Any]) -> dict[str, Any]:
     """Validate a T4 command-refusal report (worker-controller trust, D3)."""
     doc = _require_schema(obj, REFUSAL_SCHEMA)
     for key in ("instance_id", "operation_id", "reason"):
@@ -147,8 +146,8 @@ def parse_refusal(obj: Dict[str, Any]) -> Dict[str, Any]:
         "expected_execution_epoch": doc.get("expected_execution_epoch"),
         "reason": str(doc["reason"]),
         "observed_at": _parse_time(
-            doc.get("observed_at", datetime.now(timezone.utc).isoformat()),
-            "refusal/v1"),
+            doc.get("observed_at", datetime.now(timezone.utc).isoformat()), "refusal/v1"
+        ),
     }
 
 
@@ -156,61 +155,87 @@ def _age_seconds(observed_at: datetime, now: datetime) -> float:
     return (now - observed_at).total_seconds()
 
 
-def _observed_at_of(report: Dict[str, Any], stream: str) -> datetime:
+def _observed_at_of(report: dict[str, Any], stream: str) -> datetime:
     """Accept parsed (datetime) or raw (ISO string) reports from any caller."""
     return _parse_time(report.get("observed_at"), stream)
 
 
-def heartbeat_liveness(report: Optional[Dict[str, Any]],
-                       now: Optional[datetime] = None) -> Dict[str, Any]:
+def heartbeat_liveness(
+    report: dict[str, Any] | None, now: datetime | None = None
+) -> dict[str, Any]:
     """T1 freshness → liveness. STALE/MISSING ⇒ readiness UNKNOWN (never down)."""
     now = now or datetime.now(timezone.utc)
     if report is None:
-        return {"liveness": "MISSING", "age_seconds": None,
-                "readiness": "UNKNOWN"}
+        return {"liveness": "MISSING", "age_seconds": None, "readiness": "UNKNOWN"}
     age = _age_seconds(_observed_at_of(report, "heartbeat"), now)
     if -5 <= age <= HEARTBEAT_STALE_SECONDS:
-        return {"liveness": "FRESH", "age_seconds": age, "readiness": "READY",
-                "execution_epoch": report.get("execution_epoch"),
-                "pid": report.get("pid")}
+        return {
+            "liveness": "FRESH",
+            "age_seconds": age,
+            "readiness": "READY",
+            "execution_epoch": report.get("execution_epoch"),
+            "pid": report.get("pid"),
+        }
     return {"liveness": "STALE", "age_seconds": age, "readiness": "UNKNOWN"}
 
 
-def progress_quality(report: Optional[Dict[str, Any]],
-                     now: Optional[datetime] = None) -> Dict[str, Any]:
+def progress_quality(
+    report: dict[str, Any] | None, now: datetime | None = None
+) -> dict[str, Any]:
     """T2 freshness → estimator confidence hint (never zero-fill)."""
     now = now or datetime.now(timezone.utc)
     if report is None:
-        return {"quality": "MISSING", "age_seconds": None,
-                "confidence": "LOW", "usable": True}
+        return {
+            "quality": "MISSING",
+            "age_seconds": None,
+            "confidence": "LOW",
+            "usable": True,
+        }
     try:
         age = _age_seconds(_observed_at_of(report, "progress"), now)
     except TelemetryError:
-        return {"quality": "MISSING", "age_seconds": None,
-                "confidence": "LOW", "usable": True}
+        return {
+            "quality": "MISSING",
+            "age_seconds": None,
+            "confidence": "LOW",
+            "usable": True,
+        }
     if -5 <= age <= PROGRESS_STALE_SECONDS:
-        return {"quality": "FRESH", "age_seconds": age,
-                "confidence": "AS_REPORTED", "usable": True}
-    return {"quality": "STALE", "age_seconds": age,
-            "confidence": "LOW", "usable": True}
+        return {
+            "quality": "FRESH",
+            "age_seconds": age,
+            "confidence": "AS_REPORTED",
+            "usable": True,
+        }
+    return {"quality": "STALE", "age_seconds": age, "confidence": "LOW", "usable": True}
 
 
-def preflight_freshness(report: Optional[Dict[str, Any]],
-                        now: Optional[datetime] = None,
-                        ttl_seconds: float = PREFLIGHT_TTL_SECONDS) -> Dict[str, Any]:
+def preflight_freshness(
+    report: dict[str, Any] | None,
+    now: datetime | None = None,
+    ttl_seconds: float = PREFLIGHT_TTL_SECONDS,
+) -> dict[str, Any]:
     """T3 cache status → re-probe decision before admission."""
     now = now or datetime.now(timezone.utc)
     if report is None:
         return {"fresh": False, "reprobe": True, "ready_hint": "UNKNOWN"}
     age = _age_seconds(_observed_at_of(report, "preflight"), now)
     if -5 <= age <= ttl_seconds:
-        return {"fresh": True, "reprobe": False, "age_seconds": age,
-                "ready_hint": "READY" if report.get("passed") else "NOT_READY"}
-    return {"fresh": False, "reprobe": True, "age_seconds": age,
-            "ready_hint": "UNKNOWN"}
+        return {
+            "fresh": True,
+            "reprobe": False,
+            "age_seconds": age,
+            "ready_hint": "READY" if report.get("passed") else "NOT_READY",
+        }
+    return {
+        "fresh": False,
+        "reprobe": True,
+        "age_seconds": age,
+        "ready_hint": "UNKNOWN",
+    }
 
 
-def refusal_to_finding(refusal: Dict[str, Any]) -> Dict[str, Any]:
+def refusal_to_finding(refusal: dict[str, Any]) -> dict[str, Any]:
     """T4 refusal → reconciliation finding input (filed immediately)."""
     reason = str(refusal.get("reason", ""))
     return {
@@ -230,17 +255,23 @@ class WorkerTelemetryReader:
     EmulatedWorkerTransport in tests/emulation and SSHWorkerTransport on AWS.
     """
 
-    def __init__(self, transport: Any, workspace_root: str = "/opt/job_workspace",
-                 clock: Optional[Callable[[], datetime]] = None):
+    def __init__(
+        self,
+        transport: Any,
+        workspace_root: str = "/opt/job_workspace",
+        clock: Callable[[], datetime] | None = None,
+    ):
         self.transport = transport
         self.workspace_root = workspace_root.rstrip("/")
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def _read_json(self, name: str) -> Optional[Dict[str, Any]]:
+    def _read_json(self, name: str) -> dict[str, Any] | None:
         import json
+
         try:
             res = self.transport.run_command(
-                f"cat {self.workspace_root}/{name}", timeout=15.0)
+                f"cat {self.workspace_root}/{name}", timeout=15.0
+            )
         except Exception:
             return None
         if not isinstance(res, dict) or res.get("returncode", 1) != 0:
@@ -251,34 +282,35 @@ class WorkerTelemetryReader:
             return None
         return obj if isinstance(obj, dict) else None
 
-    def read_heartbeat(self) -> Optional[Dict[str, Any]]:
+    def read_heartbeat(self) -> dict[str, Any] | None:
         try:
             return parse_heartbeat(self._read_json("heartbeat.json"))
         except (TelemetryError, TypeError):
             return None
 
-    def read_progress(self) -> Optional[Dict[str, Any]]:
+    def read_progress(self) -> dict[str, Any] | None:
         try:
             return parse_progress(self._read_json("progress.json"))
         except (TelemetryError, TypeError):
             return None
 
-    def run_preflight(self, pool_id: str, instance_id: str = "",
-                      wrapper_path: str = "/opt/spot-worker-control/checkpoint/criu_wrapper.sh"
-                      ) -> Optional[Dict[str, Any]]:
+    def run_preflight(
+        self,
+        pool_id: str,
+        instance_id: str = "",
+        wrapper_path: str = "/opt/spot-worker-control/checkpoint/criu_wrapper.sh",
+    ) -> dict[str, Any] | None:
         try:
-            res = self.transport.run_command(
-                f"{wrapper_path} preflight", timeout=60.0)
+            res = self.transport.run_command(f"{wrapper_path} preflight", timeout=60.0)
         except Exception:
             return None
         if not isinstance(res, dict):
             return None
         try:
-            return parse_preflight_kv(res.get("stdout", ""), pool_id,
-                                      instance_id)
+            return parse_preflight_kv(res.get("stdout", ""), pool_id, instance_id)
         except TelemetryError:
             return None
 
-    def liveness(self) -> Dict[str, Any]:
+    def liveness(self) -> dict[str, Any]:
         """Combined T1 freshness verdict for the readiness assessment."""
         return heartbeat_liveness(self.read_heartbeat(), now=self._clock())

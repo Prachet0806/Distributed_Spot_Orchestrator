@@ -1,15 +1,12 @@
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from enum import Enum
-import uuid
 
-from orchestrator.policy_engine import PolicyDecision, MigrationRegime
-from orchestrator.candidate_compatibility import CompatibilityAssessment
-from orchestrator.candidate_readiness import ReadinessAssessment
-from orchestrator.recovery_feasibility import RecoveryFeasibility, PlanStepDuration
-from orchestrator.workload_estimator import WorkloadEstimate
 from orchestrator.cost_risk_evaluator import CostAnalysis
+from orchestrator.policy_engine import MigrationRegime, PolicyDecision
+from orchestrator.recovery_feasibility import PlanStepDuration, RecoveryFeasibility
+from orchestrator.workload_estimator import WorkloadEstimate
 
 
 class MigrationState(str, Enum):
@@ -42,9 +39,9 @@ class MigrationPlan:
     policy_decision: PolicyDecision
     created_at: datetime
     expires_at: datetime
-    deadline_seconds: Optional[float] = None
-    absolute_deadline: Optional[datetime] = None
-    estimated_critical_path_seconds: Optional[float] = None
+    deadline_seconds: float | None = None
+    absolute_deadline: datetime | None = None
+    estimated_critical_path_seconds: float | None = None
     safety_margin_seconds: float = 30.0
     input_snapshot_versions: dict = field(default_factory=dict)
     policy_versions: dict = field(default_factory=dict)
@@ -56,16 +53,16 @@ class MigrationPlan:
     plan_version: str = "v2-1"
     plan_id: str = ""
     plan_hash: str = ""
-    supersedes_plan_id: Optional[str] = None
-    candidate_assessment_version: Optional[str] = None
-    checkpoint_id: Optional[str] = None
+    supersedes_plan_id: str | None = None
+    candidate_assessment_version: str | None = None
+    checkpoint_id: str | None = None
     planner_version: str = "planner-v3"
-    pid: Optional[int] = None
+    pid: int | None = None
     source_host: str = ""
     source_instance_id: str = ""
     source_process_start: str = ""
 
-    def is_expired(self, now: Optional[datetime] = None) -> bool:
+    def is_expired(self, now: datetime | None = None) -> bool:
         now = now or datetime.utcnow()
         expires_at = self.expires_at
         if (expires_at.tzinfo is None) != (now.tzinfo is None):
@@ -118,19 +115,21 @@ class MigrationPlanner:
         source_pool_id: str,
         target_pool_id: str,
         workload_estimate: WorkloadEstimate,
-        recovery_feasibility: Optional[RecoveryFeasibility] = None,
-        stay_analysis: Optional[CostAnalysis] = None,
-        candidate_analysis: Optional[CostAnalysis] = None,
-        absolute_deadline: Optional[datetime] = None,
-        checkpoint_id: Optional[str] = None,
-        candidate_assessment_version: Optional[str] = None,
-        supersedes_plan_id: Optional[str] = None,
-        config_versions: Optional[dict] = None,
-        migration_id: Optional[str] = None,
-        source_identity: Optional[dict] = None,
+        recovery_feasibility: RecoveryFeasibility | None = None,
+        stay_analysis: CostAnalysis | None = None,
+        candidate_analysis: CostAnalysis | None = None,
+        absolute_deadline: datetime | None = None,
+        checkpoint_id: str | None = None,
+        candidate_assessment_version: str | None = None,
+        supersedes_plan_id: str | None = None,
+        config_versions: dict | None = None,
+        migration_id: str | None = None,
+        source_identity: dict | None = None,
     ) -> MigrationPlan:
         hit = self._issued.get(migration_id or "")
-        if hit is not None and (hit.supersedes_plan_id or "") == (supersedes_plan_id or ""):
+        if hit is not None and (hit.supersedes_plan_id or "") == (
+            supersedes_plan_id or ""
+        ):
             return hit  # duplicate creation request → idempotent return
         migration_id = migration_id or uuid.uuid4().hex
         plan_id = f"plan-{uuid.uuid4().hex[:16]}"
@@ -146,7 +145,9 @@ class MigrationPlanner:
             expires_at = created_at + timedelta(seconds=self.arbitrage_ttl_seconds)
 
         steps = self._build_steps(regime, recovery_feasibility)
-        deadline = self._compute_deadline(regime, recovery_feasibility, workload_estimate)
+        deadline = self._compute_deadline(
+            regime, recovery_feasibility, workload_estimate
+        )
         critical_path = self._estimate_critical_path(steps)
 
         input_versions = {
@@ -162,11 +163,13 @@ class MigrationPlanner:
             # Pin the chosen target's economics provenance (decision
             # reproducibility, C16): same evidence ⇒ same hash.
             input_versions["candidate_risk_model_version"] = (
-                candidate_analysis.risk_model_version)
-            input_versions["candidate_confidence"] = str(
-                candidate_analysis.confidence)
+                candidate_analysis.risk_model_version
+            )
+            input_versions["candidate_confidence"] = str(candidate_analysis.confidence)
         if recovery_feasibility:
-            input_versions["feasibility_confidence"] = str(recovery_feasibility.feasibility_confidence)
+            input_versions["feasibility_confidence"] = str(
+                recovery_feasibility.feasibility_confidence
+            )
         if config_versions:
             input_versions["config_versions"] = dict(config_versions)
 
@@ -188,7 +191,9 @@ class MigrationPlanner:
             estimated_critical_path_seconds=critical_path,
             safety_margin_seconds=self.safety_margin_seconds,
             input_snapshot_versions=input_versions,
-            policy_versions={"policy": getattr(policy_decision, "policy_version", "v3")},
+            policy_versions={
+                "policy": getattr(policy_decision, "policy_version", "v3")
+            },
             steps=steps,
             fencing_authorized=True,
             cleanup_rules=cleanup_rules,
@@ -209,9 +214,11 @@ class MigrationPlanner:
 
     @staticmethod
     def from_document(doc):
-        from orchestrator.recovery_feasibility import PlanStepDuration
-        from orchestrator.policy_engine import PolicyDecision, Decision
         from dataclasses import fields
+
+        from orchestrator.policy_engine import Decision, PolicyDecision
+        from orchestrator.recovery_feasibility import PlanStepDuration
+
         data = dict(doc)
         for key in ("created_at", "expires_at", "absolute_deadline"):
             if data.get(key):
@@ -233,7 +240,7 @@ class MigrationPlanner:
         old_plan: MigrationPlan,
         reason: str,
         workload_estimate: WorkloadEstimate,
-        policy_decision: Optional[PolicyDecision] = None,
+        policy_decision: PolicyDecision | None = None,
         **overrides,
     ) -> MigrationPlan:
         """Replan path (Protocols §25; S15/S16): new immutable plan for the
@@ -283,12 +290,18 @@ class MigrationPlanner:
             "job_id": plan.job_id,
             "execution_epoch": plan.execution_epoch,
             "expires_at": plan.expires_at.isoformat(),
-            "absolute_deadline": plan.absolute_deadline.isoformat() if plan.absolute_deadline else None,
+            "absolute_deadline": plan.absolute_deadline.isoformat()
+            if plan.absolute_deadline
+            else None,
             "deadline_seconds": plan.deadline_seconds,
             "fencing_authorized": plan.fencing_authorized,
             "cleanup_rules": plan.cleanup_rules,
-            "source_identity": {"pid": plan.pid, "host": plan.source_host,
-                                "instance_id": plan.source_instance_id, "process_start": plan.source_process_start},
+            "source_identity": {
+                "pid": plan.pid,
+                "host": plan.source_host,
+                "instance_id": plan.source_instance_id,
+                "process_start": plan.source_process_start,
+            },
             "migration_id": plan.migration_id,
             "regime": plan.regime.value,
             "source_pool_id": plan.source_pool_id,
@@ -302,8 +315,11 @@ class MigrationPlanner:
             "authorization_reference": plan.authorization_reference,
             "planner_version": plan.planner_version,
             "steps": [
-                {"name": s.name, "estimated_seconds": s.estimated_seconds,
-                 "parallel_group": s.parallel_group}
+                {
+                    "name": s.name,
+                    "estimated_seconds": s.estimated_seconds,
+                    "parallel_group": s.parallel_group,
+                }
                 for s in plan.steps
             ],
         }
@@ -314,7 +330,7 @@ class MigrationPlanner:
     def to_v2_dag(
         self,
         plan: MigrationPlan,
-        injection_points: Optional[dict] = None,
+        injection_points: dict | None = None,
     ) -> list:
         """Expand the plan into models_v2 PlanSteps with DAG dependencies.
 
@@ -327,20 +343,38 @@ class MigrationPlanner:
         non-empty lists outside the test harness).
         """
         from orchestrator.models_v2 import (
-            PlanStep, PlanStepType, STEP_ROLLBACK, STEP_CRITICALITY,
+            STEP_CRITICALITY,
+            STEP_ROLLBACK,
+            PlanStep,
+            PlanStepType,
         )
-        from orchestrator.step_retry import DEFAULT_RETRYABLE, DEFAULT_PRIORITY
+        from orchestrator.step_retry import DEFAULT_PRIORITY, DEFAULT_RETRYABLE
 
         injection_points = injection_points or {}
 
-        order = ["PRECHECK", "CHECKPOINT", "PERSIST", "PROVISION", "TRANSFER",
-                 "RESTORE", "FENCE", "VALIDATE", "ACTIVATE", "FINALIZE"]
+        order = [
+            "PRECHECK",
+            "CHECKPOINT",
+            "PERSIST",
+            "PROVISION",
+            "TRANSFER",
+            "RESTORE",
+            "FENCE",
+            "VALIDATE",
+            "ACTIVATE",
+            "FINALIZE",
+        ]
         op_map = {
-            "PRECHECK": "Precheck", "CHECKPOINT": "CreateCheckpoint",
-            "PERSIST": "PersistCheckpoint", "PROVISION": "Provision",
-            "TRANSFER": "TransferCheckpoint", "RESTORE": "RestoreCheckpoint",
-            "FENCE": "FenceSource", "VALIDATE": "ValidateMigration",
-            "ACTIVATE": "ActivateTarget", "FINALIZE": "FinalizeMigration",
+            "PRECHECK": "Precheck",
+            "CHECKPOINT": "CreateCheckpoint",
+            "PERSIST": "PersistCheckpoint",
+            "PROVISION": "Provision",
+            "TRANSFER": "TransferCheckpoint",
+            "RESTORE": "RestoreCheckpoint",
+            "FENCE": "FenceSource",
+            "VALIDATE": "ValidateMigration",
+            "ACTIVATE": "ActivateTarget",
+            "FINALIZE": "FinalizeMigration",
         }
         est = {s.name.lower(): s.estimated_seconds for s in plan.steps}
         timeouts = {"FENCE": 60.0}
@@ -364,9 +398,13 @@ class MigrationPlanner:
                 depends_on=deps,
                 operation_type=op_map[name],
                 timeout_seconds=timeouts.get(name, 300.0),
-                deadline_behavior="COMPLETE_FENCING" if name == "FENCE" else "FAIL_ON_EXCEED",
+                deadline_behavior="COMPLETE_FENCING"
+                if name == "FENCE"
+                else "FAIL_ON_EXCEED",
                 max_attempts=3,
-                retryable_failure_codes=sorted(DEFAULT_RETRYABLE.get(name, frozenset())),
+                retryable_failure_codes=sorted(
+                    DEFAULT_RETRYABLE.get(name, frozenset())
+                ),
                 priority=DEFAULT_PRIORITY.get(name, 100),
                 criticality=STEP_CRITICALITY[name],
                 rollback_class=STEP_ROLLBACK[name],
@@ -381,7 +419,7 @@ class MigrationPlanner:
         return dag
 
     def _build_steps(
-        self, regime: MigrationRegime, feasibility: Optional[RecoveryFeasibility]
+        self, regime: MigrationRegime, feasibility: RecoveryFeasibility | None
     ) -> list[PlanStepDuration]:
         steps = [
             PlanStepDuration("prechecking", 10.0, 0.9),
@@ -391,25 +429,50 @@ class MigrationPlanner:
 
         if regime == MigrationRegime.EMERGENCY and feasibility:
             checkpoint_est = next(
-                (s.estimated_seconds for s in feasibility.steps if s.name == "checkpoint"), None
+                (
+                    s.estimated_seconds
+                    for s in feasibility.steps
+                    if s.name == "checkpoint"
+                ),
+                None,
             )
             provision_est = next(
-                (s.estimated_seconds for s in feasibility.steps if s.name == "provision"), None
+                (
+                    s.estimated_seconds
+                    for s in feasibility.steps
+                    if s.name == "provision"
+                ),
+                None,
             )
             transfer_est = next(
-                (s.estimated_seconds for s in feasibility.steps if s.name == "transfer"), None
+                (
+                    s.estimated_seconds
+                    for s in feasibility.steps
+                    if s.name == "transfer"
+                ),
+                None,
             )
             restore_est = next(
-                (s.estimated_seconds for s in feasibility.steps if s.name == "restore"), None
+                (s.estimated_seconds for s in feasibility.steps if s.name == "restore"),
+                None,
             )
             validate_est = next(
-                (s.estimated_seconds for s in feasibility.steps if s.name == "validate"), None
+                (
+                    s.estimated_seconds
+                    for s in feasibility.steps
+                    if s.name == "validate"
+                ),
+                None,
             )
 
             if checkpoint_est:
                 steps[1] = PlanStepDuration("checkpointing", checkpoint_est, 0.7)
             if provision_est:
-                steps.append(PlanStepDuration("provisioning", provision_est, 0.7, parallel_group="prep"))
+                steps.append(
+                    PlanStepDuration(
+                        "provisioning", provision_est, 0.7, parallel_group="prep"
+                    )
+                )
             if transfer_est:
                 steps.append(PlanStepDuration("transferring", transfer_est, 0.8))
             if restore_est:
@@ -423,28 +486,34 @@ class MigrationPlanner:
 
             return steps
 
-        steps.extend([
-            PlanStepDuration("provisioning", 120.0, 0.6),
-            PlanStepDuration("transferring", 60.0, 0.7),
-            PlanStepDuration("restoring", 60.0, 0.6),
-            PlanStepDuration("fencing", 30.0, 0.9),
-            PlanStepDuration("activating", 10.0, 0.9),
-            PlanStepDuration("finalizing", 10.0, 0.9),
-        ])
+        steps.extend(
+            [
+                PlanStepDuration("provisioning", 120.0, 0.6),
+                PlanStepDuration("transferring", 60.0, 0.7),
+                PlanStepDuration("restoring", 60.0, 0.6),
+                PlanStepDuration("fencing", 30.0, 0.9),
+                PlanStepDuration("activating", 10.0, 0.9),
+                PlanStepDuration("finalizing", 10.0, 0.9),
+            ]
+        )
 
         return steps
 
     def _compute_deadline(
         self,
         regime: MigrationRegime,
-        feasibility: Optional[RecoveryFeasibility],
+        feasibility: RecoveryFeasibility | None,
         workload_estimate: WorkloadEstimate,
-    ) -> Optional[float]:
-        if regime == MigrationRegime.EMERGENCY and feasibility and feasibility.deadline_seconds:
+    ) -> float | None:
+        if (
+            regime == MigrationRegime.EMERGENCY
+            and feasibility
+            and feasibility.deadline_seconds
+        ):
             return feasibility.deadline_seconds
         return None
 
-    def _estimate_critical_path(self, steps: list[PlanStepDuration]) -> Optional[float]:
+    def _estimate_critical_path(self, steps: list[PlanStepDuration]) -> float | None:
         sequential = [s for s in steps if not s.parallel_group]
         parallel_groups: dict[str, list[PlanStepDuration]] = {}
         for s in steps:
@@ -461,9 +530,18 @@ class MigrationPlanner:
     def _build_cleanup_rules(self, regime: MigrationRegime) -> dict:
         base = {
             "on_abort_pre_fencing": ["terminate_target", "delete_partial_artifacts"],
-            "on_failure_pre_fencing": ["terminate_target", "delete_partial_artifacts", "preserve_source"],
-            "on_failure_post_fencing": ["retain_target_for_recovery", "forward_recovery_only"],
+            "on_failure_pre_fencing": [
+                "terminate_target",
+                "delete_partial_artifacts",
+                "preserve_source",
+            ],
+            "on_failure_post_fencing": [
+                "retain_target_for_recovery",
+                "forward_recovery_only",
+            ],
         }
         if regime == MigrationRegime.EMERGENCY:
-            base["deadline_exceeded_during_fencing"] = "complete_fencing_then_forward_recovery"
+            base["deadline_exceeded_during_fencing"] = (
+                "complete_fencing_then_forward_recovery"
+            )
         return base

@@ -5,13 +5,13 @@ Dynamo shape (when wired): table `spot_arbitrage_plans`, PK `plan_id`,
 step states in `steps` map; step updates conditional on plan_hash +
 expected step state (CAS). Crash recovery reads non-terminal step states.
 """
+
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Optional
 
+from storage.backend import Documents, conditional_failure, encode
 from storage.v2_transitions import is_v2_transition_allowed
-from storage.backend import Documents, encode, conditional_failure
 
 
 class PlanExistsError(KeyError):
@@ -23,7 +23,9 @@ class PlanStepConflictError(RuntimeError):
 
 
 class PlanStore:
-    def __init__(self, table_name: str = "spot_arbitrage_plans", dynamodb_resource=None):
+    def __init__(
+        self, table_name: str = "spot_arbitrage_plans", dynamodb_resource=None
+    ):
         self.table_name = table_name
         self.dynamodb = dynamodb_resource
         self._docs = Documents("plan_id", table_name, dynamodb_resource)
@@ -31,7 +33,8 @@ class PlanStore:
 
     # -- local backend --
     def put_plan(self, plan) -> dict:
-        from orchestrator.models_v2 import to_dict, compute_plan_hash
+        from orchestrator.models_v2 import compute_plan_hash, to_dict
+
         doc = deepcopy(to_dict(plan))
         pid = doc.get("plan_id")
         if not pid:
@@ -64,8 +67,7 @@ class PlanStore:
     # ({step_id, type, state, operation_id}) — NOT the planner's duration
     # estimates — so list_active/frontier logic applies unchanged.
     # `outcome` is None until mark_plan_outcome stamps it terminal.
-    PLAN_OUTCOMES = frozenset(
-        {"SUCCEEDED", "FAILED", "ABORTED", "SUPERSEDED"})
+    PLAN_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "ABORTED", "SUPERSEDED"})
 
     def put_plan_doc(self, doc: dict) -> dict:
         stored = deepcopy(dict(doc or {}))
@@ -104,7 +106,9 @@ class PlanStore:
             if doc.get("outcome") == outcome:
                 return doc
             if doc.get("outcome") in self.PLAN_OUTCOMES:
-                raise PlanStepConflictError(f"plan {plan_id} outcome already {doc['outcome']}")
+                raise PlanStepConflictError(
+                    f"plan {plan_id} outcome already {doc['outcome']}"
+                )
             version = doc["version"]
             doc.update(outcome=outcome, version=version + 1)
             try:
@@ -123,7 +127,7 @@ class PlanStore:
         step_id: str,
         expected_from: str,
         to_state: str,
-        operation_id: Optional[str] = None,
+        operation_id: str | None = None,
     ) -> dict:
         doc = self.get_plan(plan_id)
         steps = {s["step_id"]: s for s in doc.get("steps", [])}
@@ -160,7 +164,8 @@ class PlanStore:
                 if "ConditionalCheckFailedException" in str(exc):
                     raise PlanStepConflictError(
                         f"step {step_id}: concurrent advance detected "
-                        f"(plan_hash/version changed)") from exc
+                        f"(plan_hash/version changed)"
+                    ) from exc
                 raise
         stored = self._plans.get(plan_id)
         if stored is not None:
@@ -185,12 +190,13 @@ class PlanStore:
             out.append(deepcopy(doc))
         return out
 
-    def find_preemptible_plan(self, job_id: str, migration_id: str) -> Optional[dict]:
+    def find_preemptible_plan(self, job_id: str, migration_id: str) -> dict | None:
         """S16 trigger lookup: newest non-terminal, non-EMERGENCY plan doc
         for this job+attempt (pre-fence arbitrage eligible for emergency
         pre-emption). None when nothing qualifies. Read-only."""
         cands = [
-            doc for doc in self._docs.all()
+            doc
+            for doc in self._docs.all()
             if doc.get("job_id") == job_id
             and doc.get("migration_id") == migration_id
             and doc.get("outcome") not in self.PLAN_OUTCOMES

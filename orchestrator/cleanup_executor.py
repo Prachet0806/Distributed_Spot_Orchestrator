@@ -1,8 +1,9 @@
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Any, Callable
-import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +32,11 @@ class CleanupTask:
     parameters: dict
     priority: int
     created_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     status: CleanupStatus = CleanupStatus.PENDING
-    result: Optional[Any] = None
-    error: Optional[str] = None
+    result: Any | None = None
+    error: str | None = None
 
 
 class CleanupExecutor:
@@ -70,7 +71,11 @@ class CleanupExecutor:
             for op in operations:
                 if getattr(op, "step_name", "") == "provisioning":
                     result = getattr(op, "result", None)
-                    target = result.get("instance_id") if isinstance(result, dict) else getattr(result, "instance_id", None)
+                    target = (
+                        result.get("instance_id")
+                        if isinstance(result, dict)
+                        else getattr(result, "instance_id", None)
+                    )
         if target and outcome != "SUCCESS":
             self._terminate_target_instance(target)
             completed.append("target_instance")
@@ -87,7 +92,9 @@ class CleanupExecutor:
                 self._cleanup_volume(resource_id)
             return True
         except Exception as e:
-            logger.error(f"Orphan cleanup failed for {resource_type} {resource_id}: {e}")
+            logger.error(
+                f"Orphan cleanup failed for {resource_type} {resource_id}: {e}"
+            )
             return False
 
     def _cleanup_partial_artifacts(self, migration_id: str):

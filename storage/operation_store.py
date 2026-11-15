@@ -1,6 +1,8 @@
 """Write-before-command journal. An uncertain operation is never reissued blindly."""
+
 from datetime import datetime, timezone
-from storage.backend import Documents, encode, decode, conditional_failure
+
+from storage.backend import Documents, conditional_failure, decode, encode
 
 
 class OperationStore:
@@ -9,6 +11,7 @@ class OperationStore:
 
     def begin(self, operation_key, request):
         from orchestrator.models_v2 import new_ulid_like
+
         request = decode(encode(request))
         with self._docs.lock:
             try:
@@ -17,11 +20,18 @@ class OperationStore:
                 current = None
             if current is not None:
                 if current["request"] != request:
-                    raise RuntimeError("operation identity reused for a different request")
+                    raise RuntimeError(
+                        "operation identity reused for a different request"
+                    )
                 return {**current, "newly_issued": False}
-            doc = {"operation_key": operation_key, "operation_id": new_ulid_like(),
-                   "request": request, "state": "ISSUED", "version": 0,
-                   "issued_at": datetime.now(timezone.utc).isoformat()}
+            doc = {
+                "operation_key": operation_key,
+                "operation_id": new_ulid_like(),
+                "request": request,
+                "state": "ISSUED",
+                "version": 0,
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+            }
             try:
                 return {**self._docs.put(doc, create=True), "newly_issued": True}
             except Exception as exc:
@@ -48,8 +58,13 @@ class OperationStore:
                     return doc
                 raise RuntimeError("terminal operation outcome conflict")
             version = doc["version"]
-            doc.update(state=state, result=decode(encode(result)), error=error,
-                       version=version + 1, completed_at=datetime.now(timezone.utc).isoformat())
+            doc.update(
+                state=state,
+                result=decode(encode(result)),
+                error=error,
+                version=version + 1,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
             return self._docs.put(doc, expected_version=version)
 
     def get_operation_status(self, operation_id):

@@ -3,12 +3,12 @@
 Vehicles: C-WORKER (progress durability evidence), C-VALID-adjacent
 freshness gating, I7 (missing ≠ favorable) unit evidence.
 """
+
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from worker.job_runner import _heartbeat_payload
 from orchestrator.worker_telemetry import (
     HEARTBEAT_STALE_SECONDS,
     PREFLIGHT_TTL_SECONDS,
@@ -23,15 +23,18 @@ from orchestrator.worker_telemetry import (
     progress_quality,
     refusal_to_finding,
 )
-
+from worker.job_runner import _heartbeat_payload
 
 NOW = datetime(2026, 9, 9, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _hb(age_seconds=10, **kw):
     doc = {
-        "schema": "heartbeat/v1", "job_id": "job-1", "instance_id": "i-1",
-        "execution_epoch": 7, "pid": 4242,
+        "schema": "heartbeat/v1",
+        "job_id": "job-1",
+        "instance_id": "i-1",
+        "execution_epoch": 7,
+        "pid": 4242,
         "observed_at": (NOW - timedelta(seconds=age_seconds)).isoformat(),
         "workload": {"state": "RUNNING", "progress": 0.5},
     }
@@ -77,10 +80,15 @@ def test_heartbeat_rejects_bad_schema():
 
 
 # -- T1 freshness → readiness UNKNOWN, never down --
-@pytest.mark.parametrize("age,expected", [
-    (10, "READY"), (HEARTBEAT_STALE_SECONDS, "READY"),
-    (HEARTBEAT_STALE_SECONDS + 1, "UNKNOWN"), (10_000, "UNKNOWN"),
-])
+@pytest.mark.parametrize(
+    "age,expected",
+    [
+        (10, "READY"),
+        (HEARTBEAT_STALE_SECONDS, "READY"),
+        (HEARTBEAT_STALE_SECONDS + 1, "UNKNOWN"),
+        (10_000, "UNKNOWN"),
+    ],
+)
 def test_heartbeat_liveness_boundaries(age, expected):
     verdict = heartbeat_liveness(parse_heartbeat(_hb(age_seconds=age)), now=NOW)
     assert verdict["readiness"] == expected
@@ -89,44 +97,66 @@ def test_heartbeat_liveness_boundaries(age, expected):
 
 def test_missing_heartbeat_is_unknown_never_down():
     verdict = heartbeat_liveness(None, now=NOW)
-    assert verdict == {"liveness": "MISSING", "age_seconds": None,
-                       "readiness": "UNKNOWN"}
+    assert verdict == {
+        "liveness": "MISSING",
+        "age_seconds": None,
+        "readiness": "UNKNOWN",
+    }
     assert "DOWN" not in json.dumps(verdict)  # I7: no health fabrication
 
 
 # -- T2 freshness → degraded confidence, still usable --
 def test_progress_stale_downgrades_confidence_without_zero_fill():
-    fresh = progress_quality({"observed_at": NOW.isoformat(), "progress": 0.5},
-                             now=NOW)
-    assert fresh == {"quality": "FRESH", "age_seconds": pytest.approx(0),
-                     "confidence": "AS_REPORTED", "usable": True}
+    fresh = progress_quality({"observed_at": NOW.isoformat(), "progress": 0.5}, now=NOW)
+    assert fresh == {
+        "quality": "FRESH",
+        "age_seconds": pytest.approx(0),
+        "confidence": "AS_REPORTED",
+        "usable": True,
+    }
     stale = progress_quality(
-        {"observed_at": (NOW - timedelta(seconds=PROGRESS_STALE_SECONDS + 1)).isoformat()},
-        now=NOW)
+        {
+            "observed_at": (
+                NOW - timedelta(seconds=PROGRESS_STALE_SECONDS + 1)
+            ).isoformat()
+        },
+        now=NOW,
+    )
     assert stale["confidence"] == "LOW" and stale["usable"] is True
     missing = progress_quality(None, now=NOW)
-    assert missing == {"quality": "MISSING", "age_seconds": None,
-                       "confidence": "LOW", "usable": True}
+    assert missing == {
+        "quality": "MISSING",
+        "age_seconds": None,
+        "confidence": "LOW",
+        "usable": True,
+    }
 
 
 # -- T3 preflight parse + TTL --
 def test_preflight_kv_parse_and_ready_hint():
-    text = ("criu_version=3.19\nkernel_version=5.15.0\narchitecture=x86_64\n"
-            "capabilities=unprivileged-ok\nunsupported_features=\npassed=true\n")
-    rep = parse_preflight_kv(text, pool_id="pool-a", instance_id="i-1",
-                             observed_at=NOW)
+    text = (
+        "criu_version=3.19\nkernel_version=5.15.0\narchitecture=x86_64\n"
+        "capabilities=unprivileged-ok\nunsupported_features=\npassed=true\n"
+    )
+    rep = parse_preflight_kv(text, pool_id="pool-a", instance_id="i-1", observed_at=NOW)
     assert rep["passed"] is True and rep["criu_version"] == "3.19"
     verdict = preflight_freshness(rep, now=NOW, ttl_seconds=PREFLIGHT_TTL_SECONDS)
-    assert verdict == {"fresh": True, "reprobe": False,
-                       "age_seconds": pytest.approx(0, abs=5),
-                       "ready_hint": "READY"}
+    assert verdict == {
+        "fresh": True,
+        "reprobe": False,
+        "age_seconds": pytest.approx(0, abs=5),
+        "ready_hint": "READY",
+    }
     bad = parse_preflight_kv("passed=false\n", pool_id="pool-a", observed_at=NOW)
     assert preflight_freshness(bad, now=NOW)["ready_hint"] == "NOT_READY"
     old = dict(rep, observed_at=NOW - timedelta(seconds=PREFLIGHT_TTL_SECONDS + 1))
     aged = preflight_freshness(old, now=NOW)
-    assert aged == {"fresh": False, "reprobe": True,
-                    "age_seconds": pytest.approx(PREFLIGHT_TTL_SECONDS + 1),
-                    "ready_hint": "UNKNOWN"}
+    assert aged == {
+        "fresh": False,
+        "reprobe": True,
+        "age_seconds": pytest.approx(PREFLIGHT_TTL_SECONDS + 1),
+        "ready_hint": "UNKNOWN",
+    }
     assert preflight_freshness(None, now=NOW)["reprobe"] is True
     with pytest.raises(TelemetryError):
         parse_preflight_kv("   ", pool_id="pool-a")
@@ -134,11 +164,19 @@ def test_preflight_kv_parse_and_ready_hint():
 
 # -- T4 refusal → finding --
 def test_refusal_to_finding_mapping():
-    finding = refusal_to_finding(parse_refusal({
-        "schema": "refusal/v1", "instance_id": "i-1", "admission_epoch": 7,
-        "operation_id": "op-1", "expected_execution_epoch": 6,
-        "reason": "EPOCH_MISMATCH",
-        "observed_at": NOW.isoformat()}))
+    finding = refusal_to_finding(
+        parse_refusal(
+            {
+                "schema": "refusal/v1",
+                "instance_id": "i-1",
+                "admission_epoch": 7,
+                "operation_id": "op-1",
+                "expected_execution_epoch": 6,
+                "reason": "EPOCH_MISMATCH",
+                "observed_at": NOW.isoformat(),
+            }
+        )
+    )
     assert finding["mismatch_type"] == "EPOCH_MISMATCH"
     assert finding["severity"] == "HIGH" and finding["trigger"] == "EVENT_DRIVEN"
     other = refusal_to_finding({"reason": "PAIRING_FAILED"})
@@ -149,22 +187,28 @@ def test_refusal_to_finding_mapping():
 
 # -- reader over transport (best-effort, never raises) --
 def test_reader_round_trip_and_loss_is_none():
-    files = {"heartbeat.json": json.dumps(_hb()),
-             "progress.json": json.dumps({"progress": 0.25, "observed_at": NOW.isoformat()})}
-    reader = WorkerTelemetryReader(_StubTransport(files), workspace_root="/w",
-                                   clock=lambda: NOW)
+    files = {
+        "heartbeat.json": json.dumps(_hb()),
+        "progress.json": json.dumps({"progress": 0.25, "observed_at": NOW.isoformat()}),
+    }
+    reader = WorkerTelemetryReader(
+        _StubTransport(files), workspace_root="/w", clock=lambda: NOW
+    )
     hb = reader.read_heartbeat()
     assert hb["job_id"] == "job-1" and hb["execution_epoch"] == 7
     assert reader.liveness()["readiness"] == "READY"
     assert reader.read_progress()["progress"] == 0.25
 
-    dead = WorkerTelemetryReader(_StubTransport({}), workspace_root="/w",
-                                 clock=lambda: NOW)
+    dead = WorkerTelemetryReader(
+        _StubTransport({}), workspace_root="/w", clock=lambda: NOW
+    )
     assert dead.read_heartbeat() is None
     assert dead.read_progress() is None
     assert dead.liveness()["readiness"] == "UNKNOWN"
 
     garbage = WorkerTelemetryReader(
-        _StubTransport({"heartbeat.json": "not json{"}), workspace_root="/w",
-        clock=lambda: NOW)
+        _StubTransport({"heartbeat.json": "not json{"}),
+        workspace_root="/w",
+        clock=lambda: NOW,
+    )
     assert garbage.read_heartbeat() is None

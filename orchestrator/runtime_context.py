@@ -1,7 +1,8 @@
 """Dependencies and persistent iteration state, explicit at the CLI boundary."""
-from dataclasses import dataclass, field
-from typing import Callable
+
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 
 @dataclass
